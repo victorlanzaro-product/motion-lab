@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Motion Lab — Sprint 05</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <h1>MOTION LAB <span class="sprint">sprint 05 · web app</span></h1>
+      <p class="status" id="status">
+        <span class="dot" id="dot"></span><span id="status-text">conectando…</span>
+      </p>
+    </header>
+
+    <main>
+      <section class="stage">
+        <!-- Size is set from the first frame: the canvas matches the preview the
+             server sends, and CSS scales it down on narrow screens. -->
+        <canvas id="view" width="640" height="360"></canvas>
+        <p class="banner hidden" id="banner"></p>
+        <p class="hint hidden" id="hint">nenhum corpo detectado</p>
+        <p class="toast hidden" id="toast"></p>
+      </section>
+
+      <aside class="panel">
+        <section>
+          <h2>gestos</h2>
+          <ul class="feed" id="gesture-feed"></ul>
+        </section>
+
+        <section>
+          <h2>stream</h2>
+          <dl>
+            <dt>fps</dt><dd id="fps">—</dd>
+            <dt>inferência</dt><dd><span id="inference">—</span> ms</dd>
+            <dt>confiança</dt><dd id="confidence">—</dd>
+            <dt>frame</dt><dd id="frame-index">—</dd>
+          </dl>
+        </section>
+
+        <section>
+          <h2>braço esquerdo</h2>
+          <dl>
+            <dt>direção</dt><dd><span class="badge" id="left-direction">—</span></dd>
+            <dt>vy</dt><dd id="left-vy">—</dd>
+            <dt>velocidade</dt><dd id="left-speed">—</dd>
+            <dt>cotovelo</dt><dd><span id="left-elbow">—</span>°</dd>
+            <dt>altura punho</dt><dd id="left-height">—</dd>
+          </dl>
+        </section>
+
+        <section>
+          <h2>braço direito</h2>
+          <dl>
+            <dt>direção</dt><dd><span class="badge" id="right-direction">—</span></dd>
+            <dt>vy</dt><dd id="right-vy">—</dd>
+            <dt>velocidade</dt><dd id="right-speed">—</dd>
+            <dt>cotovelo</dt><dd><span id="right-elbow">—</span>°</dd>
+            <dt>altura punho</dt><dd id="right-height">—</dd>
+          </dl>
+        </section>
+
+        <section class="toggles">
+          <h2>exibição</h2>
+          <label><input type="checkbox" id="toggle-mirror" checked /> espelho <kbd>m</kbd></label>
+          <label><input type="checkbox" id="toggle-trail" checked /> rastro <kbd>t</kbd></label>
+          <label><input type="checkbox" id="toggle-labels" /> rótulos <kbd>l</kbd></label>
+          <label><input type="checkbox" id="toggle-video" checked /> vídeo <kbd>v</kbd></label>
+        </section>
+
+        <footer>
+          <p>velocidades em larguras de ombro por segundo.</p>
+          <p>nenhum frame é gravado — os pixels existem só em memória.</p>
+        </footer>
+      </aside>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
