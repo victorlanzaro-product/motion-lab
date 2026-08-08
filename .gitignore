@@ -14,6 +14,7 @@ data/events/*
 !data/training/.gitkeep
 !data/events/.gitkeep
 backend/models/*.joblib
+backend/models/*.html
 
 # Third-party pose model (5.5 MB), re-downloaded by ensure_model() on demand.
 models/*.task

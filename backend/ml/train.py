@@ -32,7 +32,7 @@ from typing import Any
 
 import joblib
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 
 from backend.dataset.writer import DEFAULT_DATASET_PATH, MOTION_COLUMNS
@@ -134,6 +134,13 @@ class TrainingReport:
     report: str
     feature_importances: dict[str, float]
     trained_at: str
+    #: Rows/cols both ordered by `class_labels` — the confusion matrix on its
+    #: own is just a grid of integers otherwise.
+    class_labels: list[str]
+    confusion_matrix: list[list[int]]
+    #: precision/recall/f1/support per class, from the same held-out split
+    #: the confusion matrix and accuracy came from.
+    per_class: dict[str, dict[str, float]]
 
 
 def train(
@@ -157,21 +164,36 @@ def train(
     model.fit(X_train, y_train)
     predicted = model.predict(X_test)
 
+    class_labels = model.classes_.tolist()
+    matrix = confusion_matrix(y_test, predicted, labels=class_labels).tolist()
+    per_class_report = classification_report(
+        y_test, predicted, labels=class_labels, zero_division=0, output_dict=True
+    )
+    per_class = {label: per_class_report[label] for label in class_labels}
+    feature_importances = dict(zip(TRAINING_COLUMNS, model.feature_importances_.tolist()))
+    accuracy = accuracy_score(y_test, predicted)
+
     model_path = Path(model_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     trained_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     # Model, column order and class list travel together in one file — Sprint
     # 09 loads all three from the same artifact, never re-derives them, so
     # the vector it builds at inference time cannot silently drift from the
-    # one this model was actually trained on.
+    # one this model was actually trained on. The evaluation numbers ride
+    # along too (Sprint 10): `scripts/report.py` regenerates the HTML report
+    # from `load_model()` alone, without re-running training.
     joblib.dump(
         {
             "model": model,
             "columns": TRAINING_COLUMNS,
-            "classes": model.classes_.tolist(),
+            "classes": class_labels,
             "trained_at": trained_at,
             "n_samples": len(dataset.y),
             "counts": dataset.counts,
+            "confusion_matrix": matrix,
+            "per_class": per_class,
+            "feature_importances": feature_importances,
+            "accuracy": accuracy,
         },
         model_path,
     )
@@ -180,10 +202,13 @@ def train(
         model_path=model_path,
         n_samples=len(dataset.y),
         counts=dataset.counts,
-        accuracy=accuracy_score(y_test, predicted),
-        report=classification_report(y_test, predicted, zero_division=0),
-        feature_importances=dict(zip(TRAINING_COLUMNS, model.feature_importances_.tolist())),
+        accuracy=accuracy,
+        report=classification_report(y_test, predicted, labels=class_labels, zero_division=0),
+        feature_importances=feature_importances,
         trained_at=trained_at,
+        class_labels=class_labels,
+        confusion_matrix=matrix,
+        per_class=per_class,
     )
 
 

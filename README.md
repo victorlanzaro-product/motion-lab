@@ -1,9 +1,9 @@
 # Motion Lab
 
-Computer vision playground rodando 100% local: webcam → pose → features → gestos → eventos.
+Computer vision playground rodando 100% local: webcam → pose → features → gestos → ML → relatório.
 
 O objetivo não é só funcionar, é deixar visível cada etapa do pipeline. Vídeo nunca é
-armazenado — apenas landmarks temporários, dados de treino e eventos detectados.
+armazenado — apenas landmarks temporários, dados de treino e o modelo treinado.
 
 ## Status
 
@@ -18,7 +18,7 @@ armazenado — apenas landmarks temporários, dados de treino e eventos detectad
 | 07 | Dataset Builder | ✅ pronto |
 | 08 | ML Training (Random Forest) | ✅ pronto |
 | 09 | Live ML (Sinal X em tempo real) | ✅ pronto |
-| 10 | Motion Lab (métricas, explicabilidade) | ⬜ |
+| 10 | Motion Lab (métricas, explicabilidade) | ✅ pronto |
 
 ## Setup
 
@@ -88,6 +88,11 @@ uv run python scripts/train_model.py --simulate
 uv run python scripts/hello_web.py --model backend/models/gesture_classifier.joblib
 uv run python scripts/check_web.py --model backend/models/gesture_classifier.joblib
 
+# Sprint 10 — relatório: matriz de confusão, importância de feature, saúde
+# ao vivo e concordância regra x ML, tudo num HTML só
+uv run python scripts/report.py
+uv run python scripts/report.py --no-live   # sem câmera, só a parte do treino
+
 # testes (não precisam de webcam nem do modelo — ambos são falsificados)
 uv run pytest -q
 ```
@@ -108,19 +113,56 @@ terminal — a permissão só passa a valer depois do restart do processo pai.
 ## Arquitetura
 
 ```
-Camera Engine  ->  Pose Engine  ->  Landmark Engine  ->  Feature Engine
-   (OpenCV)        (MediaPipe)      (posições)           (ângulos,
-                                                          distâncias,
-                                                          velocidades)
-                                                              |
-                                       Event Engine  <-  Gesture Engine
-                                       (eventos com      (regras + modelo
-                                        cooldown)         Random Forest)
+Camera Engine -> Pose Engine -> Feature Engine -> Motion Engine
+   (OpenCV)       (MediaPipe)    (ângulos,          (velocidade,
+                                  distâncias)         direção)
+                                                          |
+                            Gesture Engine  <----+---->  Live ML
+                            (regras, cooldown)   |      (Random Forest,
+                                                  |       Sprint 07-09)
+                                                  v
+                                               Web App
+                                        (FastAPI + WebSocket)
+                                                  |
+                                          Motion Lab Report
+                                     (métricas, explicabilidade)
 ```
+
+Gesture Engine e Live ML são dois sinais paralelos sobre o mesmo Motion Engine —
+nenhum depende do outro, e o relatório do Sprint 10 compara os dois.
 
 Regra de acoplamento: cada camada recebe o **dado** da anterior, nunca o handle dela.
 `CameraEngine` entrega `Frame`, não um `cv2.VideoCapture` — por isso trocar webcam por
 arquivo de vídeo não toca em nada do lado da visão.
+
+### Decisões do Sprint 10: explicação é o que o modelo já sabe dizer, não um método novo
+
+`scripts/report.py` fecha o roadmap: lê o `.joblib` do Sprint 08, amostra uma
+sessão ao vivo (opcional) e funde os dois num HTML autocontido. Tensão real
+nas respostas do briefing: métricas pedidas eram todas *ao vivo* (saúde do
+pipeline, concordância regra × ML), mas a interface pedida foi HTML *estático,
+gerado no treino*. Resolução: o HTML nasce no treino (matriz de confusão,
+precision/recall, importância de feature — tudo já calculado, nunca precisa
+de câmera pra existir), e o script soma uma amostragem ao vivo por cima
+quando a câmera está disponível.
+
+1. **Explicabilidade é o que o Random Forest já expõe, não SHAP nem LIME.**
+   `feature_importances_` do próprio modelo já diz "decido principalmente por
+   `wrist_distance` e `left_wrist_height`" — inventar um método de explicação
+   por cima seria uma segunda fonte de verdade competindo com a primeira, sem
+   necessidade real neste tamanho de modelo.
+2. **Concordância regra × ML reusa o mesmo threshold da regra, não um novo.**
+   `rule_label()` em `backend/ml/report.py` decide "braço levantado" com a
+   mesma lógica de três booleanos que `GestureEngine` já usa — lido direto do
+   payload do frame, não recalculado. `wave` é excluído da comparação, não
+   contado como discordância: é movimento, não postura, a regra não tem
+   equivalente estático pra comparar.
+3. **Sem câmera, o relatório ainda existe.** `run_live_session` captura
+   `CameraError`/timeout e degrada pra "só treino" em vez de falhar —
+   consistente com o Sprint 09: ML e suas métricas são camada opcional, nunca
+   dependência do resto funcionar.
+
+`backend/models/*.html` fica fora do git, mesma regra do `.joblib`.
 
 ### Decisões do Sprint 09: o sinal de ML é opcional, nunca dependência
 
@@ -201,10 +243,9 @@ dado biométrico-ish, fica local por padrão.
 
 ### Decisões do Sprint 06: um gesto é um evento, não um estado
 
-`backend/gestures/` fica entre a Motion Engine e o Event Engine do Sprint 09:
-transforma `wrist_above_shoulder = True` sustentado, ou o punho oscilando pra
-cima e pra baixo, num evento nomeado que sai uma vez, não a cada frame. Três
-escolhas:
+`backend/gestures/` fica logo depois da Motion Engine: transforma
+`wrist_above_shoulder = True` sustentado, ou o punho oscilando pra cima e pra
+baixo, num evento nomeado que sai uma vez, não a cada frame. Três escolhas:
 
 1. **Regra pura, tempo é do engine.** `rules.py` só responde "essa postura
    bate agora?" (igual `angles.py`/`positions.py`); quanto tempo precisa
@@ -226,8 +267,9 @@ escolhas:
 Seis gestos na V1 — `arm_raised` e `wave` por lado, mais as posturas de duas
 mãos `arms_crossed` e `arms_open` — todos só no payload do WebSocket
 (`backend/web/payload.py`): o HUD mostra "gesto detectado" ao vivo, nada é
-persistido ainda. Gravar em `data/events/` com cooldown de verdade fica pro
-Event Engine do Sprint 09.
+persistido em `data/events/`. O roadmap final (Sprints 09-10) foi por outro
+caminho — sinal de ML ao vivo e relatório de métricas — em vez de um Event
+Engine dedicado; `data/events/` fica como diretório reservado, sem uso.
 
 ### Decisões do Sprint 05: uma câmera, muitos navegadores
 
@@ -343,8 +385,9 @@ backend/
   gestures/engine.py  GestureEngine, GestureConfig, GestureEvent (hold + cooldown)
   dataset/writer.py   DatasetWriter, DATASET_COLUMNS — features+motion rotulados em CSV
   ml/train.py         TRAINING_COLUMNS, train, load_model, predict (Random Forest)
-  events/             (sprint 09) event store
-  models/             modelos .joblib treinados (fora do git)
+  ml/report.py        render_report, compute_agreement — o relatório do Sprint 10
+  events/             reservado, sem uso (roadmap foi por ML ao vivo + relatório em vez de Event Engine)
+  models/             modelos .joblib e .report.html (fora do git)
   web/payload.py      formato de mensagem do WebSocket (hello/frame/error)
   web/pipeline.py     PipelineRunner, Subscriber — uma câmera, muitos clientes
   web/app.py          FastAPI: rotas /, /health, /ws
@@ -352,8 +395,8 @@ frontend/
   index.html          layout: canvas + painel de stream/motion/toggles
   style.css           cores do overlay, mesmas de vision/drawing.py
   app.js              desenha o payload no canvas; nunca calcula feature
-data/training/        amostras de gestos (landmarks + features, nunca imagens)
-data/events/          eventos detectados
+data/training/        amostras de gestos (features + motion rotulados, nunca imagens)
+data/events/          reservado, sem uso
 scripts/              entrypoints de cada sprint
 tests/
 ```
