@@ -16,7 +16,7 @@ armazenado — apenas landmarks temporários, dados de treino e eventos detectad
 | 05 | Web App (FastAPI + WebSocket) | ✅ pronto |
 | 06 | Gesture Rules | ✅ pronto |
 | 07 | Dataset Builder | ✅ pronto |
-| 08 | ML Training (Random Forest) | ⬜ |
+| 08 | ML Training (Random Forest) | ✅ pronto |
 | 09 | Live ML (Sinal X em tempo real) | ⬜ |
 | 10 | Motion Lab (métricas, explicabilidade) | ⬜ |
 
@@ -26,7 +26,7 @@ Requer Python 3.10–3.12 (MediaPipe ainda não suporta 3.13+) e [uv](https://do
 
 ```bash
 uv venv --python python3.12
-uv sync --group dev --extra vision --extra web
+uv sync --group dev --extra vision --extra web --extra ml
 ```
 
 O modelo de pose (`models/pose_landmarker_lite.task`, 5.5 MB) é baixado sozinho na
@@ -78,6 +78,12 @@ uv run python scripts/check_gestures.py --frames 300   # webcam
 # segure 1-5 pra gravar cada rótulo, SPACE pra parar, q/ESC pra sair
 uv run python scripts/hello_dataset.py
 
+# Sprint 08 — treina o Random Forest a partir do dataset gravado
+uv run python scripts/train_model.py
+
+# sem dataset ainda? treina em cima de dados sintéticos, só pra provar o pipeline
+uv run python scripts/train_model.py --simulate
+
 # testes (não precisam de webcam nem do modelo — ambos são falsificados)
 uv run pytest -q
 ```
@@ -111,6 +117,34 @@ Camera Engine  ->  Pose Engine  ->  Landmark Engine  ->  Feature Engine
 Regra de acoplamento: cada camada recebe o **dado** da anterior, nunca o handle dela.
 `CameraEngine` entrega `Frame`, não um `cv2.VideoCapture` — por isso trocar webcam por
 arquivo de vídeo não toca em nada do lado da visão.
+
+### Decisões do Sprint 08: o vetor de treino é a única fonte da verdade
+
+`backend/ml/train.py` lê `data/training/dataset.csv`, treina um
+`RandomForestClassifier` e salva em `backend/models/*.joblib` (fora do git).
+Três escolhas:
+
+1. **`TRAINING_COLUMNS` é uma tupla, não uma convenção.** É a ordem exata do
+   vetor com que o modelo foi ajustado. O Sprint 09 vai montar esse mesmo
+   vetor a partir de um frame ao vivo — se a ordem lá divergir da ordem aqui,
+   o modelo não quebra, só erra com confiança, sem erro pra pegar. Fixar isso
+   numa tupla importável é a mesma disciplina append-only de `FEATURE_NAMES`.
+2. **Direção sai, velocidade fica.** `left_direction`/`right_direction` já são
+   um resumo com perda da velocidade com sinal (`classify()` em `velocity.py`:
+   positivo é subindo). Treinar com as duas seria treinar com uma cópia
+   derivada da mesma coluna, sem ganho de separação.
+3. **Modelo, ordem de coluna e lista de classes viajam juntos.** O `.joblib`
+   salvo é um dict com os três — o Sprint 09 carrega tudo de um artefato só,
+   nunca re-deriva a ordem, então o vetor montado na hora da inferência não
+   tem como divergir silenciosamente do que treinou o modelo.
+
+Dataset real ainda está vazio (ninguém gravou sessão com `hello_dataset.py`
+até agora), então `train_model.py --simulate` existe pelo mesmo motivo que
+`check_motion.py --simulate`: provar o pipeline inteiro — carregar, separar
+treino/teste, ajustar, avaliar, salvar, recarregar, prever — funciona hoje,
+deterministicamente, sem esperar uma sessão de gravação real. Rodar sem
+`--simulate` com o dataset vazio falha limpo (`DatasetError`), não com stack
+trace.
 
 ### Decisões do Sprint 07: o dataset não é a mesma tabela do gesto
 
@@ -280,8 +314,9 @@ backend/
   gestures/rules.py   arm_raised, arms_crossed, arms_open (postura, sem tempo)
   gestures/engine.py  GestureEngine, GestureConfig, GestureEvent (hold + cooldown)
   dataset/writer.py   DatasetWriter, DATASET_COLUMNS — features+motion rotulados em CSV
+  ml/train.py         TRAINING_COLUMNS, train, load_model, predict (Random Forest)
   events/             (sprint 09) event store
-  models/             (sprint 08) modelos .joblib treinados
+  models/             modelos .joblib treinados (fora do git)
   web/payload.py      formato de mensagem do WebSocket (hello/frame/error)
   web/pipeline.py     PipelineRunner, Subscriber — uma câmera, muitos clientes
   web/app.py          FastAPI: rotas /, /health, /ws
