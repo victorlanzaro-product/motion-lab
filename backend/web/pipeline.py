@@ -35,11 +35,17 @@ import asyncio
 import threading
 import time
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from backend.camera import CameraConfig, CameraEngine, CameraError
 from backend.features import MotionConfig, MotionTracker, Trail, extract
+from backend.features.features import FrameFeatures
+from backend.features.velocity import MotionState
 from backend.gestures import GestureConfig, GestureEngine
+from backend.ml import DEFAULT_MODEL_PATH, ModelError
+from backend.ml import load_model as load_ml_model
+from backend.ml import predict as ml_predict
 from backend.vision import (
     DEFAULT_VISIBILITY_THRESHOLD,
     PoseConfig,
@@ -66,6 +72,10 @@ class WebConfig:
     pose: PoseConfig = field(default_factory=PoseConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
     gesture: GestureConfig = field(default_factory=GestureConfig)
+    #: Path to a trained Sprint 08 model. Optional on purpose: the whole
+    #: pipeline (pose, motion, rule-based gestures) works with no model at
+    #: all — Live ML is a signal riding on top, never a dependency.
+    model_path: Path = DEFAULT_MODEL_PATH
     #: Width of the JPEG sent to the browser. Inference still runs on the full
     #: frame, so this trades picture size against bandwidth, never accuracy.
     preview_width: int = 640
@@ -146,6 +156,20 @@ class PipelineRunner:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+
+    # --- model introspection --------------------------------------------
+    def ml_classes(self) -> list[str]:
+        """Class vocabulary of the trained model, or `[]` if there is none.
+
+        Called from the WebSocket handshake (`backend/web/app.py`), before
+        any frame has flowed and possibly before the camera thread has even
+        started — so it loads independently of `_stream`'s own bundle rather
+        than reading a cached value that might not exist yet.
+        """
+        try:
+            return list(load_ml_model(self.config.model_path)["classes"])
+        except ModelError:
+            return []
 
     # --- subscriptions -------------------------------------------------
     @property
@@ -229,6 +253,14 @@ class PipelineRunner:
         gestures = GestureEngine(self.config.gesture)
         trails = {name: Trail(self.config.motion.trail_length) for name in SIDES}
         idle_since: Optional[float] = None
+        # Loaded once per stream start (mirrors PoseDetector's own lifecycle)
+        # so training a model mid-session takes effect on the next reconnect
+        # without a server restart. Missing or corrupt is not fatal — Live ML
+        # is a signal on top of the pipeline, never a dependency of it.
+        try:
+            ml_bundle = load_ml_model(self.config.model_path)
+        except ModelError:
+            ml_bundle = None
 
         for frame in camera.frames():
             if self._stop.is_set():
@@ -254,6 +286,7 @@ class PipelineRunner:
             features = extract(snapshot, self.config.visibility_threshold)
             motion = tracker.update(features)
             fired = gestures.update(features, motion)
+            prediction = self._predict(ml_bundle, features, motion)
             for name, trail in trails.items():
                 trail.add_from(snapshot, SIDES[name], self.config.visibility_threshold)
 
@@ -270,6 +303,24 @@ class PipelineRunner:
                     fps=camera.fps,
                     trails=trails,
                     gestures=fired,
+                    ml=prediction,
                 )
             )
             self.frames_served += 1
+
+    @staticmethod
+    def _predict(
+        bundle: Optional[dict], features: FrameFeatures, motion: MotionState
+    ) -> Optional[tuple[str, dict[str, float]]]:
+        """Skip, don't guess: an incomplete frame never reaches the model.
+
+        Same rule `DatasetWriter` applies at training time (Sprint 07) — a
+        fabricated 0 for an occluded joint reads as a real, confident value
+        to the Forest (an unseen elbow at "0 degrees" looks fully bent), so a
+        frame that would have been rejected as a training row is rejected as
+        an inference input too.
+        """
+        if bundle is None or not features.complete:
+            return None
+        row = {**features.to_dict(), **motion.to_dict()}
+        return ml_predict(bundle, row)

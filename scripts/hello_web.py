@@ -19,7 +19,10 @@ import webbrowser
 
 import uvicorn
 
+from pathlib import Path
+
 from backend.camera import CameraConfig
+from backend.ml import DEFAULT_MODEL_PATH
 from backend.vision import PoseModelError, ensure_model
 from backend.web import WebConfig, create_app
 
@@ -40,6 +43,12 @@ def main() -> int:
         help="width of the JPEG sent to the browser; inference still uses the full frame",
     )
     parser.add_argument("--quality", type=int, default=70, help="JPEG quality, 1-100")
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=DEFAULT_MODEL_PATH,
+        help="trained Sprint 08 model; missing is fine, Live ML just stays off",
+    )
     parser.add_argument("--open", action="store_true", help="open the browser on startup")
     args = parser.parse_args()
 
@@ -47,6 +56,7 @@ def main() -> int:
         camera=CameraConfig(args.camera, args.width, args.height),
         preview_width=args.preview_width,
         jpeg_quality=args.quality,
+        model_path=args.model,
     )
 
     try:
