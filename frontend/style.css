@@ -1,0 +1,266 @@
+/* Motion Lab web app.
+ *
+ * The overlay colours are the ones `backend/vision/drawing.py` uses in the
+ * OpenCV window, converted from BGR to RGB, so the browser view and the desktop
+ * view read as the same instrument.
+ */
+
+:root {
+  --bg: #0b0f14;
+  --panel: #121821;
+  --line: #1e2733;
+  --text: #d7e0ea;
+  --dim: #7a8899;
+  --accent: #78ff78; /* drawing.py _ACCENT */
+  --weak: #ffa050; /* drawing.py _WEAK */
+  --bone: #5ac8ff; /* drawing.py _BONE */
+  --trail: #dc82ff; /* drawing.py _TRAIL */
+  --alert: #ff6b6b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+h1 {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: 0.14em;
+}
+
+.sprint {
+  color: var(--dim);
+  letter-spacing: 0.06em;
+  font-weight: 400;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--dim);
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--dim);
+}
+
+.dot.live {
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+}
+
+.dot.off {
+  background: var(--weak);
+}
+
+.dot.error {
+  background: var(--alert);
+}
+
+main {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+  padding: 20px;
+  align-items: flex-start;
+}
+
+.stage {
+  position: relative;
+  flex: 1 1 640px;
+  min-width: 320px;
+}
+
+canvas {
+  width: 100%;
+  height: auto;
+  display: block;
+  background: #000;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.banner,
+.hint,
+.toast {
+  position: absolute;
+  left: 12px;
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.72);
+}
+
+.banner {
+  top: 12px;
+  right: 12px;
+  color: var(--alert);
+  border: 1px solid var(--alert);
+}
+
+.hint {
+  bottom: 12px;
+  color: var(--dim);
+}
+
+.toast {
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.toast.flash {
+  animation: toast-fade 2s ease-out;
+}
+
+@keyframes toast-fade {
+  0% {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-6px);
+  }
+  15% {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+  75% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.hidden {
+  display: none;
+}
+
+.feed {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  min-height: 24px;
+}
+
+.feed li {
+  padding: 3px 0;
+  border-bottom: 1px dashed var(--line);
+  color: var(--accent);
+}
+
+.feed li:first-child {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.feed:empty::after {
+  content: "nenhum gesto ainda";
+  color: var(--dim);
+  font-weight: 400;
+}
+
+.panel {
+  flex: 0 1 300px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 16px 12px;
+}
+
+.panel h2 {
+  margin: 16px 0 8px;
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--bone);
+}
+
+dl {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 12px;
+  margin: 0;
+}
+
+dt {
+  color: var(--dim);
+}
+
+dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.badge {
+  padding: 1px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  color: var(--dim);
+}
+
+.badge.up {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.badge.down {
+  color: var(--weak);
+  border-color: var(--weak);
+}
+
+.badge.still {
+  color: var(--text);
+}
+
+.toggles label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  cursor: pointer;
+}
+
+kbd {
+  margin-left: auto;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--dim);
+}
+
+.panel footer {
+  margin-top: 18px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.panel footer p {
+  margin: 0 0 4px;
+}

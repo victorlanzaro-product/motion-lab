@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# uv
+uv.lock
+
+# Motion Lab data — training samples, events and trained models are local-only.
+data/training/*
+data/events/*
+!data/training/.gitkeep
+!data/events/.gitkeep
+backend/models/*.joblib
+
+# Third-party pose model (5.5 MB), re-downloaded by ensure_model() on demand.
+models/*.task
+
+# Media must never be committed: the spec forbids storing video.
+*.mp4
+*.mov
+*.avi
+*.png
+*.jpg
+
+# macOS
+.DS_Store
