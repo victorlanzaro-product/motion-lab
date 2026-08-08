@@ -28,6 +28,10 @@ const GESTURE_LABEL = {
   arms_open: "braços abertos",
 };
 
+// Same vocabulary as GESTURE_LABEL, plus "idle" -- a training class the
+// rule-based GestureEngine has no equivalent event for.
+const ML_LABEL = { ...GESTURE_LABEL, idle: "parado" };
+
 const SIDE_LABEL = { left: "esquerdo", right: "direito" };
 
 const GESTURE_FEED_LIMIT = 6;
@@ -289,6 +293,7 @@ function updatePanel(message) {
   el("inference").textContent = fmt(message.inference_ms, 1);
   el("confidence").textContent = fmt(message.confidence, 2);
   el("frame-index").textContent = message.frame_index;
+  updateMlPanel(message.ml);
 
   for (const side of ["left", "right"]) {
     const direction = message.motion[`${side}_direction`] || "unknown";
@@ -300,6 +305,24 @@ function updatePanel(message) {
     el(`${side}-elbow`).textContent = fmt(message.features[`${side}_elbow_angle`], 0);
     el(`${side}-height`).textContent = fmt(message.features[`${side}_wrist_height`]);
   }
+}
+
+function updateMlPanel(ml) {
+  const label = el("ml-label");
+  const confidence = el("ml-confidence");
+  if (ml === null) {
+    // Two reasons this frame has nothing to say, told apart by whether a
+    // model exists at all: no model trained yet, or this exact frame had an
+    // occluded joint and the backend skipped it rather than guessing.
+    const hasModel = state.config && state.config.ml_classes && state.config.ml_classes.length;
+    label.textContent = hasModel ? "sem sinal" : "sem modelo";
+    label.className = "badge";
+    confidence.textContent = "—";
+    return;
+  }
+  label.textContent = ML_LABEL[ml.label] || ml.label;
+  label.className = `badge ${ml.label === "idle" ? "still" : "up"}`;
+  confidence.textContent = `${Math.round(ml.confidence * 100)}%`;
 }
 
 function setStatus(kind, text) {

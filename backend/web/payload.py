@@ -134,6 +134,27 @@ def motion_payload(motion: MotionState) -> dict[str, Any]:
     }
 
 
+def ml_payload(prediction: Optional[tuple[str, dict[str, float]]]) -> Optional[dict[str, Any]]:
+    """Raw per-frame classifier signal, or `None` when there is nothing to say.
+
+    `None` covers two cases the client treats the same way — no model has
+    been trained yet, or this particular frame had an occluded joint and was
+    never handed to the model (`PipelineRunner` skips it rather than feeding
+    the model a fabricated value; see Sprint 07's `DatasetWriter` for the
+    same rule at training time). Deliberately unsmoothed: this is the raw
+    "Sinal X em tempo real" the roadmap asks for, not a debounced verdict —
+    `GestureEngine` already owns that job.
+    """
+    if prediction is None:
+        return None
+    label, probabilities = prediction
+    return {
+        "label": label,
+        "confidence": _round(probabilities[label], 3),
+        "probabilities": {name: _round(value, 3) for name, value in probabilities.items()},
+    }
+
+
 def gesture_payload(events: list[GestureEvent]) -> list[dict[str, Any]]:
     """Gestures that fired on THIS frame — usually empty.
 
@@ -157,6 +178,7 @@ def frame_message(
     fps: float,
     trails: dict[str, Trail],
     gestures: Optional[list[GestureEvent]] = None,
+    ml: Optional[tuple[str, dict[str, float]]] = None,
 ) -> dict[str, Any]:
     """One `type: "frame"` message: pixels, joints and numbers from the same frame.
 
@@ -178,6 +200,7 @@ def frame_message(
         "motion": motion_payload(motion),
         "trail": {name: trail_payload(trail) for name, trail in trails.items()},
         "gestures": gesture_payload(gestures or []),
+        "ml": ml_payload(ml),
     }
 
 
@@ -193,6 +216,7 @@ def hello_message(
     still_threshold: float = 0.35,
     preview_width: int = 640,
     jpeg_quality: int = 70,
+    ml_classes: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """First message on every connection: everything the client needs to draw.
 
@@ -206,6 +230,10 @@ def hello_message(
         "chains": [[int(a), int(b)] for a, b in ARM_CHAINS],
         "feature_names": list(FEATURE_NAMES),
         "gesture_names": list(GESTURE_NAMES),
+        # Empty when no model is trained yet -- the client's cue to show
+        # "sem modelo treinado" instead of waiting for an "ml" field that
+        # will never arrive non-null.
+        "ml_classes": list(ml_classes) if ml_classes else [],
         "visibility_threshold": visibility_threshold,
         "still_threshold": still_threshold,
         "preview": {"width": preview_width, "quality": jpeg_quality},

@@ -20,7 +20,15 @@ pytest.importorskip("httpx", reason="fastapi's TestClient needs httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from backend.camera import CameraConfig, CameraEngine  # noqa: E402
-from backend.features import FEATURE_NAMES  # noqa: E402
+from backend.dataset import DatasetWriter  # noqa: E402
+from backend.features import (  # noqa: E402
+    FEATURE_NAMES,
+    ArmMotion,
+    Direction,
+    FrameFeatures,
+    MotionState,
+)
+from backend.ml import MIN_SAMPLES_PER_CLASS, train  # noqa: E402
 from backend.vision import ARM_CHAINS, ARM_LANDMARKS, PoseDetector, PoseLandmark  # noqa: E402
 from backend.web import WebConfig, create_app  # noqa: E402
 from backend.web.pipeline import PipelineRunner, Subscriber  # noqa: E402
@@ -84,6 +92,13 @@ class FakeLandmarker:
         points[int(PoseLandmark.LEFT_WRIST)] = SimpleNamespace(
             x=LEFT_WRIST_X, y=0.4, z=0.0, visibility=0.9, presence=0.9
         )
+        # The right wrist must differ from the right elbow's default point too
+        # (0.5, 0.5): a zero-length elbow->wrist vector makes `angle_between`
+        # return None (`angles.py`), which would make `FrameFeatures.complete`
+        # false on every frame and silently skip ML inference (Sprint 09).
+        points[int(PoseLandmark.RIGHT_WRIST)] = SimpleNamespace(
+            x=0.55, y=0.6, z=0.0, visibility=0.9, presence=0.9
+        )
         return SimpleNamespace(pose_landmarks=[points], pose_world_landmarks=[points])
 
     def close(self) -> None:
@@ -116,6 +131,32 @@ def build(opened: bool = True, **overrides) -> tuple[PipelineRunner, list[FakeCa
 
 def client_for(runner: PipelineRunner) -> TestClient:
     return TestClient(create_app(runner=runner))
+
+
+def train_tiny_model(tmp_path):
+    """A minimal real model, trained through the real Sprint 07/08 code —
+    not a mock — so the wiring under test is the same as production."""
+    dataset_path = tmp_path / "dataset.csv"
+    with DatasetWriter(dataset_path, session_id="test") as writer:
+        for index in range(MIN_SAMPLES_PER_CLASS * 2):
+            label = "arms_open" if index % 2 == 0 else "idle"
+            wrist_distance = 2.8 if label == "arms_open" else 1.0
+            values = {name: 0.0 for name in FEATURE_NAMES}
+            for name in ("wrists_crossed", "left_wrist_above_shoulder", "right_wrist_above_shoulder"):
+                values[name] = False
+            values["wrist_distance"] = wrist_distance
+            features = FrameFeatures(frame_index=index, timestamp=index / 30.0, **values)
+            motion = MotionState(
+                frame_index=index,
+                timestamp=features.timestamp,
+                left=ArmMotion(direction=Direction.STILL),
+                right=ArmMotion(direction=Direction.STILL),
+            )
+            writer.write(label, features, motion)
+
+    model_path = tmp_path / "model.joblib"
+    train(dataset_path=dataset_path, model_path=model_path)
+    return model_path
 
 
 def wait_until(predicate, timeout: float = 5.0) -> bool:
@@ -204,6 +245,31 @@ def test_a_sustained_pose_fires_a_gesture_through_the_whole_pipeline():
     assert fired is not None, "arm_raised never fired within 5s of a sustained pose"
     assert fired[0]["name"] == "arm_raised"
     assert fired[0]["side"] == "left"
+
+
+def test_ml_signal_is_null_when_no_model_is_trained(tmp_path):
+    runner, _ = build(model_path=tmp_path / "missing.joblib")
+    with client_for(runner) as client, client.websocket_connect("/ws") as socket:
+        hello = socket.receive_json()
+        frame = socket.receive_json()
+    runner.stop()
+
+    assert hello["ml_classes"] == []
+    assert frame["ml"] is None
+
+
+def test_ml_signal_carries_a_real_prediction_when_a_model_is_trained(tmp_path):
+    model_path = train_tiny_model(tmp_path)
+    runner, _ = build(model_path=model_path)
+    with client_for(runner) as client, client.websocket_connect("/ws") as socket:
+        hello = socket.receive_json()
+        frame = socket.receive_json()
+    runner.stop()
+
+    assert set(hello["ml_classes"]) == {"arms_open", "idle"}
+    assert frame["ml"]["label"] in ("arms_open", "idle")
+    assert 0.0 < frame["ml"]["confidence"] <= 1.0
+    assert sum(frame["ml"]["probabilities"].values()) == pytest.approx(1.0, abs=1e-2)
 
 
 def test_preview_is_downscaled_but_inference_is_not():

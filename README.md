@@ -17,7 +17,7 @@ armazenado — apenas landmarks temporários, dados de treino e eventos detectad
 | 06 | Gesture Rules | ✅ pronto |
 | 07 | Dataset Builder | ✅ pronto |
 | 08 | ML Training (Random Forest) | ✅ pronto |
-| 09 | Live ML (Sinal X em tempo real) | ⬜ |
+| 09 | Live ML (Sinal X em tempo real) | ✅ pronto |
 | 10 | Motion Lab (métricas, explicabilidade) | ⬜ |
 
 ## Setup
@@ -84,6 +84,10 @@ uv run python scripts/train_model.py
 # sem dataset ainda? treina em cima de dados sintéticos, só pra provar o pipeline
 uv run python scripts/train_model.py --simulate
 
+# Sprint 09 — o mesmo hello_web.py, agora com o sinal do modelo ao vivo
+uv run python scripts/hello_web.py --model backend/models/gesture_classifier.joblib
+uv run python scripts/check_web.py --model backend/models/gesture_classifier.joblib
+
 # testes (não precisam de webcam nem do modelo — ambos são falsificados)
 uv run pytest -q
 ```
@@ -117,6 +121,30 @@ Camera Engine  ->  Pose Engine  ->  Landmark Engine  ->  Feature Engine
 Regra de acoplamento: cada camada recebe o **dado** da anterior, nunca o handle dela.
 `CameraEngine` entrega `Frame`, não um `cv2.VideoCapture` — por isso trocar webcam por
 arquivo de vídeo não toca em nada do lado da visão.
+
+### Decisões do Sprint 09: o sinal de ML é opcional, nunca dependência
+
+`PipelineRunner` carrega o `.joblib` (se existir) uma vez por sessão de câmera
+e manda `ml: {label, confidence, probabilities}` no payload — `null` quando
+não há modelo ou quando o frame tem junta oculta. Três escolhas:
+
+1. **Sem modelo, o app inteiro continua de pé.** Pose, motion, gestos por
+   regra (Sprint 01-06) não sabem que ML existe. `load_model` falha com
+   `ModelError`, capturado só ali, nunca propaga — ao contrário de câmera ou
+   modelo de pose ausentes, que são erro fatal, um `.joblib` ausente é
+   silêncio numa coluna do payload.
+2. **Frame incompleto nunca chega ao classificador.** Mesma regra do Sprint
+   07/08: uma junta oculta virando `0` pareceria um valor real e confiante pro
+   Random Forest (cotovelo "a 0 grau" pareceria totalmente dobrado). O sinal
+   fica `null` nesse frame em vez de arriscar um palpite fabricado.
+3. **Sinal cru, sem suavização.** É "Sinal X em tempo real" por definição —
+   pisca frame a frame do jeito que o modelo realmente prevê, sem debounce
+   nem cooldown como o `GestureEngine` tem. O painel mostra o modelo pelado,
+   inclusive as vezes que ele erra ou hesita — dado real pra decidir depois se
+   precisa de mais tratamento.
+
+`--model` é flag nova em `hello_web.py`/`check_web.py`, default aponta pro
+mesmo `backend/models/gesture_classifier.joblib` que o Sprint 08 salva.
 
 ### Decisões do Sprint 08: o vetor de treino é a única fonte da verdade
 

@@ -79,6 +79,7 @@ def create_app(
                 still_threshold=pipeline.config.motion.still_threshold,
                 preview_width=pipeline.config.preview_width,
                 jpeg_quality=pipeline.config.jpeg_quality,
+                ml_classes=pipeline.ml_classes(),
             )
         )
 
