@@ -15,7 +15,7 @@ armazenado — apenas landmarks temporários, dados de treino e eventos detectad
 | 04 | Motion (histórico, velocidade) | ✅ pronto |
 | 05 | Web App (FastAPI + WebSocket) | ✅ pronto |
 | 06 | Gesture Rules | ✅ pronto |
-| 07 | Dataset Builder | ⬜ |
+| 07 | Dataset Builder | ✅ pronto |
 | 08 | ML Training (Random Forest) | ⬜ |
 | 09 | Live ML (Sinal X em tempo real) | ⬜ |
 | 10 | Motion Lab (métricas, explicabilidade) | ⬜ |
@@ -74,6 +74,10 @@ uv run python scripts/check_web.py --frames 30
 uv run python scripts/check_gestures.py --simulate
 uv run python scripts/check_gestures.py --frames 300   # webcam
 
+# Sprint 07 — grava amostras rotuladas (features, nunca pixel) em data/training/dataset.csv
+# segure 1-5 pra gravar cada rótulo, SPACE pra parar, q/ESC pra sair
+uv run python scripts/hello_dataset.py
+
 # testes (não precisam de webcam nem do modelo — ambos são falsificados)
 uv run pytest -q
 ```
@@ -107,6 +111,31 @@ Camera Engine  ->  Pose Engine  ->  Landmark Engine  ->  Feature Engine
 Regra de acoplamento: cada camada recebe o **dado** da anterior, nunca o handle dela.
 `CameraEngine` entrega `Frame`, não um `cv2.VideoCapture` — por isso trocar webcam por
 arquivo de vídeo não toca em nada do lado da visão.
+
+### Decisões do Sprint 07: o dataset não é a mesma tabela do gesto
+
+`backend/dataset/` grava `FrameFeatures` rotulados em `data/training/dataset.csv`
+pra alimentar o Random Forest do Sprint 08. Três escolhas:
+
+1. **Motion entra na mesma linha das features estáticas.** `FEATURE_NAMES`
+   descreve um instante; "aceno" não é postura, é movimento. Um classificador
+   treinado só em posição não distingue punho no meio de um aceno de qualquer
+   outra posição de passagem. `MOTION_COLUMNS` (velocidade, direção) dá esse
+   sinal — sem ele o rótulo `wave` seria ruído puro no dataset.
+2. **Frame incompleto não vira amostra.** `FrameFeatures.complete` já diz se
+   toda coluna de ML está preenchida (regra do Sprint 03: junta oculta é
+   `None`, nunca um `0` inventado). `DatasetWriter` descarta e conta em vez de
+   gravar — `skipped` no HUD mostra oclusão acontecendo, não depois do fato.
+3. **Gravação é sem debounce, de propósito.** `GestureEngine` exige postura
+   sustentada antes de contar; aqui cada frame com a tecla segurada vira uma
+   linha, erro incluído — é matéria-prima pra treinar, uma amostra ruim é só
+   uma linha a filtrar depois, não um veredito ao vivo que precisa acertar.
+
+Segurar tecla no OpenCV não tem key-up nativo: `hello_dataset.py` infere
+"ainda segurando" pelo auto-repeat do SO chegando mais rápido que
+`RELEASE_TIMEOUT` (0.25s) — SPACE sempre para na hora, como rede de segurança.
+`data/training/*` fica fora do git (só `.gitkeep`): dataset de gesto carrega
+dado biométrico-ish, fica local por padrão.
 
 ### Decisões do Sprint 06: um gesto é um evento, não um estado
 
@@ -250,6 +279,7 @@ backend/
   features/velocity.py   SignalTrack, MotionTracker, MotionState, Direction, Trail
   gestures/rules.py   arm_raised, arms_crossed, arms_open (postura, sem tempo)
   gestures/engine.py  GestureEngine, GestureConfig, GestureEvent (hold + cooldown)
+  dataset/writer.py   DatasetWriter, DATASET_COLUMNS — features+motion rotulados em CSV
   events/             (sprint 09) event store
   models/             (sprint 08) modelos .joblib treinados
   web/payload.py      formato de mensagem do WebSocket (hello/frame/error)
