@@ -3,88 +3,355 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Motion Lab — Sprint 05</title>
+    <meta name="color-scheme" content="dark" />
+    <title>Motion Lab — Live Studio</title>
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
-    <header class="bar">
-      <h1>MOTION LAB <span class="sprint">sprint 05 · web app</span></h1>
-      <p class="status" id="status">
-        <span class="dot" id="dot"></span><span id="status-text">conectando…</span>
-      </p>
+    <header class="app-bar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">ML</span>
+        <div>
+          <h1>Motion Lab</h1>
+          <p>Live Studio</p>
+        </div>
+      </div>
+
+      <div class="app-meta">
+        <p class="privacy-pill" title="Os pixels ficam somente na memória">
+          <span aria-hidden="true">●</span> processamento local
+        </p>
+        <p class="status" id="status" aria-live="polite">
+          <span class="dot" id="dot"></span><span id="status-text">conectando…</span>
+        </p>
+      </div>
     </header>
 
-    <main>
-      <section class="stage">
-        <!-- Size is set from the first frame: the canvas matches the preview the
-             server sends, and CSS scales it down on narrow screens. -->
-        <canvas id="view" width="640" height="360"></canvas>
-        <p class="banner hidden" id="banner"></p>
-        <p class="hint hidden" id="hint">nenhum corpo detectado</p>
-        <p class="toast hidden" id="toast"></p>
+    <main class="studio-layout">
+      <section class="stage-column" aria-label="Visualização ao vivo">
+        <div class="stage">
+          <canvas
+            id="view"
+            width="640"
+            height="360"
+            role="img"
+            aria-label="Vídeo ao vivo com visualização de pose e sinais faciais"
+          >
+            Seu navegador não oferece suporte ao canvas.
+          </canvas>
+
+          <div class="presence-strip" aria-label="Estado das detecções">
+            <span class="presence-chip pending" id="camera-chip">
+              <span class="presence-dot" aria-hidden="true"></span>
+              <span id="camera-chip-text">câmera iniciando</span>
+            </span>
+            <span class="presence-chip pending" id="body-chip">
+              <span class="presence-dot" aria-hidden="true"></span>
+              <span id="body-chip-text">procurando corpo</span>
+            </span>
+            <span class="presence-chip pending" id="face-chip">
+              <span class="presence-dot" aria-hidden="true"></span>
+              <span id="face-chip-text">verificando rosto</span>
+            </span>
+          </div>
+
+          <p class="banner hidden" id="banner" role="alert"></p>
+          <p class="hint hidden" id="hint">Entre no enquadramento para detectar o corpo</p>
+          <p class="toast hidden" id="toast" aria-live="assertive"></p>
+
+          <div class="preset-dock" role="group" aria-label="Presets de visualização">
+            <span class="preset-label">Visual</span>
+            <button type="button" class="preset-button" data-preset="clean">Limpo</button>
+            <button type="button" class="preset-button active" data-preset="studio">Studio</button>
+            <button type="button" class="preset-button" data-preset="body">Corpo</button>
+            <button type="button" class="preset-button" data-preset="face">Rosto</button>
+            <button type="button" class="preset-button" data-preset="debug">Debug</button>
+          </div>
+        </div>
+
+        <div class="stage-caption">
+          <p><span class="privacy-icon" aria-hidden="true">◆</span> Nenhum frame é gravado.</p>
+          <p>Atalhos: <kbd>m</kbd> espelho · <kbd>b</kbd> corpo · <kbd>o</kbd> rosto</p>
+        </div>
       </section>
 
-      <aside class="panel">
-        <section>
-          <h2>ml ao vivo</h2>
-          <dl>
-            <dt>sinal</dt><dd><span class="badge" id="ml-label">sem modelo</span></dd>
-            <dt>confiança</dt><dd id="ml-confidence">—</dd>
-          </dl>
-        </section>
+      <aside class="panel" aria-label="Painel do Motion Lab">
+        <nav class="panel-tabs" role="tablist" aria-label="Seções do painel">
+          <button
+            type="button"
+            class="panel-tab active"
+            id="tab-now"
+            data-tab="now"
+            role="tab"
+            aria-selected="true"
+            aria-controls="panel-now"
+          >Agora</button>
+          <button
+            type="button"
+            class="panel-tab"
+            id="tab-history"
+            data-tab="history"
+            role="tab"
+            aria-selected="false"
+            aria-controls="panel-history"
+          >Histórico</button>
+          <button
+            type="button"
+            class="panel-tab"
+            id="tab-diagnostics"
+            data-tab="diagnostics"
+            role="tab"
+            aria-selected="false"
+            aria-controls="panel-diagnostics"
+          >Diagnóstico</button>
+        </nav>
 
-        <section>
-          <h2>gestos</h2>
-          <ul class="feed" id="gesture-feed"></ul>
-        </section>
+        <div class="panel-scroll">
+          <section
+            class="tab-panel"
+            id="panel-now"
+            data-panel="now"
+            role="tabpanel"
+            aria-labelledby="tab-now"
+          >
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Leitura ao vivo</p>
+                <h2>O que está acontecendo agora</h2>
+              </div>
+              <span class="badge" id="face-status">indisponível</span>
+            </div>
 
-        <section>
-          <h2>stream</h2>
-          <dl>
-            <dt>fps</dt><dd id="fps">—</dd>
-            <dt>inferência</dt><dd><span id="inference">—</span> ms</dd>
-            <dt>confiança</dt><dd id="confidence">—</dd>
-            <dt>frame</dt><dd id="frame-index">—</dd>
-          </dl>
-        </section>
+            <section id="face-panel" aria-label="Sinais faciais observáveis">
+              <div class="signal-grid">
+                <article class="signal-card signal-card-wide">
+                  <div class="signal-card-heading">
+                    <span>Expressão observável</span>
+                    <span class="signal-value" id="face-smile">—</span>
+                  </div>
+                  <p class="signal-title">Sorriso aparente</p>
+                  <div class="signal-meter" aria-hidden="true">
+                    <span id="face-smile-meter"></span>
+                  </div>
+                  <div class="signal-subrow">
+                    <span>boca <strong id="face-mouth">—</strong></span>
+                    <span>sobrancelhas <strong id="face-brow">—</strong></span>
+                  </div>
+                </article>
 
-        <section>
-          <h2>braço esquerdo</h2>
-          <dl>
-            <dt>direção</dt><dd><span class="badge" id="left-direction">—</span></dd>
-            <dt>vy</dt><dd id="left-vy">—</dd>
-            <dt>velocidade</dt><dd id="left-speed">—</dd>
-            <dt>cotovelo</dt><dd><span id="left-elbow">—</span>°</dd>
-            <dt>altura punho</dt><dd id="left-height">—</dd>
-          </dl>
-        </section>
+                <article class="signal-card">
+                  <span class="signal-kicker">Olhos</span>
+                  <p class="signal-title" id="face-eyes-summary">aguardando sinal</p>
+                  <dl class="compact-list">
+                    <dt>fechamento E / D</dt>
+                    <dd><span id="face-blink-left">—</span> / <span id="face-blink-right">—</span></dd>
+                    <dt>piscadas/min E / D</dt>
+                    <dd><span id="face-blink-rate-left">—</span> / <span id="face-blink-rate-right">—</span></dd>
+                  </dl>
+                </article>
 
-        <section>
-          <h2>braço direito</h2>
-          <dl>
-            <dt>direção</dt><dd><span class="badge" id="right-direction">—</span></dd>
-            <dt>vy</dt><dd id="right-vy">—</dd>
-            <dt>velocidade</dt><dd id="right-speed">—</dd>
-            <dt>cotovelo</dt><dd><span id="right-elbow">—</span>°</dd>
-            <dt>altura punho</dt><dd id="right-height">—</dd>
-          </dl>
-        </section>
+                <article class="signal-card">
+                  <span class="signal-kicker">Orientação experimental</span>
+                  <p class="signal-title" id="face-head-direction">aguardando sinal</p>
+                  <dl class="compact-list">
+                    <dt>guinada</dt><dd><span id="face-yaw">—</span>°</dd>
+                    <dt>inclinação</dt><dd><span id="face-pitch">—</span>°</dd>
+                    <dt>rotação</dt><dd><span id="face-roll">—</span>°</dd>
+                  </dl>
+                </article>
+              </div>
+            </section>
 
-        <section class="toggles">
-          <h2>exibição</h2>
-          <label><input type="checkbox" id="toggle-mirror" checked /> espelho <kbd>m</kbd></label>
-          <label><input type="checkbox" id="toggle-trail" checked /> rastro <kbd>t</kbd></label>
-          <label><input type="checkbox" id="toggle-labels" /> rótulos <kbd>l</kbd></label>
-          <label><input type="checkbox" id="toggle-video" checked /> vídeo <kbd>v</kbd></label>
-        </section>
+            <section class="empty-state hidden" id="face-ui-empty">
+              <p class="empty-state-title">Sinais faciais ocultos</p>
+              <p id="face-ui-empty-copy">Ative os dados faciais no painel de diagnóstico.</p>
+            </section>
 
-        <footer>
-          <p>velocidades em larguras de ombro por segundo.</p>
-          <p>nenhum frame é gravado — os pixels existem só em memória.</p>
+            <section class="live-section">
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">Classificador</p>
+                  <h2>ML ao vivo</h2>
+                </div>
+                <span class="badge" id="ml-label">sem modelo</span>
+              </div>
+              <dl class="summary-row">
+                <dt>confiança do sinal</dt><dd id="ml-confidence">—</dd>
+              </dl>
+            </section>
+
+            <section class="live-section">
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">Eventos recentes</p>
+                  <h2>Gestos</h2>
+                </div>
+              </div>
+              <ul class="feed" id="gesture-feed" aria-live="polite"></ul>
+            </section>
+          </section>
+
+          <section
+            class="tab-panel"
+            id="panel-history"
+            data-panel="history"
+            role="tabpanel"
+            aria-labelledby="tab-history"
+            hidden
+          >
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Últimos 10 segundos</p>
+                <h2>Sinais no tempo</h2>
+              </div>
+            </div>
+
+            <div id="face-history-panel">
+              <div class="chart-block">
+                <div class="chart-heading">
+                  <label for="face-level-series-select">Sinal facial</label>
+                  <select id="face-level-series-select">
+                    <option value="smile">Sorriso aparente</option>
+                    <option value="mouth_open">Abertura da boca</option>
+                    <option value="eye_blink_left">Olho esquerdo</option>
+                    <option value="eye_blink_right">Olho direito</option>
+                    <option value="brow_raise">Sobrancelhas</option>
+                  </select>
+                </div>
+                <div class="chart-frame">
+                  <span class="axis-label axis-top">1.0</span>
+                  <span class="axis-label axis-bottom">0</span>
+                  <canvas
+                    id="face-chart-levels"
+                    class="chart"
+                    width="520"
+                    height="180"
+                    role="img"
+                    aria-label="Histórico do sinal facial selecionado"
+                  ></canvas>
+                </div>
+                <ul class="chart-legend" id="face-legend-levels"></ul>
+                <p class="chart-caption">−10s <span>agora · unidade blendshape · <span id="face-chart-levels-state">—</span></span></p>
+              </div>
+
+              <div class="chart-block">
+                <div class="chart-heading">
+                  <label for="face-head-series-select">Orientação da cabeça</label>
+                  <select id="face-head-series-select">
+                    <option value="head_yaw">Guinada (yaw)</option>
+                    <option value="head_pitch">Inclinação (pitch)</option>
+                    <option value="head_roll">Rotação (roll)</option>
+                  </select>
+                </div>
+                <div class="chart-frame">
+                  <span class="axis-label axis-top">+90°</span>
+                  <span class="axis-label axis-bottom">−90°</span>
+                  <canvas
+                    id="face-chart-head"
+                    class="chart"
+                    width="520"
+                    height="180"
+                    role="img"
+                    aria-label="Histórico da orientação de cabeça selecionada"
+                  ></canvas>
+                </div>
+                <ul class="chart-legend" id="face-legend-head"></ul>
+                <p class="chart-caption">−10s <span>agora · graus · <span id="face-chart-head-state">—</span></span></p>
+              </div>
+            </div>
+
+            <section class="empty-state hidden" id="face-history-empty">
+              <p class="empty-state-title">Histórico facial indisponível</p>
+              <p>Ative os dados faciais para acompanhar os sinais no tempo.</p>
+            </section>
+
+            <details class="explanation">
+              <summary>Como interpretar estes sinais?</summary>
+              <p>
+                “Fechamento do olho” é uma leitura instantânea de 0 a 1. A taxa de
+                piscadas conta eventos no tempo. São sinais observáveis, nunca um
+                diagnóstico de emoção ou estado mental.
+              </p>
+            </details>
+          </section>
+
+          <section
+            class="tab-panel"
+            id="panel-diagnostics"
+            data-panel="diagnostics"
+            role="tabpanel"
+            aria-labelledby="tab-diagnostics"
+            hidden
+          >
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Instrumentação</p>
+                <h2>Diagnóstico técnico</h2>
+              </div>
+            </div>
+
+            <section class="diagnostic-card">
+              <h3>Stream</h3>
+              <dl>
+                <dt>fps da captura</dt><dd id="fps">—</dd>
+                <dt>inferência de pose</dt><dd><span id="inference">—</span> ms</dd>
+                <dt>confiança da pose</dt><dd id="confidence">—</dd>
+                <dt>frame</dt><dd id="frame-index">—</dd>
+              </dl>
+            </section>
+
+            <div class="diagnostic-grid">
+              <section class="diagnostic-card">
+                <h3>Braço esquerdo</h3>
+                <dl>
+                  <dt>direção</dt><dd><span class="badge" id="left-direction">—</span></dd>
+                  <dt>vy</dt><dd id="left-vy">—</dd>
+                  <dt>velocidade</dt><dd id="left-speed">—</dd>
+                  <dt>cotovelo</dt><dd><span id="left-elbow">—</span>°</dd>
+                  <dt>altura do punho</dt><dd id="left-height">—</dd>
+                </dl>
+              </section>
+
+              <section class="diagnostic-card">
+                <h3>Braço direito</h3>
+                <dl>
+                  <dt>direção</dt><dd><span class="badge" id="right-direction">—</span></dd>
+                  <dt>vy</dt><dd id="right-vy">—</dd>
+                  <dt>velocidade</dt><dd id="right-speed">—</dd>
+                  <dt>cotovelo</dt><dd><span id="right-elbow">—</span>°</dd>
+                  <dt>altura do punho</dt><dd id="right-height">—</dd>
+                </dl>
+              </section>
+            </div>
+
+            <section class="diagnostic-card toggles">
+              <h3>Camadas de exibição</h3>
+              <label><input type="checkbox" id="toggle-video" checked /> vídeo <kbd>v</kbd></label>
+              <label><input type="checkbox" id="toggle-mirror" checked /> espelho <kbd>m</kbd></label>
+              <label><input type="checkbox" id="toggle-body-overlay" checked /> overlay corporal <kbd>b</kbd></label>
+              <label><input type="checkbox" id="toggle-trail" /> rastro <kbd>t</kbd></label>
+              <label><input type="checkbox" id="toggle-labels" /> números e rótulos <kbd>l</kbd></label>
+              <label><input type="checkbox" id="toggle-face" checked /> dados faciais <kbd>f</kbd></label>
+              <label><input type="checkbox" id="toggle-face-overlay" checked /> overlay facial <kbd>o</kbd></label>
+            </section>
+
+            <p class="technical-note">
+              Os controles faciais mostram ou escondem dados já habilitados pelo servidor.
+              Para iniciar o processamento, execute com <code>--face</code>.
+            </p>
+          </section>
+        </div>
+
+        <footer class="panel-footer">
+          <span class="footer-lock" aria-hidden="true">◆</span>
+          <span>Local por padrão. Pixels apenas em memória.</span>
         </footer>
       </aside>
     </main>
 
+    <script src="/static/face-history.js"></script>
+    <script src="/static/face-overlay.js"></script>
+    <script src="/static/studio-controls.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

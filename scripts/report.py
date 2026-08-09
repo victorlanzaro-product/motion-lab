@@ -144,6 +144,10 @@ def main() -> int:
         "n_samples": bundle["n_samples"],
         "counts": bundle["counts"],
         "accuracy": bundle["accuracy"],
+        # Both absent from a bundle saved before this field existed --
+        # `render_report`/`print_report` fall back to 0.0 rather than KeyError.
+        "macro_f1": bundle.get("macro_f1", 0.0),
+        "balanced_accuracy": bundle.get("balanced_accuracy", 0.0),
         "feature_importances": bundle["feature_importances"],
         "class_labels": bundle["classes"],
         "confusion_matrix": bundle["confusion_matrix"],
