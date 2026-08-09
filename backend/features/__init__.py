@@ -2,6 +2,12 @@
 
 from backend.features.angles import angle_between, elbow_angle, shoulder_angle
 from backend.features.distances import distance, forearm_length, shoulder_width, wrist_distance
+from backend.features.face_features import FACE_SIGNAL_NAMES, FaceSignals, extract_face
+from backend.features.face_motion import (
+    FACE_MOTION_COLUMNS,
+    FaceMotionState,
+    FaceMotionTracker,
+)
 from backend.features.features import FEATURE_NAMES, FrameFeatures, extract
 from backend.features.positions import (
     wrist_above_shoulder,
@@ -21,9 +27,14 @@ from backend.features.velocity import (
 )
 
 __all__ = [
+    "FACE_MOTION_COLUMNS",
+    "FACE_SIGNAL_NAMES",
     "FEATURE_NAMES",
     "ArmMotion",
     "Direction",
+    "FaceMotionState",
+    "FaceMotionTracker",
+    "FaceSignals",
     "FrameFeatures",
     "MotionConfig",
     "MotionState",
@@ -35,6 +46,7 @@ __all__ = [
     "distance",
     "elbow_angle",
     "extract",
+    "extract_face",
     "forearm_length",
     "shoulder_angle",
     "shoulder_width",

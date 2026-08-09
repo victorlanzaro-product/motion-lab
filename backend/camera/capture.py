@@ -26,6 +26,14 @@ class CameraError(RuntimeError):
     """Raised when the webcam cannot be opened or stops delivering frames."""
 
 
+class CameraOpenError(CameraError):
+    """Camera could not be opened; operator action may be required."""
+
+
+class CameraReadError(CameraError):
+    """An opened camera stopped delivering frames; this may be transient."""
+
+
 @dataclass(frozen=True)
 class CameraConfig:
     index: int = 0
@@ -115,7 +123,7 @@ class CameraEngine:
         capture = self.capture_factory(self.config)
         if not capture.isOpened():
             capture.release()
-            raise CameraError(
+            raise CameraOpenError(
                 f"Could not open camera index {self.config.index}. "
                 "On macOS, grant camera access to your terminal/IDE in "
                 "System Settings > Privacy & Security > Camera, then restart it."
@@ -183,7 +191,7 @@ class CameraEngine:
             if frame is None:
                 failures += 1
                 if failures >= self.config.max_read_failures:
-                    raise CameraError(
+                    raise CameraReadError(
                         f"Camera stopped delivering frames after "
                         f"{self.config.max_read_failures} consecutive failed reads."
                     )
