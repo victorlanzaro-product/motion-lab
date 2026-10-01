@@ -5,7 +5,10 @@ from backend.dataset.writer import (
     DEFAULT_DATASET_PATH,
     DEFAULT_LABELS,
     MOTION_COLUMNS,
+    NUMERIC_MOTION_COLUMNS,
+    REMOVED_LABELS,
     DatasetWriter,
+    DatasetWriterError,
 )
 
 __all__ = [
@@ -13,5 +16,8 @@ __all__ = [
     "DEFAULT_DATASET_PATH",
     "DEFAULT_LABELS",
     "MOTION_COLUMNS",
+    "NUMERIC_MOTION_COLUMNS",
+    "REMOVED_LABELS",
     "DatasetWriter",
+    "DatasetWriterError",
 ]

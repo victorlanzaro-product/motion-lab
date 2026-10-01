@@ -68,6 +68,11 @@ def create_app(
             "clients": pipeline.client_count,
             "frames": pipeline.frames_served,
             "error": pipeline.error,
+            # Independent of `error` on purpose: the face signal is optional
+            # (Sprint 11) and can be unavailable while pose/web are perfectly
+            # healthy -- `pipeline.state`/`error` must keep meaning "the whole
+            # pipeline", not get muddied by an opt-in layer's own failure.
+            "face_error": pipeline.face_error,
         }
 
     @app.websocket("/ws")
@@ -80,6 +85,7 @@ def create_app(
                 preview_width=pipeline.config.preview_width,
                 jpeg_quality=pipeline.config.jpeg_quality,
                 ml_classes=pipeline.ml_classes(),
+                face_enabled=pipeline.config.face_enabled,
             )
         )
 
@@ -94,11 +100,29 @@ def create_app(
             )
             for task in pending:
                 task.cancel()
+            # Always let a cancelled task finish unwinding before this handler
+            # returns -- an un-awaited task is still mid-cleanup (or could
+            # raise something other than `CancelledError`) after this
+            # coroutine has already moved on, which used to surface as
+            # "Task exception was never retrieved" on server shutdown.
+            # `return_exceptions=True` means this call itself never raises.
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             for task in done:
                 task.result()  # surface a real bug instead of swallowing it
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            # `CancelledError` here is the ASGI server tearing this same
+            # coroutine down from outside (shutdown, or the test client's own
+            # teardown) while we are still waiting on `pending` above -- the
+            # same "client is gone" signal `WebSocketDisconnect` already
+            # models, not a bug to propagate. Cleanup below still runs, and
+            # the very next checkpoint re-raises into whatever cancelled us,
+            # so the cancellation itself is never actually lost.
             pass
         finally:
+            for task in (writer, reader):
+                if not task.done():
+                    task.cancel()
             pipeline.unsubscribe(subscriber)
 
     return app

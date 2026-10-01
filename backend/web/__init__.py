@@ -11,6 +11,7 @@ from backend.web.payload import (
     frame_message,
     hello_message,
     landmarks_payload,
+    status_message,
     trail_payload,
 )
 from backend.web.pipeline import PipelineRunner, Subscriber, WebConfig
@@ -26,5 +27,6 @@ __all__ = [
     "frame_message",
     "hello_message",
     "landmarks_payload",
+    "status_message",
     "trail_payload",
 ]
