@@ -6,8 +6,14 @@ amostras rotuladas de features (nunca pixels) em data/training/."
     uv run python scripts/hello_dataset.py     # q/ESC quits
 
 Controls
-  1 arm_raised   2 wave   3 arms_crossed   4 arms_open   5 idle
+  1 arm_raised   2 arms_crossed   3 arms_open   4 idle
   hold the digit key to record that label continuously; release to stop.
+
+  "wave" is not one of the keys: it is a class of motion, not posture, and
+  this recorder writes one static feature snapshot per frame -- no window of
+  reversals for the Forest to actually learn a wave from. GestureEngine's
+  rule-based detector recognizes a wave live; this dataset does not train
+  the ML side to (`backend/dataset/writer.py:REMOVED_LABELS`).
 
 Recording is edge-free on purpose — this is raw material for Sprint 08's
 Random Forest, not a gesture verdict, so there is no hold debounce or

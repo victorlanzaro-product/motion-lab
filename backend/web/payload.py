@@ -19,18 +19,26 @@ JavaScript: the bone table is domain knowledge and belongs in one place.
 from __future__ import annotations
 
 import base64
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import cv2
 import numpy as np
 
+from backend.features.face_features import FaceSignals
+from backend.features.face_motion import FaceMotionState
 from backend.features.features import FEATURE_NAMES, FrameFeatures
 from backend.features.velocity import MotionState, Trail
 from backend.gestures.engine import GestureEvent
+from backend.vision.face_landmarks import (
+    FACE_CHAIN_GROUPS,
+    FACE_MESH_CONTRACT_VERSION,
+    FACE_OVERLAY_LANDMARKS,
+)
 from backend.vision.landmarks import (
     ARM_CHAINS,
     ARM_LANDMARKS,
     DEFAULT_VISIBILITY_THRESHOLD,
+    Point,
     PoseSnapshot,
 )
 
@@ -101,6 +109,24 @@ def landmarks_payload(snapshot: PoseSnapshot) -> dict[str, dict[str, float]]:
     return payload
 
 
+def face_landmarks_payload(mesh: Mapping[int, Point]) -> dict[str, dict[str, float]]:
+    """Face overlay points, keyed by landmark index as a string — same shape
+    `landmarks_payload` uses for arm joints.
+
+    Only `x`/`y` travel: `z` is not drawn client-side (2D overlay only), and
+    no `v`/visibility field is added the way arm joints get one, because the
+    Face Landmarker gives no equivalent per-point confidence to report
+    (`face_landmarks.py`'s `FaceSnapshot` docstring) — inventing one would
+    look exactly as trustworthy as the real thing while measuring nothing.
+    Empty when `mesh` is empty (no face this frame): nothing to draw, not a
+    guess at where the face might be.
+    """
+    return {
+        str(index): {"x": _round(point.x, COORD_DIGITS), "y": _round(point.y, COORD_DIGITS)}
+        for index, point in mesh.items()
+    }
+
+
 def trail_payload(trail: Trail) -> list[list[list[float]]]:
     """Wrist trajectory as one polyline per continuous run.
 
@@ -169,6 +195,64 @@ def gesture_payload(events: list[GestureEvent]) -> list[dict[str, Any]]:
     ]
 
 
+def face_payload(
+    *,
+    enabled: bool,
+    error: Optional[str],
+    detected: bool = False,
+    signals: Optional[FaceSignals] = None,
+    motion: Optional[FaceMotionState] = None,
+    mesh: Optional[Mapping[int, Point]] = None,
+) -> dict[str, Any]:
+    """Facial signal for the wire — always present, never an emotion claim.
+
+    `mesh` is `FaceSnapshot.mesh` (the overlay-subset points), or `None`/empty
+    when there is nothing to draw — a missing/disabled/errored face never
+    reaches `landmarks_payload` at all here, same as `signals`/`motion`.
+
+    Three states the client has to tell apart, so `reason`/`available`/
+    `detected` are three separate fields rather than one:
+
+    * `available: false, reason: "disabled"` — the operator turned face
+      tracking off for this deployment (`WebConfig.face_enabled`).
+    * `available: false, reason: <error>` — face tracking is on but the
+      model never loaded this session (missing file, failed download, or a
+      runtime error mid-session); Sprint 09's rule for the ML signal, applied
+      here too: optional layers degrade, they never take pose/web down.
+    * `available: true, detected: false` — the model is fine, nobody's face
+      is in frame this instant.
+
+    Every field is a named, observable signal (`smile`, `mouth_open`, ...) or
+    a rate of change of one — never a mood, an emotion, or a mental state.
+    """
+    if not enabled:
+        return {"available": False, "detected": False, "reason": "disabled"}
+    if signals is None:
+        return {"available": False, "detected": False, "reason": error or "no_model"}
+    return {
+        "available": True,
+        "detected": detected,
+        "smile": _round(signals.smile, 3),
+        "mouth_open": _round(signals.mouth_open, 3),
+        "eye_blink_left": _round(signals.eye_blink_left, 3),
+        "eye_blink_right": _round(signals.eye_blink_right, 3),
+        "brow_raise": _round(signals.brow_raise, 3),
+        "head_yaw": _round(signals.head_yaw, 1),
+        "head_pitch": _round(signals.head_pitch, 1),
+        "head_roll": _round(signals.head_roll, 1),
+        "smile_velocity": _round(motion.smile_velocity, 3) if motion else None,
+        "mouth_open_velocity": _round(motion.mouth_open_velocity, 3) if motion else None,
+        "brow_raise_velocity": _round(motion.brow_raise_velocity, 3) if motion else None,
+        "blink_rate_left": _round(motion.blink_rate_left, 2) if motion else None,
+        "blink_rate_right": _round(motion.blink_rate_right, 2) if motion else None,
+        # Overlay points for THIS frame -- `{}` (never omitted) when nothing
+        # was detected, so the client's "no face -> draw nothing" rule
+        # (app.js:drawFaceOverlay) never has to distinguish "key missing"
+        # from "key present but empty".
+        "landmarks": face_landmarks_payload(mesh) if mesh else {},
+    }
+
+
 def frame_message(
     *,
     snapshot: PoseSnapshot,
@@ -179,6 +263,7 @@ def frame_message(
     trails: dict[str, Trail],
     gestures: Optional[list[GestureEvent]] = None,
     ml: Optional[tuple[str, dict[str, float]]] = None,
+    face: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """One `type: "frame"` message: pixels, joints and numbers from the same frame.
 
@@ -201,6 +286,10 @@ def frame_message(
         "trail": {name: trail_payload(trail) for name, trail in trails.items()},
         "gestures": gesture_payload(gestures or []),
         "ml": ml_payload(ml),
+        # Falls back to "disabled" rather than `None`: an omitted `face` key
+        # would look, to a client written before Sprint 11, exactly like a
+        # face signal that simply is not there yet -- explicit beats absent.
+        "face": face if face is not None else face_payload(enabled=False, error=None),
     }
 
 
@@ -217,6 +306,7 @@ def hello_message(
     preview_width: int = 640,
     jpeg_quality: int = 70,
     ml_classes: Optional[list[str]] = None,
+    face_enabled: bool = False,
 ) -> dict[str, Any]:
     """First message on every connection: everything the client needs to draw.
 
@@ -237,6 +327,22 @@ def hello_message(
         "visibility_threshold": visibility_threshold,
         "still_threshold": still_threshold,
         "preview": {"width": preview_width, "quality": jpeg_quality},
+        # Static config, known before the first frame -- lets the client show
+        # the face toggle (or not) without waiting on a `frame.face` reason.
+        "face_enabled": face_enabled,
+        # Face overlay topology (Sprint 11) -- static domain knowledge, sent
+        # unconditionally on `face_enabled` for the same reason `chains`/
+        # `arm_landmarks` are sent unconditionally on the pose model existing:
+        # it costs nothing when unused and the client never has to hardcode a
+        # copy that could drift from `face_landmarks.py`.
+        "face_landmarks": list(FACE_OVERLAY_LANDMARKS),
+        "face_chains": {
+            name: [[a, b] for a, b in pairs] for name, pairs in FACE_CHAIN_GROUPS.items()
+        },
+        # Bumped only if the topology above ever changes shape -- lets a
+        # client tell "this server's face overlay contract is different from
+        # what I was built against" apart from "no topology sent at all".
+        "face_mesh_version": FACE_MESH_CONTRACT_VERSION,
     }
 
 
@@ -247,3 +353,15 @@ def error_message(message: str, *, fatal: bool = True) -> dict[str, Any]:
     that silently stops looks exactly like a person standing very still.
     """
     return {"type": "error", "message": message, "fatal": fatal}
+
+
+def status_message(state: str, message: str = "") -> dict[str, Any]:
+    """A non-fatal lifecycle notice — the socket stays open, frames may resume.
+
+    Distinct from `error_message` on purpose: an `error` in this wire format
+    always means "the browser should show a stopped state" (see `app.js`).
+    A transient camera drop that `PipelineRunner` is actively retrying is not
+    that — the client should say "reconectando…", not "parado", and keep
+    listening on the same connection for the frames that resume it.
+    """
+    return {"type": "status", "state": state, "message": message}

@@ -23,7 +23,13 @@ from pathlib import Path
 
 from backend.camera import CameraConfig
 from backend.ml import DEFAULT_MODEL_PATH
-from backend.vision import PoseModelError, ensure_model
+from backend.vision import (
+    DEFAULT_FACE_MODEL_PATH,
+    FaceModelError,
+    PoseModelError,
+    ensure_face_model,
+    ensure_model,
+)
 from backend.web import WebConfig, create_app
 
 
@@ -49,6 +55,12 @@ def main() -> int:
         default=DEFAULT_MODEL_PATH,
         help="trained Sprint 08 model; missing is fine, Live ML just stays off",
     )
+    parser.add_argument(
+        "--face",
+        action="store_true",
+        help="Sprint 11 facial signals (smile, blink, brow, head pose) — off by default",
+    )
+    parser.add_argument("--face-model", type=Path, default=DEFAULT_FACE_MODEL_PATH)
     parser.add_argument("--open", action="store_true", help="open the browser on startup")
     args = parser.parse_args()
 
@@ -57,6 +69,8 @@ def main() -> int:
         preview_width=args.preview_width,
         jpeg_quality=args.quality,
         model_path=args.model,
+        face_enabled=args.face,
+        face_model_path=args.face_model,
     )
 
     try:
@@ -66,6 +80,15 @@ def main() -> int:
     except PoseModelError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
+
+    if args.face:
+        try:
+            ensure_face_model(config.face_model_path)
+        except FaceModelError as exc:
+            # Face is optional, never a dependency of the rest of the
+            # pipeline (ARQUITETURA FACIAL: falha degradada) — warn and keep
+            # going with pose/gestures/ML/web fully working.
+            print(f"WARN: face model unavailable, Sprint 11 signals stay off: {exc}")
 
     url = f"http://{args.host}:{args.port}"
     print(f"Motion Lab web app on {url} — the camera starts when a page connects.")

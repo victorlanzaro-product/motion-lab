@@ -14,10 +14,14 @@ Two pieces, independently useful:
    verdict from the same three static booleans `GestureEngine` already checks
    (`arm_raised`, `arms_crossed`, `arms_open` — see `backend/gestures/rules.py`)
    directly off the wire payload, so the comparison uses the identical
-   thresholds the live app itself uses, not a re-guessed copy. "wave" is
-   excluded from the comparison, not counted as a disagreement: it is motion,
-   not a posture, and the rule side has no single-frame equivalent to compare
-   against.
+   thresholds the live app itself uses, not a re-guessed copy. A `ml.label`
+   of `"wave"` is excluded from the comparison rather than counted as a
+   disagreement — not because the current ML model recognizes wave (it
+   cannot: "wave" is out of the trainable vocabulary, see
+   `backend/dataset/writer.py:REMOVED_LABELS`), but so this report does not
+   crash or silently misreport agreement against a `gesture_classifier.joblib`
+   trained before that decision, which may still emit the class it was
+   trained on.
 """
 
 from __future__ import annotations
@@ -53,7 +57,11 @@ def compute_agreement(frames: list[dict[str, Any]], open_threshold: float) -> di
         if not ml:
             continue
         if ml["label"] == "wave":
-            excluded_wave += 1  # no static rule equivalent to compare against
+            # Not something the current model can predict (out of the
+            # trainable vocabulary) -- this only fires against a bundle
+            # trained before that decision. No static rule equivalent to
+            # compare it against either way.
+            excluded_wave += 1
             continue
         compared += 1
         if rule_label(frame["features"], open_threshold) == ml["label"]:
@@ -130,7 +138,9 @@ def _live_section(live: Optional[dict[str, Any]]) -> str:
         agreement_html = (
             f"<p>concordância regra × ML: <strong>{agreement['rate'] * 100:.0f}%</strong> "
             f"({agreement['matches']}/{agreement['compared']} frames comparados; "
-            f"{agreement['excluded_wave']} excluídos por serem 'wave', sem equivalente estático)</p>"
+            f"{agreement['excluded_wave']} excluídos por serem 'wave' -- classe fora do "
+            "vocabulário treinável desde este sprint; só aparece aqui se o modelo "
+            "carregado for de antes dessa decisão)</p>"
         )
     else:
         agreement_html = "<p class='muted'>sem sinal de ML suficiente pra comparar com a regra.</p>"
@@ -201,7 +211,12 @@ def render_report(training: dict[str, Any], live: Optional[dict[str, Any]] = Non
 <body>
   <h1>MOTION LAB — relatório do modelo</h1>
   <p class="muted">treinado em {training['trained_at']} · {training['n_samples']} amostras
-    ({counts}) · acurácia no teste: {training['accuracy'] * 100:.1f}%</p>
+    ({counts}) · acurácia no teste: {training['accuracy'] * 100:.1f}%
+    · macro-F1: {training.get('macro_f1', 0.0):.3f}
+    · acurácia balanceada: {training.get('balanced_accuracy', 0.0) * 100:.1f}%</p>
+  <p class="muted">acurácia simples pode parecer boa só por acertar a classe majoritária
+    (<code>idle</code> costuma dominar uma sessão real); macro-F1 e acurácia balanceada
+    pesam cada classe igual, sem deixar uma classe rara se esconder atrás da média.</p>
 
   <section>
     <h2>importância de feature</h2>

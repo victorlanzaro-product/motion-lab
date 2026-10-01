@@ -195,6 +195,14 @@ class ArmMotion:
     #: moving, and collapsing the two would make the HUD lie.
     moving: Optional[bool] = None
 
+    @property
+    def complete(self) -> bool:
+        """True when every numeric signal is known -- not occluded, and the
+        tracker has warmed up past `min_samples`. Same rule `FrameFeatures.complete`
+        applies to static features (Sprint 03), extended to motion: a `None`
+        here means "we don't know yet", never "not moving"."""
+        return None not in (self.velocity_y, self.velocity_x, self.speed, self.elbow_velocity)
+
 
 @dataclass(frozen=True)
 class MotionState:
@@ -207,6 +215,18 @@ class MotionState:
 
     def arm(self, side: Side) -> ArmMotion:
         return self.left if side is Side.LEFT else self.right
+
+    @property
+    def complete(self) -> bool:
+        """True when both arms' motion is fully known.
+
+        Anything that reads motion as a model input (`PipelineRunner._predict`)
+        must check this the same way it already checks `FrameFeatures.complete`
+        -- a frame or two after the camera starts, or right after an occlusion
+        clears, the tracker has not warmed up yet (`MotionConfig.min_samples`)
+        and every numeric field here is `None`, not `0`.
+        """
+        return self.left.complete and self.right.complete
 
     def to_dict(self) -> dict:
         """Flat payload for the Sprint 05 WebSocket."""
