@@ -72,6 +72,7 @@ const state = {
   smoothedFaceLandmarks: null,
   activeTab: "now",
   lastFace: null,
+  reportAvailable: false,
 };
 
 const el = (id) => document.getElementById(id);
@@ -87,6 +88,7 @@ function connect() {
 
   socket.onopen = () => {
     state.retries = 0;
+    confidenceTimeline.clear();
     // Not "ao vivo" yet: opening the webcam and loading the pose model takes a
     // few seconds on the first connection, and a green dot over a black canvas
     // reads as a broken app.
@@ -116,6 +118,7 @@ function connect() {
 function handle(message) {
   if (message.type === "hello") {
     state.config = message;
+    applyReportAvailable(message.report_available);
     applyFaceEnabled(message.face_enabled);
     setPresenceChip(
       "face",
@@ -163,6 +166,7 @@ function handle(message) {
     // the newest one, but the history still needs every message's timestamp
     // to keep the ~10s window accurate.
     recordFaceHistory(message);
+    recordConfidenceTimeline(message);
     state.pending = message;
     render();
   }
@@ -398,6 +402,130 @@ function fmt(value, digits = 2) {
   return value === null || value === undefined ? "—" : value.toFixed(digits);
 }
 
+// --- Sprint 15 dashboard ------------------------------------------------
+//
+// One global timeline (single camera / pipeline). The browser only stores and
+// draws what the frame payload already decided -- no feature recompute.
+
+const confidenceTimeline = ConfidenceTimeline.createTimeline();
+
+const TIMING_VALUE_IDS = {
+  capture_ms: "timing-capture",
+  pose_ms: "timing-pose",
+  features_ms: "timing-features",
+  ml_ms: "timing-ml",
+  face_ms: "timing-face",
+};
+
+const TIMING_BAR_IDS = {
+  capture_ms: "timing-bar-capture",
+  pose_ms: "timing-bar-pose",
+  features_ms: "timing-bar-features",
+  ml_ms: "timing-bar-ml",
+  face_ms: "timing-bar-face",
+};
+
+const AGREEMENT_COLORS = {
+  agree: COLORS.accent,
+  disagree: "#ff747b",
+  unknown: "rgba(141, 155, 173, 0.35)",
+};
+
+function applyReportAvailable(available) {
+  state.reportAvailable = Boolean(available);
+  const link = el("report-link");
+  if (!link) return;
+  // Maestro S15: the link always opens /report; 404 carries the short message.
+  // `report_available` only drives the hint, never disables navigation.
+  link.classList.toggle("pending", !state.reportAvailable);
+  link.title = state.reportAvailable
+    ? "Abre o último relatório HTML gerado no servidor"
+    : "Relatório ainda não gerado — rode scripts/report.py";
+}
+
+function recordConfidenceTimeline(message) {
+  confidenceTimeline.push(message);
+}
+
+function updateHealthPanel(message) {
+  const view = HealthPanel.snapshot(message);
+  el("health-fps").textContent = view.fpsDisplay;
+  if (view.dropped_frames === null || view.dropped_frames === undefined) {
+    el("health-dropped-frames").textContent = "—";
+  } else {
+    el("health-dropped-frames").textContent = String(view.dropped_frames);
+  }
+  const rateNode = el("health-dropped-rate");
+  rateNode.textContent = view.droppedRateDisplay;
+  rateNode.classList.toggle("alert", view.droppedRateAlert);
+  const rateLabel = el("pipeline-health-panel")?.querySelector(".health-dropped-label");
+  if (rateLabel) rateLabel.classList.toggle("alert", view.droppedRateAlert);
+  el("health-total-ms").textContent =
+    view.totalDisplay === "—" ? view.totalDisplay : `${view.totalDisplay} ms`;
+  for (const stage of view.stages) {
+    const valueId = TIMING_VALUE_IDS[stage.key];
+    const barId = TIMING_BAR_IDS[stage.key];
+    if (valueId) {
+      el(valueId).textContent = stage.display === "—" ? "—" : `${stage.display} ms`;
+    }
+    if (barId) el(barId).style.width = `${Math.round(stage.barFraction * 100)}%`;
+  }
+}
+
+const mlConfidenceCanvas = el("ml-confidence-chart");
+const mlConfidenceCtx = mlConfidenceCanvas ? mlConfidenceCanvas.getContext("2d") : null;
+
+function renderConfidenceTimeline() {
+  const rateNode = el("ml-agreement-rate");
+  if (!mlConfidenceCanvas || !mlConfidenceCtx) return;
+  if (state.activeTab !== "history") return;
+
+  clearChartCanvas(mlConfidenceCanvas, mlConfidenceCtx);
+  drawChartGrid(mlConfidenceCanvas, mlConfidenceCtx);
+
+  const now = confidenceTimeline.now();
+  if (now === null) {
+    if (rateNode) rateNode.textContent = "—";
+    return;
+  }
+
+  const points = confidenceTimeline.series(now);
+  const bandHeight = 10;
+  const padTop = 6;
+  const plotHeight = mlConfidenceCanvas.height - bandHeight - padTop - 4;
+  const width = mlConfidenceCanvas.width;
+  const slice =
+    points.length > 1 ? Math.max(1, Math.ceil(width / Math.max(points.length - 1, 1))) : 1;
+
+  for (const point of points) {
+    const x = Math.round(point.x * (width - 1));
+    let color = AGREEMENT_COLORS.unknown;
+    if (point.agreement === true) color = AGREEMENT_COLORS.agree;
+    else if (point.agreement === false) color = AGREEMENT_COLORS.disagree;
+    mlConfidenceCtx.fillStyle = color;
+    mlConfidenceCtx.fillRect(x, mlConfidenceCanvas.height - bandHeight - 2, slice, bandHeight);
+  }
+
+  mlConfidenceCtx.strokeStyle = COLORS.bone;
+  mlConfidenceCtx.lineWidth = 1.5;
+  mlConfidenceCtx.lineJoin = "round";
+  for (const run of confidenceTimeline.probabilityRuns(now)) {
+    mlConfidenceCtx.beginPath();
+    run.forEach((point, index) => {
+      const x = point.x * (width - 1);
+      const y = padTop + (1 - point.mlProbability) * plotHeight;
+      if (index === 0) mlConfidenceCtx.moveTo(x, y);
+      else mlConfidenceCtx.lineTo(x, y);
+    });
+    mlConfidenceCtx.stroke();
+  }
+
+  const rate = confidenceTimeline.agreementRate();
+  if (rateNode) {
+    rateNode.textContent = rate === null ? "—" : `${Math.round(rate * 100)}% concorda`;
+  }
+}
+
 function updatePanel(message) {
   state.lastFace = message.face;
   setPresenceChip(
@@ -413,6 +541,8 @@ function updatePanel(message) {
   updateMlPanel(message.ml);
   updateFacePanel(message.face);
   renderFaceCharts(message.face);
+  updateHealthPanel(message);
+  renderConfidenceTimeline();
 
   for (const side of ["left", "right"]) {
     const direction = message.motion[`${side}_direction`] || "unknown";
@@ -886,7 +1016,10 @@ function activateTab(name, focus = false) {
     if (active && focus) button.focus();
   }
   for (const panel of tabPanels) panel.hidden = panel.dataset.panel !== name;
-  if (name === "history") renderFaceCharts(state.lastFace, true);
+  if (name === "history") {
+    renderFaceCharts(state.lastFace, true);
+    renderConfidenceTimeline();
+  }
 }
 
 tabButtons.forEach((button, index) => {
