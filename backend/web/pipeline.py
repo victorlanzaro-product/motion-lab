@@ -45,19 +45,16 @@ Four decisions carry this file:
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from backend.camera import CameraConfig, CameraEngine, CameraOpenError, CameraReadError
-from backend.dataset.writer import (
-    DEFAULT_DATASET_PATH,
-    DatasetWriterError,
-    validate_label,
-)
+from backend.dataset.writer import DEFAULT_DATASET_PATH, DatasetWriterError
 from backend.features import (
     FEATURE_NAMES,
     FaceMotionTracker,
@@ -70,7 +67,7 @@ from backend.features.face_features import extract_face
 from backend.features.features import FrameFeatures
 from backend.features.velocity import MotionState
 from backend.gestures import GestureConfig, GestureEngine
-from backend.ml import DEFAULT_MODEL_PATH, ModelError
+from backend.ml import DEFAULT_MODEL_PATH
 from backend.ml.rule_label import rule_label as compute_rule_label
 from backend.ml import load_model as load_ml_model
 from backend.ml import predict as ml_predict
@@ -88,6 +85,7 @@ from backend.vision import (
     ensure_model,
 )
 from backend.web.payload import (
+    PreviewError,
     encode_preview,
     error_message,
     face_payload,
@@ -95,7 +93,14 @@ from backend.web.payload import (
     record_status_message,
     status_message,
 )
-from backend.web.recorder import Recorder
+from backend.web.recorder import INVALID_RECORD_LABEL, Recorder, validate_record_label
+
+logger = logging.getLogger(__name__)
+PROJECT_DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+
+
+def default_report_path(model_path: Path) -> Path:
+    return PROJECT_DATA_DIR / "training" / f"{model_path.stem}.report.html"
 
 #: Wire names for the two arms, in the order the payload uses them.
 SIDES: dict[str, Side] = {"left": Side.LEFT, "right": Side.RIGHT}
@@ -152,9 +157,8 @@ class WebConfig:
     #: Shared labeled dataset target. Tests and alternate deployments can
     #: redirect writes without changing the DatasetWriter schema.
     dataset_path: Path = DEFAULT_DATASET_PATH
-    #: Sprint 15 — last generated Sprint 10 HTML report. `None` follows the
-    #: model path using the same `<model-stem>.report.html` convention as
-    #: `scripts/report.py`; deployments can point the web app elsewhere.
+    #: Saved HTML report under the project's data directory. `None` selects
+    #: the same model-based filename used by `scripts/report.py`.
     report_path: Optional[Path] = None
 
 
@@ -308,20 +312,30 @@ class PipelineRunner:
         """
         try:
             return list(load_ml_model(self.config.model_path)["classes"])
-        except ModelError:
+        except Exception:  # noqa: BLE001 - optional live ML
+            logger.debug("ML model unavailable during WebSocket handshake", exc_info=True)
             return []
 
     @property
     def report_path(self) -> Path:
-        """Configured report target, or the Sprint 10 default beside the model."""
-        if self.config.report_path is not None:
-            return self.config.report_path
-        model_path = self.config.model_path
-        return model_path.with_name(f"{model_path.stem}.report.html")
+        return self.config.report_path or default_report_path(self.config.model_path)
+
+    def safe_report_path(self) -> Optional[Path]:
+        """Resolve a regular report within data, rejecting symlinks."""
+        candidate = self.report_path.absolute()
+        try:
+            resolved = candidate.resolve()
+            if resolved != candidate or not resolved.is_relative_to(PROJECT_DATA_DIR):
+                logger.warning("Rejected report path outside the allowed location: %s", candidate)
+                return None
+            return resolved if resolved.is_file() else None
+        except (OSError, RuntimeError):
+            logger.exception("Could not resolve saved report")
+            return None
 
     def report_available(self) -> bool:
-        """Whether the last generated report exists; this never generates it."""
-        return self.report_path.is_file()
+        """Whether the report can be served over HTTP."""
+        return self.safe_report_path() is not None
 
     # --- subscriptions -------------------------------------------------
     @property
@@ -359,27 +373,19 @@ class PipelineRunner:
             if self.recorder.owner_disconnected(subscriber):
                 self._owner_disconnected.set()
 
-    def record_start(self, label: str, subscriber: Subscriber) -> dict[str, Any]:
+    def record_start(self, label: object, subscriber: Subscriber) -> dict[str, Any]:
         """Reserve a session only while a worker can consume its command."""
-        try:
-            label = validate_label(label)
-        except DatasetWriterError as exc:
-            with self._lock:
-                event = self.recorder.status()
-                event["error"] = str(exc)
-                self._offer_record_status(subscriber, event)
-                return event
-
         with self._lock:
+            try:
+                label = validate_record_label(label)
+            except DatasetWriterError:
+                return self._reject_record_start(subscriber, INVALID_RECORD_LABEL)
+
             if not self._accept_record_starts or self.state in ("recovering", "failed"):
-                event = self.recorder.status()
-                reason = self.error or "the camera stream is unavailable"
-                event["error"] = (
-                    f"Cannot start recording while the pipeline is not accepting "
-                    f"requests: {reason}"
+                reason = self.error or "A câmera ainda não está disponível."
+                return self._reject_record_start(
+                    subscriber, f"Não foi possível iniciar a gravação. {reason}"
                 )
-                self._offer_record_status(subscriber, event)
-                return event
 
             # request_start is validation/reservation only; file I/O remains
             # on the pipeline thread. Offer the accepted status under the
@@ -391,6 +397,12 @@ class PipelineRunner:
                 self._offer_record_status(subscriber, event)
             return event
 
+    def _reject_record_start(self, subscriber: Subscriber, error: str) -> dict[str, Any]:
+        snapshot = self.recorder.status_for(subscriber, error=error)
+        owner = snapshot.pop("owner")
+        subscriber.offer_threadsafe(record_status_message(**snapshot, owner=owner))
+        return snapshot
+
     def record_stop(self, subscriber: Subscriber) -> Optional[dict[str, Any]]:
         """Queue a stop request after the recorder checks tab ownership."""
         with self._lock:
@@ -401,7 +413,7 @@ class PipelineRunner:
 
     def recording_snapshot_for(self, subscriber: Subscriber) -> dict[str, Any]:
         """Current recorder state with ownership scoped to one browser tab."""
-        return self._record_wire_message(self.recorder.status(), subscriber)
+        return record_status_message(**self.recorder.status_for(subscriber))
 
     def recording_health(self) -> dict[str, Any]:
         """Current recorder state without leaking the in-process owner token."""
@@ -434,6 +446,8 @@ class PipelineRunner:
             return
         with self._lock:
             self._publish_record_event_locked(event)
+        if event["error"] is not None:
+            self._broadcast(error_message(event["error"], fatal=False))
 
     def _publish_record_event_locked(self, event: dict[str, Any]) -> None:
         """Queue one shared status while the subscriber set is stable."""
@@ -466,6 +480,8 @@ class PipelineRunner:
                 self._publish_record_event_locked(event)
             if resume_record_starts and self.state == "live" and not self._stop.is_set():
                 self._accept_record_starts = True
+        if error is None and event is not None and event["error"] is not None:
+            self._broadcast(error_message(event["error"], fatal=False))
 
     # --- lifecycle -----------------------------------------------------
     def _ensure_running(self) -> bool:
@@ -511,42 +527,23 @@ class PipelineRunner:
         for subscriber in subscribers:
             subscriber.offer_threadsafe(message)
 
-    def _disable_face(self, detector: Optional[FaceDetector], exc: Exception) -> str:
-        """Contain every optional-face lifecycle failure at its boundary.
-
-        `FaceModelError` already carries a clean, explainable message (missing
-        file, failed download) -- the same rule `_run` applies to
-        `PoseModelError`/`CameraError`. Only an *unexpected* exception (a
-        MediaPipe runtime hiccup, `close()` blowing up) gets its type name
-        prefixed, since there `str(exc)` alone (e.g. `"boom"`) would not be
-        enough context to tell a client-visible bug apart from an unrelated
-        message that happens to read the same.
-        """
-
-        def _describe(inner: Exception) -> str:
-            if isinstance(inner, FaceModelError):
-                return str(inner)
-            return f"{type(inner).__name__}: {inner}"
-
-        error = _describe(exc)
-        self.face_error = error
+    def _disable_face(self, detector: Optional[FaceDetector], message: str) -> str:
+        """Keep the public reason about face tracking and log the underlying failure."""
+        logger.exception("Face tracking unavailable")
+        self.face_error = message
+        self._broadcast(error_message(message, fatal=False))
         if detector is not None:
             try:
                 detector.close()
-            except Exception as close_exc:  # noqa: BLE001 - optional teardown
-                error = f"{error}; close failed: {_describe(close_exc)}"
-                self.face_error = error
-        return error
+            except Exception:  # noqa: BLE001 - optional teardown
+                logger.exception("Could not close face detector")
+        return message
 
     def _run(self) -> None:
         """Thread body: open the devices, stream, and always release them.
 
-        Wrapped in a bounded retry loop (class docstring, point 5): a
-        `CameraError` — whether it is the very first `open()` or the camera
-        going silent mid-stream — gets `max_camera_retries` attempts with an
-        exponential backoff before the runner gives up. A `PoseModelError` or
-        any other exception is not retried: the pose model file is not going
-        to appear on its own between one attempt and the next.
+        A camera read failure gets bounded retries with exponential backoff.
+        Camera open and pose model failures are fatal.
         """
         self.error = None
         attempt = 0
@@ -571,15 +568,22 @@ class PipelineRunner:
                 with self._lock:
                     self.state = "idle"
                 break
-            except CameraOpenError as exc:
+            except CameraOpenError:
+                logger.exception("Could not open camera")
                 with self._lock:
                     self._accept_record_starts = False
                     self.state = "failed"
-                    self.error = str(exc)
+                    self.error = (
+                        f"Não foi possível abrir a câmera (índice {self.config.camera.index}). "
+                        "Verifique se ela está conectada, livre e se o aplicativo tem "
+                        "permissão de acesso à câmera. No macOS, confira em Ajustes do Sistema "
+                        "> Privacidade e Segurança > Câmera e reinicie o aplicativo."
+                    )
                 self._close_recorder(error=self.error)
                 self._broadcast(error_message(self.error))
                 break
-            except CameraReadError as exc:
+            except CameraReadError:
+                logger.warning("Camera stopped delivering frames", exc_info=True)
                 with self._lock:
                     self._accept_record_starts = False
                 # At least one real frame got through before it died: that is
@@ -595,24 +599,26 @@ class PipelineRunner:
                 while flap_times and flap_times[0] < cutoff:
                     flap_times.pop(0)
                 flapping = len(flap_times) > self.config.max_flaps_per_window
-                with self._lock:
-                    self.error = str(exc)
+                message = "A câmera parou de enviar imagens."
                 if self._stop.is_set() or attempt > self.config.max_camera_retries or flapping:
+                    if flapping:
+                        message += (
+                            f" Houve {len(flap_times)} falhas em "
+                            f"{self.config.flap_window_seconds:.0f} s."
+                        )
+                    message += " As tentativas de reconexão foram encerradas."
                     with self._lock:
                         self.state = "failed"
-                    if flapping:
-                        self.error = (
-                            f"{self.error} (camera failed {len(flap_times)} times in "
-                            f"{self.config.flap_window_seconds:.0f}s — giving up instead "
-                            "of retrying forever)"
-                        )
-                    self._close_recorder(error=self.error)
-                    self._broadcast(error_message(self.error))
+                        self.error = message
+                    self._close_recorder(error=message)
+                    self._broadcast(error_message(message))
                     break
                 with self._lock:
                     self.state = "recovering"
-                self._close_recorder(error=self.error)
-                self._broadcast(status_message("recovering", self.error))
+                    self.error = message
+                self._close_recorder(error=message)
+                self._broadcast(error_message(message, fatal=False))
+                self._broadcast(status_message("recovering", message))
                 delay = min(
                     self.config.retry_backoff_base * (2 ** (attempt - 1)),
                     self.config.retry_backoff_cap,
@@ -621,24 +627,24 @@ class PipelineRunner:
                     with self._lock:
                         self.state = "idle"
                     break
-            except PoseModelError as exc:
-                # An expected, explainable failure: the pose model is missing
-                # or unusable. The user has to see it, so it goes to every
-                # client — and it will not fix itself on a retry.
+            except Exception as exc:  # noqa: BLE001 - surface fatal pipeline failures
+                logger.exception("Camera pipeline stopped")
+                if isinstance(exc, PoseModelError):
+                    message = (
+                        "Não foi possível baixar o modelo de pose. Verifique a conexão com a internet."
+                        if exc.__cause__ is not None
+                        else "O modelo de pose está indisponível. Verifique se ele foi instalado."
+                    )
+                elif isinstance(exc, PreviewError):
+                    message = str(exc)
+                else:
+                    message = "O processamento da câmera foi interrompido por uma falha interna."
                 with self._lock:
                     self._accept_record_starts = False
                     self.state = "failed"
-                    self.error = str(exc)
-                self._close_recorder(error=self.error)
-                self._broadcast(error_message(self.error))
-                break
-            except Exception as exc:  # noqa: BLE001 - a dead thread must not fail silently
-                with self._lock:
-                    self._accept_record_starts = False
-                    self.state = "failed"
-                    self.error = f"{type(exc).__name__}: {exc}"
-                self._close_recorder(error=self.error)
-                self._broadcast(error_message(self.error))
+                    self.error = message
+                self._close_recorder(error=message)
+                self._broadcast(error_message(message))
                 break
 
         with self._lock:
@@ -662,10 +668,17 @@ class PipelineRunner:
         # so training a model mid-session takes effect on the next reconnect
         # without a server restart. Missing or corrupt is not fatal — Live ML
         # is a signal on top of the pipeline, never a dependency of it.
+        ml_bundle = None
         try:
-            ml_bundle = load_ml_model(self.config.model_path)
-        except ModelError:
-            ml_bundle = None
+            if self.config.model_path.exists():
+                ml_bundle = load_ml_model(self.config.model_path)
+        except Exception:  # noqa: BLE001 - optional live ML
+            logger.exception("Could not load model for live inference")
+            self._broadcast(
+                error_message(
+                    "Não foi possível carregar o modelo de classificação ao vivo.", fatal=False
+                )
+            )
 
         # Sprint 11 — facial signals, same isolation rule as the ML bundle
         # above: opt-in (`face_enabled`) and, once on, a missing/broken model
@@ -681,7 +694,14 @@ class PipelineRunner:
                 face_detector = self.face_detector_factory(self.config)
                 face_detector.open()
             except Exception as exc:  # noqa: BLE001 - optional subsystem boundary
-                face_error = self._disable_face(face_detector, exc)
+                message = "Não foi possível iniciar o rastreamento facial."
+                if isinstance(exc, FaceModelError):
+                    message = (
+                        "Não foi possível baixar o modelo facial. Verifique a conexão com a internet."
+                        if exc.__cause__ is not None
+                        else "O modelo facial está indisponível. Verifique se ele foi instalado."
+                    )
+                face_error = self._disable_face(face_detector, message)
                 face_detector = None
         self.face_error = face_error
 
@@ -736,7 +756,18 @@ class PipelineRunner:
                 features_ms = (time.perf_counter() - features_started) * 1000
 
                 ml_started = time.perf_counter()
-                prediction = self._predict(ml_bundle, features, motion)
+                try:
+                    prediction = self._predict(ml_bundle, features, motion)
+                except Exception:  # noqa: BLE001 - optional live ML
+                    logger.exception("Disabling live ML after inference failed")
+                    self._broadcast(
+                        error_message(
+                            "A classificação ao vivo foi desativada após uma falha de inferência.",
+                            fatal=False,
+                        )
+                    )
+                    ml_bundle = None
+                    prediction = None
                 ml_ms = (
                     (time.perf_counter() - ml_started) * 1000
                     if prediction is not None
@@ -764,12 +795,14 @@ class PipelineRunner:
                                 motion=face_motion,
                                 mesh=face_snapshot.mesh,
                             )
-                        except Exception as exc:  # noqa: BLE001 - optional layer,
+                        except Exception:  # noqa: BLE001 - optional layer,
                             # must never sink pose/web (requirement 4): one bad
                             # frame disables face for the rest of THIS session
                             # rather than crashing the whole pipeline thread —
                             # pose, motion, gestures, ML keep running untouched.
-                            face_error = self._disable_face(face_detector, exc)
+                            face_error = self._disable_face(
+                                face_detector, "Falha ao analisar o rosto. O rastreamento facial foi desativado."
+                            )
                             face_detector = None
                             face_dict = face_payload(enabled=True, error=face_error)
                         finally:
@@ -834,8 +867,8 @@ class PipelineRunner:
             if face_detector is not None:
                 try:
                     face_detector.close()
-                except Exception as exc:  # noqa: BLE001 - optional teardown
-                    self._disable_face(None, exc)
+                except Exception:  # noqa: BLE001 - optional teardown
+                    self._disable_face(None, "Não foi possível encerrar o rastreamento facial.")
 
     @staticmethod
     def _predict(

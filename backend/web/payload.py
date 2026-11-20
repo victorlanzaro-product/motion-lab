@@ -75,11 +75,17 @@ def encode_preview(image: np.ndarray, width: int = 640, quality: int = 70) -> di
     source_h, source_w = image.shape[:2]
     if width > 0 and source_w > width:
         height = max(1, int(round(source_h * width / source_w)))
-        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+        try:
+            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+        except cv2.error as exc:
+            raise PreviewError("Não foi possível redimensionar a imagem da câmera.") from exc
 
-    ok, buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    try:
+        ok, buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    except cv2.error as exc:
+        raise PreviewError("Não foi possível gerar a imagem da câmera em JPEG.") from exc
     if not ok:
-        raise PreviewError("OpenCV could not encode the frame as JPEG.")
+        raise PreviewError("Não foi possível gerar a imagem da câmera em JPEG.")
 
     return {
         "format": "jpeg",
@@ -397,21 +403,14 @@ def record_status_message(
 
 
 def error_message(message: str, *, fatal: bool = True) -> dict[str, Any]:
-    """A failure the user has to see — camera denied, model missing, device gone.
-
-    The browser shows this instead of holding a frozen last frame: a live view
-    that silently stops looks exactly like a person standing very still.
-    """
+    """Send a user-facing failure; only fatal failures end the stream."""
     return {"type": "error", "message": message, "fatal": fatal}
 
 
 def status_message(state: str, message: str = "") -> dict[str, Any]:
     """A non-fatal lifecycle notice — the socket stays open, frames may resume.
 
-    Distinct from `error_message` on purpose: an `error` in this wire format
-    always means "the browser should show a stopped state" (see `app.js`).
-    A transient camera drop that `PipelineRunner` is actively retrying is not
-    that — the client should say "reconectando…", not "parado", and keep
-    listening on the same connection for the frames that resume it.
+    The recovering state lets the browser indicate it is reconnecting while
+    listening for frames to resume on the same connection.
     """
     return {"type": "status", "state": state, "message": message}
