@@ -27,6 +27,7 @@ Two pieces, independently useful:
 from __future__ import annotations
 
 import time
+from html import escape
 from typing import Any, Optional
 
 
@@ -124,6 +125,151 @@ def _per_class_table(class_labels: list[str], per_class: dict[str, dict[str, flo
     )
 
 
+def _dataset_section(dataset: Optional[dict[str, Any]]) -> str:
+    """Render the same dataset coverage snapshot used by the stats endpoint.
+
+    A missing or not-yet-recorded dataset is useful information for this
+    report, not a reason to omit the section or invent zero-valued coverage.
+    """
+    if dataset is None:
+        return (
+            "<section><h2>Dataset</h2>"
+            "<p class='muted'>Cobertura do dataset não foi incluída neste relatório.</p>"
+            "</section>"
+        )
+
+    path = escape(str(dataset.get("path", "")))
+    if not dataset.get("exists", False):
+        return (
+            "<section><h2>Dataset</h2>"
+            f"<p class='muted'>Dataset ausente: <code>{path}</code>. "
+            "Grave sessões antes de treinar.</p></section>"
+        )
+
+    labels = dataset.get("labels", {})
+    label_rows = []
+    for label, stats in labels.items():
+        label_rows.append(
+            "<tr><td>{label}</td><td>{rows}</td><td>{sessions}</td><td>{seconds:.1f}s</td></tr>".format(
+                label=escape(str(label)),
+                rows=int(stats.get("rows", 0)),
+                sessions=int(stats.get("sessions", 0)),
+                seconds=float(stats.get("seconds", 0.0)),
+            )
+        )
+    label_table = (
+        "<table class='dataset-labels'><thead><tr>"
+        "<th>rótulo</th><th>linhas</th><th>sessões</th><th>tempo</th>"
+        f"</tr></thead><tbody>{''.join(label_rows)}</tbody></table>"
+    )
+
+    sessions = dataset.get("sessions", [])
+    if sessions:
+        session_rows = []
+        for session in sessions:
+            session_rows.append(
+                "<tr><td>{session_id}</td><td>{label}</td><td>{rows}</td><td>{seconds:.1f}s</td></tr>".format(
+                    session_id=escape(str(session.get("session_id", ""))),
+                    label=escape(str(session.get("label", ""))),
+                    rows=int(session.get("rows", 0)),
+                    seconds=float(session.get("seconds", 0.0)),
+                )
+            )
+        session_table = (
+            "<h3>Sessões</h3><table class='dataset-sessions'><thead><tr>"
+            "<th>sessão</th><th>rótulo</th><th>linhas</th><th>tempo</th>"
+            f"</tr></thead><tbody>{''.join(session_rows)}</tbody></table>"
+        )
+    else:
+        session_table = "<p class='muted'>Nenhuma sessão válida no dataset.</p>"
+
+    problems = dataset.get("problems", [])
+    if problems:
+        problems_html = "<ul class='problems'>" + "".join(
+            f"<li>{escape(str(problem))}</li>" for problem in problems
+        ) + "</ul>"
+    else:
+        problems_html = "<p>Cobertura mínima por sessões atingida.</p>"
+
+    dropped = dataset.get("dropped", {})
+    dropped_html = ""
+    if dropped:
+        dropped_html = "<p class='muted'>Linhas descartadas: " + ", ".join(
+            f"{escape(str(reason))}={int(count)}" for reason, count in dropped.items()
+        ) + "</p>"
+
+    state = (
+        "cobertura de sessões pronta"
+        if dataset.get("ready", False)
+        else "cobertura de sessões incompleta"
+    )
+    return f"""
+    <section>
+      <h2>Dataset</h2>
+      <p class="muted"><code>{path}</code> · {int(dataset.get('total_rows', 0))} linhas lidas ·
+        {int(dataset.get('usable_rows', 0))} utilizáveis · {state}</p>
+      {label_table}
+      {session_table}
+      {dropped_html}
+      {problems_html}
+    </section>
+    """
+
+
+def _cross_validation_section(cv: Optional[dict[str, Any]]) -> str:
+    """Show every grouped fold so skipped folds cannot hide behind the mean."""
+    if not cv:
+        return (
+            "<section><h2>Validação cruzada</h2>"
+            "<p class='muted'>Este modelo não contém métricas de validação cruzada agrupada.</p>"
+            "</section>"
+        )
+
+    mean = cv.get("macro_f1_mean")
+    std = cv.get("macro_f1_std")
+    if mean is None or std is None:
+        headline = "macro-F1 indisponível"
+    else:
+        headline = f"macro-F1 médio: <strong>{float(mean):.3f} ± {float(std):.3f}</strong>"
+
+    rows = []
+    for entry in cv.get("per_fold", []):
+        fold = entry.get("fold", entry.get("fold_index", "?"))
+        if entry.get("valid", True):
+            score = entry.get("macro_f1")
+            value = "—" if score is None else f"{float(score):.3f}"
+            status = "incluída na média"
+            reason = ""
+        else:
+            value = "—"
+            status = "ignorada"
+            reason_text = entry.get("reason", entry.get("skipped_reason", "dobra inválida"))
+            reason = f"<br><span class='muted'>{escape(str(reason_text))}</span>"
+        rows.append(
+            f"<tr><td>{escape(str(fold))}</td><td>{value}</td>"
+            f"<td>{status}{reason}</td></tr>"
+        )
+
+    if rows:
+        fold_table = (
+            "<table class='cv-folds'><thead><tr>"
+            "<th>dobra</th><th>macro-F1</th><th>estado</th>"
+            f"</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+        )
+    else:
+        fold_table = "<p class='muted'>Nenhuma dobra foi registrada.</p>"
+
+    return f"""
+    <section>
+      <h2>Validação cruzada</h2>
+      <p>{headline}</p>
+      <p class="muted">{int(cv.get('folds_used', 0))} dobras incluídas e
+        {int(cv.get('folds_skipped', 0))} ignoradas, de até {int(cv.get('n_splits', 0))}.</p>
+      {fold_table}
+    </section>
+    """
+
+
 def _live_section(live: Optional[dict[str, Any]]) -> str:
     if live is None:
         return (
@@ -161,14 +307,26 @@ def _live_section(live: Optional[dict[str, Any]]) -> str:
     """
 
 
-def render_report(training: dict[str, Any], live: Optional[dict[str, Any]] = None) -> str:
-    """Training-time quality + explainability, plus an optional live section."""
+def render_report(
+    training: dict[str, Any],
+    live: Optional[dict[str, Any]] = None,
+    dataset: Optional[dict[str, Any]] = None,
+) -> str:
+    """Render training, dataset coverage, grouped CV, and optional live data."""
     importances = sorted(
         training["feature_importances"].items(), key=lambda kv: kv[1], reverse=True
     )
     max_importance = importances[0][1] if importances else 1.0
     bars = "".join(_bar(name, value, max_importance) for name, value in importances)
     counts = ", ".join(f"{label}={n}" for label, n in training["counts"].items())
+    cv = training.get("cv") or {}
+    if cv.get("macro_f1_mean") is not None and cv.get("macro_f1_std") is not None:
+        cv_headline = (
+            "macro-F1 na validação cruzada agrupada: "
+            f"<strong>{float(cv['macro_f1_mean']):.3f} ± {float(cv['macro_f1_std']):.3f}</strong>"
+        )
+    else:
+        cv_headline = "macro-F1 na validação cruzada agrupada indisponível neste modelo"
 
     return f"""<!doctype html>
 <html lang="pt-BR">
@@ -206,17 +364,21 @@ def render_report(training: dict[str, Any], live: Optional[dict[str, Any]] = Non
   dl.stats {{ display: grid; grid-template-columns: 200px auto; gap: 4px 12px; margin: 8px 0; }}
   dl.stats dt {{ color: var(--dim); }}
   code {{ color: var(--accent); }}
+  .problems {{ color: var(--alert); }}
 </style>
 </head>
 <body>
   <h1>MOTION LAB — relatório do modelo</h1>
   <p class="muted">treinado em {training['trained_at']} · {training['n_samples']} amostras
-    ({counts}) · acurácia no teste: {training['accuracy'] * 100:.1f}%
-    · macro-F1: {training.get('macro_f1', 0.0):.3f}
-    · acurácia balanceada: {training.get('balanced_accuracy', 0.0) * 100:.1f}%</p>
-  <p class="muted">acurácia simples pode parecer boa só por acertar a classe majoritária
+    ({counts}) · {cv_headline}</p>
+  <p class="muted">No split único usado como detalhe: acurácia {training['accuracy'] * 100:.1f}% ·
+    macro-F1 {training.get('macro_f1', 0.0):.3f} · acurácia balanceada
+    {training.get('balanced_accuracy', 0.0) * 100:.1f}%. A acurácia simples pode parecer boa só por acertar a classe majoritária
     (<code>idle</code> costuma dominar uma sessão real); macro-F1 e acurácia balanceada
     pesam cada classe igual, sem deixar uma classe rara se esconder atrás da média.</p>
+
+  {_dataset_section(dataset)}
+  {_cross_validation_section(training.get('cv'))}
 
   <section>
     <h2>importância de feature</h2>
