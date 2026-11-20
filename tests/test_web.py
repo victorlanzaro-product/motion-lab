@@ -8,6 +8,7 @@ camera lifecycle the privacy rule depends on.
 from __future__ import annotations
 
 import asyncio
+import csv
 import threading
 import time
 from dataclasses import replace
@@ -22,7 +23,7 @@ pytest.importorskip("httpx", reason="fastapi's TestClient needs httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from backend.camera import CameraConfig, CameraEngine  # noqa: E402
-from backend.dataset import DatasetWriter  # noqa: E402
+from backend.dataset import DATASET_COLUMNS, DEFAULT_LABELS, DatasetWriter  # noqa: E402
 from backend.features import (  # noqa: E402
     FEATURE_NAMES,
     ArmMotion,
@@ -135,12 +136,13 @@ def build(
     def detector_factory(_config: WebConfig) -> PoseDetector:
         return PoseDetector(landmarker_factory=lambda _cfg: FakeLandmarker())
 
-    config = WebConfig(
-        camera=CameraConfig(width=320, height=240),
-        preview_width=160,
-        idle_seconds=0.2,
-        **overrides,
-    )
+    config_values = {
+        "camera": CameraConfig(width=320, height=240),
+        "preview_width": 160,
+        "idle_seconds": 0.2,
+    }
+    config_values.update(overrides)
+    config = WebConfig(**config_values)
     kwargs = dict(camera_factory=camera_factory, detector_factory=detector_factory)
     if face_detector_factory is not None:
         kwargs["face_detector_factory"] = face_detector_factory
@@ -198,6 +200,49 @@ def wait_until(predicate, timeout: float = 5.0) -> bool:
     return False
 
 
+def receive_initial_record_status(socket) -> dict:
+    """Read the mandatory recorder snapshot that follows every hello."""
+    status = socket.receive_json()
+    assert status["type"] == "record_status"
+    return status
+
+
+def receive_frame(socket) -> dict:
+    """Skip any queued lifecycle messages and return the next camera frame."""
+    while True:
+        message = socket.receive_json()
+        if message.get("type") == "frame":
+            return message
+
+
+def receive_until(
+    socket, predicate, timeout: float = 5.0, observed: list | None = None
+) -> dict:
+    """Wait through coalesced frames/statuses for a specific wire event."""
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        message = socket.receive_json()
+        last = message
+        if observed is not None:
+            observed.append(message)
+        if predicate(message):
+            return message
+    raise AssertionError(f"expected WebSocket message did not arrive before timeout; last={last}")
+
+
+def stub_preview_encoding(monkeypatch) -> None:
+    """Keep recorder WebSocket tests focused on recording, not OpenCV codecs."""
+    monkeypatch.setattr(
+        "backend.web.pipeline.encode_preview",
+        lambda _image, width=640, quality=70: {
+            "base64": "ZmFrZQ==",
+            "width": width,
+            "height": 240,
+        },
+    )
+
+
 # --- handshake ---------------------------------------------------------
 
 
@@ -206,6 +251,7 @@ def test_hello_arrives_before_any_frame():
     runner, _ = build()
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         hello = socket.receive_json()
+        record_status = receive_initial_record_status(socket)
     runner.stop()
 
     assert hello["type"] == "hello"
@@ -213,6 +259,17 @@ def test_hello_arrives_before_any_frame():
     assert hello["feature_names"] == list(FEATURE_NAMES)
     assert hello["arm_landmarks"] == [int(lm) for lm in ARM_LANDMARKS]
     assert "arm_raised" in hello["gesture_names"]
+    assert hello["record_labels"] == list(DEFAULT_LABELS)
+    assert record_status == {
+        "type": "record_status",
+        "recording": False,
+        "label": None,
+        "session_id": None,
+        "written": 0,
+        "skipped": 0,
+        "owner": False,
+        "error": None,
+    }
 
 
 def test_hello_carries_the_face_overlay_topology_regardless_of_face_enabled():
@@ -224,6 +281,7 @@ def test_hello_carries_the_face_overlay_topology_regardless_of_face_enabled():
     runner, _ = build()  # face_enabled defaults to False
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         hello = socket.receive_json()
+        receive_initial_record_status(socket)
     runner.stop()
 
     assert hello["face_enabled"] is False
@@ -234,6 +292,217 @@ def test_hello_carries_the_face_overlay_topology_regardless_of_face_enabled():
     assert isinstance(hello["face_mesh_version"], int) and hello["face_mesh_version"] >= 1
 
 
+# --- browser recorder ---------------------------------------------------
+
+
+def test_websocket_recording_appends_schema_rows_and_uses_a_new_session_id(tmp_path, monkeypatch):
+    stub_preview_encoding(monkeypatch)
+    dataset_path = tmp_path / "dataset.csv"
+    runner, _ = build(dataset_path=dataset_path, preview_width=320)
+    sessions = []
+    session_counts = []
+    with client_for(runner) as client, client.websocket_connect("/ws") as socket:
+        socket.receive_json()  # hello
+        receive_initial_record_status(socket)
+        receive_frame(socket)  # let lazy pipeline setup finish before timing a recording
+
+        for _ in range(2):
+            socket.send_json({"type": "record_start", "label": "arm_raised"})
+            started = receive_until(
+                socket,
+                lambda item: item.get("type") == "record_status" and item["recording"],
+            )
+            assert started["label"] == "arm_raised"
+            assert started["owner"] is True
+            written = receive_until(
+                socket,
+                lambda item: item.get("type") == "record_status"
+                and item["recording"]
+                and item["written"] >= 3,
+            )
+            socket.send_json({"type": "record_stop"})
+            stopped = receive_until(
+                socket,
+                lambda item: item.get("type") == "record_status"
+                and not item["recording"]
+                and item["session_id"] == started["session_id"],
+            )
+            assert stopped["written"] >= written["written"]
+            assert stopped["owner"] is False
+            sessions.append(stopped["session_id"])
+            session_counts.append(stopped["written"])
+
+        health = client.get("/health").json()
+        assert health["recording"] == {
+            "recording": False,
+            "label": None,
+            "session_id": None,
+            "written": 0,
+            "skipped": 0,
+        }
+    runner.stop()
+
+    assert sessions[0] != sessions[1]
+    with dataset_path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows
+    assert tuple(rows[0]) == DATASET_COLUMNS
+    assert {row["session_id"] for row in rows} == set(sessions)
+    assert {row["label"] for row in rows} == {"arm_raised"}
+    assert len(rows) == sum(session_counts)
+
+
+def test_websocket_rejects_removed_and_unknown_labels_before_creating_dataset(tmp_path, monkeypatch):
+    stub_preview_encoding(monkeypatch)
+    dataset_path = tmp_path / "never-created.csv"
+    runner, _ = build(dataset_path=dataset_path, preview_width=320)
+    with client_for(runner) as client, client.websocket_connect("/ws") as socket:
+        socket.receive_json()  # hello
+        receive_initial_record_status(socket)
+        for label in ("wave", "not-a-label"):
+            socket.send_json({"type": "record_start", "label": label})
+            rejected = receive_until(
+                socket,
+                lambda item: item.get("type") == "record_status" and item["error"] is not None,
+            )
+            assert rejected["recording"] is False
+            assert rejected["label"] is None
+            assert rejected["owner"] is False
+            if label == "wave":
+                assert "out of the trainable ML vocabulary" in rejected["error"]
+            else:
+                assert "not a recognized label" in rejected["error"]
+        # Invalid messages and JSON do not close the live socket.
+        socket.send_text("{")
+        socket.send_json({"type": "mirror", "enabled": True})
+        assert receive_frame(socket)["type"] == "frame"
+    runner.stop()
+
+    assert not dataset_path.exists()
+
+
+def test_second_tab_conflict_error_is_private_and_active_owner_keeps_recording(tmp_path, monkeypatch):
+    stub_preview_encoding(monkeypatch)
+    dataset_path = tmp_path / "dataset.csv"
+    runner, _ = build(dataset_path=dataset_path, preview_width=320)
+    with client_for(runner) as client:
+        with client.websocket_connect("/ws") as owner:
+            owner.receive_json()  # hello
+            receive_initial_record_status(owner)
+            receive_frame(owner)
+            owner.send_json({"type": "record_start", "label": "idle"})
+            active = receive_until(
+                owner,
+                lambda item: item.get("type") == "record_status" and item["recording"],
+            )
+            assert active["owner"] is True
+
+            with client.websocket_connect("/ws") as other:
+                other.receive_json()  # hello
+                joined = receive_initial_record_status(other)
+                assert joined["recording"] is True
+                assert joined["owner"] is False
+                other.send_json({"type": "record_start", "label": "arms_open"})
+                rejected = receive_until(
+                    other,
+                    lambda item: item.get("type") == "record_status" and item["error"] is not None,
+                )
+                assert rejected["recording"] is True
+                assert rejected["label"] == "idle"
+                assert rejected["owner"] is False
+
+                other.send_json({"type": "record_stop"})
+                refused_stop = receive_until(
+                    other,
+                    lambda item: item.get("type") == "record_status"
+                    and item["error"] is not None,
+                )
+                assert refused_stop["recording"] is True
+                assert refused_stop["label"] == "idle"
+                assert refused_stop["owner"] is False
+
+                owner_messages = []
+                owner_update = receive_until(
+                    owner,
+                    lambda item: item.get("type") == "record_status"
+                    and item["recording"]
+                    and item["written"] > rejected["written"],
+                    observed=owner_messages,
+                )
+                assert owner_update["owner"] is True
+                assert owner_update["error"] is None
+                assert not any(
+                    item.get("type") == "record_status" and item["error"] is not None
+                    for item in owner_messages
+                )
+                assert "already" in rejected["error"].lower() or "active" in rejected["error"].lower()
+
+            owner.send_json({"type": "record_stop"})
+            receive_until(
+                owner,
+                lambda item: item.get("type") == "record_status" and not item["recording"],
+            )
+    runner.stop()
+
+
+def test_owner_disconnect_closes_session_and_notifies_other_tab(tmp_path, monkeypatch):
+    stub_preview_encoding(monkeypatch)
+    runner, _ = build(dataset_path=tmp_path / "dataset.csv", preview_width=320)
+    with client_for(runner) as client:
+        with client.websocket_connect("/ws") as other:
+            other.receive_json()  # hello
+            other_status = receive_initial_record_status(other)
+            assert other_status["recording"] is False
+            receive_frame(other)
+
+            with client.websocket_connect("/ws") as owner:
+                owner.receive_json()  # hello
+                receive_initial_record_status(owner)
+                owner.send_json({"type": "record_start", "label": "arms_crossed"})
+                started = receive_until(
+                    owner,
+                    lambda item: item.get("type") == "record_status" and item["recording"],
+                )
+                assert started["owner"] is True
+
+            stopped = receive_until(
+                other,
+                lambda item: item.get("type") == "record_status"
+                and not item["recording"]
+                and item["session_id"] == started["session_id"],
+            )
+            assert stopped["label"] == "arms_crossed"
+            assert stopped["owner"] is False
+    runner.stop()
+
+
+def test_writer_error_stops_only_recording_and_pipeline_keeps_streaming(tmp_path, monkeypatch):
+    stub_preview_encoding(monkeypatch)
+    from backend.dataset import DatasetWriterError
+
+    def fail_write(_self, _label, _features, _motion):
+        raise DatasetWriterError("forced writer failure")
+
+    monkeypatch.setattr("backend.dataset.writer.DatasetWriter.write", fail_write)
+    runner, _ = build(dataset_path=tmp_path / "dataset.csv", preview_width=320)
+    with client_for(runner) as client, client.websocket_connect("/ws") as socket:
+        socket.receive_json()  # hello
+        receive_initial_record_status(socket)
+        receive_frame(socket)
+        socket.send_json({"type": "record_start", "label": "idle"})
+        failed = receive_until(
+            socket,
+            lambda item: item.get("type") == "record_status"
+            and not item["recording"]
+            and item["error"] is not None,
+        )
+        assert "forced writer failure" in failed["error"]
+        frame = receive_frame(socket)
+        assert frame["type"] == "frame"
+        assert runner.state == "live"
+    runner.stop()
+
+
 # --- payload -----------------------------------------------------------
 
 
@@ -241,7 +510,8 @@ def test_frame_carries_pixels_joints_and_numbers_together():
     runner, _ = build()
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()  # hello
-        frame = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
     runner.stop()
 
     assert frame["type"] == "frame"
@@ -257,7 +527,8 @@ def test_only_arm_landmarks_travel():
     runner, _ = build()
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()
-        frame = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
     runner.stop()
 
     assert set(frame["landmarks"]) == {str(int(lm)) for lm in ARM_LANDMARKS}
@@ -268,7 +539,8 @@ def test_coordinates_reach_the_browser_unmirrored():
     runner, _ = build()
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()
-        frame = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
     runner.stop()
 
     wrist = frame["landmarks"][str(int(PoseLandmark.LEFT_WRIST))]
@@ -283,9 +555,10 @@ def test_a_sustained_pose_fires_a_gesture_through_the_whole_pipeline():
     fired = None
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()  # hello
+        receive_initial_record_status(socket)
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            frame = socket.receive_json()
+            frame = receive_frame(socket)
             if frame["gestures"]:
                 fired = frame["gestures"]
                 break
@@ -300,7 +573,8 @@ def test_ml_signal_is_null_when_no_model_is_trained(tmp_path):
     runner, _ = build(model_path=tmp_path / "missing.joblib")
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         hello = socket.receive_json()
-        frame = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
     runner.stop()
 
     assert hello["ml_classes"] == []
@@ -318,7 +592,8 @@ def test_ml_signal_carries_a_real_prediction_when_a_model_is_trained(tmp_path):
     runner, _ = build(model_path=model_path)
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         hello = socket.receive_json()
-        frame = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
     runner.stop()
 
     assert set(hello["ml_classes"]) == {"arms_open", "idle"}
@@ -425,7 +700,8 @@ def test_preview_is_downscaled_but_inference_is_not():
     runner, _ = build()
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()
-        frame = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
     runner.stop()
 
     assert frame["image"]["width"] == 160
@@ -469,8 +745,10 @@ def test_two_browsers_share_one_camera():
         with client.websocket_connect("/ws") as first, client.websocket_connect("/ws") as second:
             first.receive_json()
             second.receive_json()
-            assert first.receive_json()["type"] == "frame"
-            assert second.receive_json()["type"] == "frame"
+            receive_initial_record_status(first)
+            receive_initial_record_status(second)
+            assert receive_frame(first)["type"] == "frame"
+            assert receive_frame(second)["type"] == "frame"
             assert runner.client_count == 2
     runner.stop()
 
@@ -488,6 +766,7 @@ def test_camera_failure_reaches_the_browser_instead_of_hanging():
     runner, _ = build(opened=False, max_camera_retries=0)
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()  # hello
+        receive_initial_record_status(socket)
         message = socket.receive_json()
     runner.stop()
 
@@ -599,6 +878,7 @@ def test_a_camera_that_flaps_forever_eventually_gives_up():
     message = None
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()  # hello
+        receive_initial_record_status(socket)
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             message = socket.receive_json()
@@ -624,7 +904,7 @@ class DeadCapture(FakeCapture):
         return False, None
 
 
-def test_camera_recovers_after_a_transient_failure_and_resumes_streaming():
+def test_camera_recovers_after_a_transient_failure_and_resumes_streaming(tmp_path):
     """'camera falha e volta': a mid-stream failure is not a permanent
     disconnect. `PipelineRunner` retries with a bounded backoff, the socket
     stays open through a non-fatal `status` message, and frames resume once
@@ -649,6 +929,7 @@ def test_camera_recovers_after_a_transient_failure_and_resumes_streaming():
         max_camera_retries=3,
         retry_backoff_base=0.01,
         retry_backoff_cap=0.02,
+        dataset_path=tmp_path / "recovered.csv",
     )
     runner = PipelineRunner(
         config, camera_factory=camera_factory, detector_factory=detector_factory
@@ -658,6 +939,7 @@ def test_camera_recovers_after_a_transient_failure_and_resumes_streaming():
     saw_frame_after_recovery = False
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()  # hello
+        receive_initial_record_status(socket)
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline and not saw_frame_after_recovery:
             message = socket.receive_json()
@@ -668,6 +950,21 @@ def test_camera_recovers_after_a_transient_failure_and_resumes_streaming():
                 pytest.fail(f"a transient failure must not reach the browser as fatal: {message}")
             elif message["type"] == "frame" and saw_recovering_status:
                 saw_frame_after_recovery = True
+        # Recovery opens a fresh stream path inside the same runner; the
+        # lifecycle gate must accept commands again after the camera returns.
+        socket.send_json({"type": "record_start", "label": "idle"})
+        started = receive_until(
+            socket,
+            lambda item: item.get("type") == "record_status" and item["recording"],
+        )
+        assert started["owner"] is True
+        socket.send_json({"type": "record_stop"})
+        receive_until(
+            socket,
+            lambda item: item.get("type") == "record_status"
+            and not item["recording"]
+            and item["session_id"] == started["session_id"],
+        )
     runner.stop()
 
     assert saw_recovering_status, "expected a non-fatal 'recovering' status while retrying"
@@ -684,7 +981,7 @@ def test_a_slow_client_gets_the_newest_frame_not_a_backlog():
     async def scenario():
         subscriber = Subscriber(asyncio.get_running_loop())
         for index in range(1, 4):
-            subscriber.offer({"frame_index": index})
+            subscriber.offer({"type": "frame", "frame_index": index})
         return await subscriber.get(), subscriber.dropped
 
     message, dropped = asyncio.run(scenario())
@@ -751,7 +1048,8 @@ def test_face_is_unavailable_by_default():
     runner, _ = build()
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()  # hello
-        frame = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
     runner.stop()
 
     assert frame["face"] == {"available": False, "detected": False, "reason": "disabled"}
@@ -766,7 +1064,8 @@ def test_face_signals_ride_along_when_enabled():
     )
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()  # hello
-        frame = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
     runner.stop()
 
     face = frame["face"]
@@ -806,7 +1105,8 @@ def test_face_overlay_landmarks_are_empty_when_no_face_is_in_frame():
     )
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()  # hello
-        frame = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
     runner.stop()
 
     assert frame["face"]["available"] is True
@@ -826,7 +1126,8 @@ def test_face_overlay_payload_cost_is_bounded_and_reported():
     )
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()  # hello
-        frame = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
     runner.stop()
 
     import json
@@ -853,7 +1154,8 @@ def test_face_degrades_to_unavailable_when_the_model_fails_to_load():
     runner, _ = build(face_enabled=True, face_detector_factory=failing_face_factory)
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()  # hello
-        frame = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
     runner.stop()
 
     assert frame["face"]["available"] is False
@@ -887,8 +1189,9 @@ def test_a_face_runtime_error_degrades_without_stopping_pose_or_the_pipeline():
     )
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()  # hello
-        frame1 = socket.receive_json()
-        frame2 = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame1 = receive_frame(socket)
+        frame2 = receive_frame(socket)
     runner.stop()
 
     assert frame1["type"] == "frame" and frame1["detected"] is True
