@@ -322,4 +322,3 @@ test("prepareOutboundReplay discards stale record_start and sets error", () => {
   assert.equal(recorder.snapshot().status.error, START_FAILED_ERROR);
   assert.deepEqual(recorder.drainOutbound(), []);
 });
-
