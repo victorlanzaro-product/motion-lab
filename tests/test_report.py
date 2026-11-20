@@ -170,3 +170,66 @@ def test_report_renders_cv_summary_and_invalid_folds():
     assert "2</td><td>—</td><td>ignorada" in html
     assert "faltou arms_open no treino" in html
     assert "2 dobras incluídas e" in html and "1 ignoradas" in html
+
+
+def test_report_compares_v1_and_v2_grouped_cv_side_by_side():
+    comparison = {
+        "v1": {
+            "schema_version": 1,
+            "n_samples": 80,
+            "classes": ["arm_raised", "idle"],
+            "cv": {
+                "n_splits": 4,
+                "folds_used": 4,
+                "folds_skipped": 0,
+                "macro_f1_mean": 0.52,
+                "macro_f1_std": 0.08,
+            },
+        },
+        "v2": {
+            "schema_version": 2,
+            "n_samples": 60,
+            "classes": ["arm_raised", "wave"],
+            "window_seconds": 1.0,
+            "max_gap": 0.30,
+            "min_samples": 4,
+            "deadband": 0.35,
+            "cv": {
+                "n_splits": 4,
+                "folds_used": 3,
+                "folds_skipped": 1,
+                "macro_f1_mean": 0.91,
+                "macro_f1_std": 0.03,
+            },
+        },
+    }
+
+    html = render_report(TRAINING, schema_comparison=comparison)
+
+    assert "Comparação S14 · v1 × v2" in html
+    assert "0.520 ± 0.080" in html
+    assert "0.910 ± 0.030" in html
+    assert "wave" in html and "1s · deadband 0.35" in html
+    assert "Decisões S14 prontas para o README" in html
+    assert "Inferência ao vivo v2 pendente" in html
+    assert "hello.model_schema" in html
+
+
+def test_report_marks_the_missing_schema_in_a_partial_comparison():
+    html = render_report(
+        TRAINING,
+        schema_comparison={
+            "v1": None,
+            "v2": {
+                "schema_version": 2,
+                "n_samples": 24,
+                "classes": ["arm_raised", "wave"],
+                "window_seconds": 1.0,
+                "deadband": 0.35,
+                "cv": {"macro_f1_mean": 0.8, "macro_f1_std": 0.1},
+            },
+        },
+    )
+
+    assert "v1 · por frame</td><td>indisponível" in html
+    assert "v2 · janela</td><td>24" in html
