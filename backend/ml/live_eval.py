@@ -50,6 +50,8 @@ class SegmentSpec:
     end_index: int
     warmup: int = 0
     transition: int = 0
+    name: str = ""
+    variant: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "SegmentSpec":
@@ -60,6 +62,8 @@ class SegmentSpec:
             end_index=int(raw["end_index"]),
             warmup=int(exclude.get("warmup", 0)),
             transition=int(exclude.get("transition", 0)),
+            name=str(raw.get("name", "")),
+            variant=str(raw.get("variant", "")),
         )
 
 
@@ -222,16 +226,28 @@ def _expected_accuracy(frames: list[EvaluatedFrame], expected: str) -> dict[str,
     return out
 
 
-def _wave_coverage(frames: list[EvaluatedFrame]) -> dict[str, Any]:
+def _wave_coverage(
+    frames: list[EvaluatedFrame], variant: str = ""
+) -> dict[str, Any]:
     v2_wave_frames = sum(1 for f in frames if f.v2_label == "wave")
+
+    def _wave_event(ev: GestureEvent) -> bool:
+        if ev.name != "wave":
+            return False
+        if variant == "wave_left":
+            return ev.side == "left"
+        if variant == "wave_right":
+            return ev.side == "right"
+        return True
+
     rule_events = sum(
-        1 for f in frames for ev in f.gesture_events if ev.name == "wave"
+        1 for f in frames for ev in f.gesture_events if _wave_event(ev)
     )
     event_sides = [
         {"side": ev.side, "frame_index": ev.frame_index, "timestamp": ev.timestamp}
         for f in frames
         for ev in f.gesture_events
-        if ev.name == "wave"
+        if _wave_event(ev)
     ]
     return {
         "v2_labeled_frames": v2_wave_frames,
@@ -279,6 +295,8 @@ def summarize_segment(
     }
     body: dict[str, Any] = {
         "label": spec.label,
+        "name": spec.name,
+        "variant": spec.variant,
         "expected": spec.label,
         "frames": len(segment_frames),
         "excluded": excluded,
@@ -286,8 +304,12 @@ def summarize_segment(
         "agreement": agreement,
         "expected_accuracy": _expected_accuracy(comparable, spec.label),
     }
-    if spec.label == "wave" or any(f.v2_label == "wave" for f in segment_frames):
-        body["wave"] = _wave_coverage(segment_frames)
+    if (
+        spec.label == "wave"
+        or spec.variant.startswith("wave_")
+        or any(f.v2_label == "wave" for f in segment_frames)
+    ):
+        body["wave"] = _wave_coverage(segment_frames, spec.variant)
     return body
 
 
