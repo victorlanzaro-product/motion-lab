@@ -45,6 +45,7 @@ Four decisions carry this file:
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -52,6 +53,11 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from backend.camera import CameraConfig, CameraEngine, CameraOpenError, CameraReadError
+from backend.dataset.writer import (
+    DEFAULT_DATASET_PATH,
+    DatasetWriterError,
+    validate_label,
+)
 from backend.features import (
     FEATURE_NAMES,
     FaceMotionTracker,
@@ -85,8 +91,10 @@ from backend.web.payload import (
     error_message,
     face_payload,
     frame_message,
+    record_status_message,
     status_message,
 )
+from backend.web.recorder import Recorder
 
 #: Wire names for the two arms, in the order the payload uses them.
 SIDES: dict[str, Side] = {"left": Side.LEFT, "right": Side.RIGHT}
@@ -140,6 +148,9 @@ class WebConfig:
     #: capability the operator must opt into, never a surprise upgrade.
     face_enabled: bool = False
     face_model_path: Path = DEFAULT_FACE_MODEL_PATH
+    #: Shared labeled dataset target. Tests and alternate deployments can
+    #: redirect writes without changing the DatasetWriter schema.
+    dataset_path: Path = DEFAULT_DATASET_PATH
 
 
 class Subscriber:
@@ -151,14 +162,39 @@ class Subscriber:
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
-        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
+        # Frames may be coalesced to keep latency bounded. Control messages
+        # carry state transitions and must remain queued until the client sees
+        # them, even if a new frame arrives in the meantime.
+        self._latest_frame: Optional[dict[str, Any]] = None
+        self._control: deque[dict[str, Any]] = deque()
+        self._available = asyncio.Event()
         self.dropped = 0
 
     def offer(self, message: dict[str, Any]) -> None:
-        if self._queue.full():
-            self._queue.get_nowait()  # the stale frame is worthless, discard it
-            self.dropped += 1
-        self._queue.put_nowait(message)
+        if message.get("type") == "frame":
+            if self._latest_frame is not None:
+                self.dropped += 1
+            self._latest_frame = message
+        elif message.get("type") == "record_status" and message.get("error") is None:
+            # Replacing an unread count update avoids turning the control
+            # queue into an old-status backlog for a slow browser. A session
+            # transition or private error forms a boundary and stays queued.
+            if self._control and self._control[-1].get("type") == "record_status":
+                pending = self._control[-1]
+                same_state = (
+                    pending.get("error") is None
+                    and pending.get("recording") == message.get("recording")
+                    and pending.get("session_id") == message.get("session_id")
+                )
+                if same_state:
+                    self._control[-1] = message
+                else:
+                    self._control.append(message)
+            else:
+                self._control.append(message)
+        else:
+            self._control.append(message)
+        self._available.set()
 
     def offer_threadsafe(self, message: dict[str, Any]) -> None:
         try:
@@ -169,7 +205,15 @@ class Subscriber:
             pass
 
     async def get(self) -> dict[str, Any]:
-        return await self._queue.get()
+        while True:
+            if self._control:
+                return self._control.popleft()
+            if self._latest_frame is not None:
+                message = self._latest_frame
+                self._latest_frame = None
+                return message
+            self._available.clear()
+            await self._available.wait()
 
 
 def _default_camera(config: WebConfig) -> CameraEngine:
@@ -212,6 +256,7 @@ class PipelineRunner:
         self.camera_factory = camera_factory
         self.detector_factory = detector_factory
         self.face_detector_factory = face_detector_factory
+        self.recorder = Recorder(self.config.dataset_path)
 
         self.state = "idle"  # idle | starting | live | failed
         self.error: Optional[str] = None
@@ -226,6 +271,12 @@ class PipelineRunner:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._owner_disconnected = threading.Event()
+        # A start request may reserve a session only while a pipeline thread
+        # can consume it. This gate and its status delivery share `_lock` so a
+        # start racing shutdown is either ordered before the final status or
+        # rejected with the recorder's actual current snapshot.
+        self._accept_record_starts = False
 
     # --- model introspection --------------------------------------------
     def ml_classes(self) -> list[str]:
@@ -271,6 +322,119 @@ class PipelineRunner:
         with self._lock:
             if subscriber in self._subscribers:
                 self._subscribers.remove(subscriber)
+            # The reader task and writer task can finish in either order;
+            # tying ownership to the subscription guarantees a closed tab
+            # cannot leave an open CSV session behind.
+            if self.recorder.owner_disconnected(subscriber):
+                self._owner_disconnected.set()
+
+    def record_start(self, label: str, subscriber: Subscriber) -> dict[str, Any]:
+        """Reserve a session only while a worker can consume its command."""
+        try:
+            label = validate_label(label)
+        except DatasetWriterError as exc:
+            with self._lock:
+                event = self.recorder.status()
+                event["error"] = str(exc)
+                self._offer_record_status(subscriber, event)
+                return event
+
+        with self._lock:
+            if not self._accept_record_starts or self.state in ("recovering", "failed"):
+                event = self.recorder.status()
+                reason = self.error or "the camera stream is unavailable"
+                event["error"] = (
+                    f"Cannot start recording while the pipeline is not accepting "
+                    f"requests: {reason}"
+                )
+                self._offer_record_status(subscriber, event)
+                return event
+
+            # request_start is validation/reservation only; file I/O remains
+            # on the pipeline thread. Offer the accepted status under the
+            # same lock so a concurrent finish cannot overtake it.
+            event = self.recorder.request_start(label, subscriber)
+            if event.get("error") is None:
+                self._publish_record_event_locked(event)
+            else:
+                self._offer_record_status(subscriber, event)
+            return event
+
+    def record_stop(self, subscriber: Subscriber) -> Optional[dict[str, Any]]:
+        """Queue a stop request after the recorder checks tab ownership."""
+        with self._lock:
+            event = self.recorder.request_stop(subscriber)
+            if event is not None:
+                self._offer_record_status(subscriber, event)
+            return event
+
+    def recording_snapshot_for(self, subscriber: Subscriber) -> dict[str, Any]:
+        """Current recorder state with ownership scoped to one browser tab."""
+        return self._record_wire_message(self.recorder.status(), subscriber)
+
+    def recording_health(self) -> dict[str, Any]:
+        """Current recorder state without leaking the in-process owner token."""
+        snapshot = self.recorder.status()
+        return {
+            key: snapshot[key]
+            for key in ("recording", "label", "session_id", "written", "skipped")
+        }
+
+    def _record_wire_message(
+        self, snapshot: dict[str, Any], subscriber: Subscriber
+    ) -> dict[str, Any]:
+        # Ownership is meaningful only while the recording remains active.
+        owner = bool(snapshot["recording"] and self.recorder.is_owner(subscriber))
+        return record_status_message(
+            recording=snapshot["recording"],
+            label=snapshot["label"],
+            session_id=snapshot["session_id"],
+            written=snapshot["written"],
+            skipped=snapshot["skipped"],
+            owner=owner,
+            error=snapshot["error"],
+        )
+
+    def _offer_record_status(self, subscriber: Subscriber, event: dict[str, Any]) -> None:
+        subscriber.offer_threadsafe(self._record_wire_message(event, subscriber))
+
+    def _publish_record_events(self, event: Optional[dict[str, Any]]) -> None:
+        if event is None:
+            return
+        with self._lock:
+            self._publish_record_event_locked(event)
+
+    def _publish_record_event_locked(self, event: dict[str, Any]) -> None:
+        """Queue one shared status while the subscriber set is stable."""
+        for subscriber in self._subscribers:
+            subscriber.offer_threadsafe(self._record_wire_message(event, subscriber))
+
+    def _publish_record_counts_if_due(self) -> None:
+        snapshot = self.recorder.status_if_due()
+        if snapshot is None:
+            return
+        self._broadcast_record_snapshot(snapshot)
+
+    def _broadcast_record_snapshot(self, snapshot: dict[str, Any]) -> None:
+        with self._lock:
+            subscribers = list(self._subscribers)
+        for subscriber in subscribers:
+            subscriber.offer_threadsafe(self._record_wire_message(snapshot, subscriber))
+
+    def _close_recorder(
+        self, error: Optional[str] = None, *, resume_record_starts: bool = False
+    ) -> None:
+        # Release the lifecycle lock during close(): it can flush/close a CSV
+        # and must never make an asyncio handler wait behind file I/O. Starts
+        # still see the closed gate and receive the live Recorder snapshot.
+        with self._lock:
+            self._accept_record_starts = False
+        event = self.recorder.finish(error=error)
+        with self._lock:
+            if event is not None:
+                self._publish_record_event_locked(event)
+            if resume_record_starts and self.state == "live" and not self._stop.is_set():
+                self._accept_record_starts = True
 
     # --- lifecycle -----------------------------------------------------
     def _ensure_running(self) -> bool:
@@ -289,18 +453,24 @@ class PipelineRunner:
             if self._thread is not None and self._thread.is_alive():
                 return False
             self._stop.clear()
+            self._accept_record_starts = False
             self.state = "starting"
             self.error = None
             self._thread = threading.Thread(
                 target=self._run, name="motion-lab-pipeline", daemon=True
             )
             self._thread.start()
+            # The worker now exists and can either consume queued requests or
+            # finalize them if device/model startup fails.
+            self._accept_record_starts = True
             return True
 
     def stop(self, timeout: float = 3.0) -> None:
         """Ask the loop to finish, and wait for the device to be released."""
-        self._stop.set()
-        thread = self._thread
+        with self._lock:
+            self._accept_record_starts = False
+            self._stop.set()
+            thread = self._thread
         if thread is not None:
             thread.join(timeout=timeout)
 
@@ -361,17 +531,26 @@ class PipelineRunner:
                 camera = self.camera_factory(self.config)
                 detector = self.detector_factory(self.config)
                 with camera, detector:
-                    self.state = "live"
-                    self.error = None
+                    with self._lock:
+                        self.state = "live"
+                        self.error = None
+                        self._accept_record_starts = not self._stop.is_set()
                     self._stream(camera, detector)
-                self.state = "idle"
+                self._close_recorder()
+                with self._lock:
+                    self.state = "idle"
                 break
             except CameraOpenError as exc:
-                self.state = "failed"
-                self.error = str(exc)
+                with self._lock:
+                    self._accept_record_starts = False
+                    self.state = "failed"
+                    self.error = str(exc)
+                self._close_recorder(error=self.error)
                 self._broadcast(error_message(self.error))
                 break
             except CameraReadError as exc:
+                with self._lock:
+                    self._accept_record_starts = False
                 # At least one real frame got through before it died: that is
                 # proof of an actual recovery, not just a lucky `open()` — the
                 # streak resets, so a device that flakes for a few seconds
@@ -385,41 +564,54 @@ class PipelineRunner:
                 while flap_times and flap_times[0] < cutoff:
                     flap_times.pop(0)
                 flapping = len(flap_times) > self.config.max_flaps_per_window
-                self.error = str(exc)
+                with self._lock:
+                    self.error = str(exc)
                 if self._stop.is_set() or attempt > self.config.max_camera_retries or flapping:
-                    self.state = "failed"
+                    with self._lock:
+                        self.state = "failed"
                     if flapping:
                         self.error = (
                             f"{self.error} (camera failed {len(flap_times)} times in "
                             f"{self.config.flap_window_seconds:.0f}s — giving up instead "
                             "of retrying forever)"
                         )
+                    self._close_recorder(error=self.error)
                     self._broadcast(error_message(self.error))
                     break
-                self.state = "recovering"
+                with self._lock:
+                    self.state = "recovering"
+                self._close_recorder(error=self.error)
                 self._broadcast(status_message("recovering", self.error))
                 delay = min(
                     self.config.retry_backoff_base * (2 ** (attempt - 1)),
                     self.config.retry_backoff_cap,
                 )
                 if self._stop.wait(timeout=delay):
-                    self.state = "idle"
+                    with self._lock:
+                        self.state = "idle"
                     break
             except PoseModelError as exc:
                 # An expected, explainable failure: the pose model is missing
                 # or unusable. The user has to see it, so it goes to every
                 # client — and it will not fix itself on a retry.
-                self.state = "failed"
-                self.error = str(exc)
+                with self._lock:
+                    self._accept_record_starts = False
+                    self.state = "failed"
+                    self.error = str(exc)
+                self._close_recorder(error=self.error)
                 self._broadcast(error_message(self.error))
                 break
             except Exception as exc:  # noqa: BLE001 - a dead thread must not fail silently
-                self.state = "failed"
-                self.error = f"{type(exc).__name__}: {exc}"
+                with self._lock:
+                    self._accept_record_starts = False
+                    self.state = "failed"
+                    self.error = f"{type(exc).__name__}: {exc}"
+                self._close_recorder(error=self.error)
                 self._broadcast(error_message(self.error))
                 break
 
         with self._lock:
+            self._accept_record_starts = False
             self._thread = None
             # A client can connect during teardown, between the loop's last
             # idle check and this line; without the restart it would wait
@@ -468,6 +660,11 @@ class PipelineRunner:
                     return
 
                 if self.client_count == 0:
+                    # Commands still need servicing during the camera's idle
+                    # grace period, especially the owner's disconnect stop.
+                    if self._owner_disconnected.is_set():
+                        self._close_recorder(resume_record_starts=True)
+                        self._owner_disconnected.clear()
                     if idle_since is None:
                         # First frame with nobody watching: drop the temporal state.
                         # Whatever the arms did while the tab was closed is not part
@@ -517,6 +714,14 @@ class PipelineRunner:
                             face_error = self._disable_face(face_detector, exc)
                             face_detector = None
                             face_dict = face_payload(enabled=True, error=face_error)
+
+                # The CSV writer runs here, on the pipeline thread, with the
+                # exact feature and motion objects derived from this frame.
+                record_event = self.recorder.record_frame(features, motion)
+                self._publish_record_events(record_event)
+                if record_event is not None:
+                    self._owner_disconnected.clear()
+                self._publish_record_counts_if_due()
 
                 self._broadcast(
                     frame_message(

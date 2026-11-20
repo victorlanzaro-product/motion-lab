@@ -18,6 +18,8 @@ Two things it does own:
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -31,6 +33,7 @@ from backend.web.pipeline import PipelineRunner, Subscriber, WebConfig
 
 #: backend/web/app.py -> backend/web -> backend -> project root
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -73,6 +76,7 @@ def create_app(
             # healthy -- `pipeline.state`/`error` must keep meaning "the whole
             # pipeline", not get muddied by an opt-in layer's own failure.
             "face_error": pipeline.face_error,
+            "recording": pipeline.recording_health(),
         }
 
     @app.websocket("/ws")
@@ -92,8 +96,11 @@ def create_app(
         # Subscribing after the hello guarantees the client holds the landmark
         # table and the bone topology before the first frame that needs them.
         subscriber = pipeline.subscribe(asyncio.get_running_loop())
+        # Every client receives the current shared recorder state immediately
+        # after hello, including a second tab joining an active session.
+        await websocket.send_json(pipeline.recording_snapshot_for(subscriber))
         writer = asyncio.create_task(_write_frames(websocket, subscriber))
-        reader = asyncio.create_task(_watch_for_disconnect(websocket))
+        reader = asyncio.create_task(_read_client_messages(websocket, pipeline, subscriber))
         try:
             done, pending = await asyncio.wait(
                 {writer, reader}, return_when=asyncio.FIRST_COMPLETED
@@ -137,17 +144,44 @@ async def _write_frames(websocket: WebSocket, subscriber: Subscriber) -> None:
             return
 
 
-async def _watch_for_disconnect(websocket: WebSocket) -> None:
-    """Read from a client that never writes, purely to notice when it leaves.
+async def _read_client_messages(
+    websocket: WebSocket, pipeline: PipelineRunner, subscriber: Subscriber
+) -> None:
+    """Handle recorder commands and ignore every other browser message.
 
-    Anything the browser does send is ignored on purpose: the UI toggles
-    (mirror, trail, labels) are drawing choices, handled client-side.
+    The visual toggles remain client-side. `receive()` lets malformed JSON,
+    binary messages, and unknown message types be ignored without ending the
+    connection that also carries the live camera stream.
     """
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        return
+    while True:
+        message = await websocket.receive()
+        if message.get("type") == "websocket.disconnect":
+            return
+        raw = message.get("text")
+        if not isinstance(raw, str):
+            logger.debug("ignoring non-text WebSocket message")
+            continue
+        try:
+            command = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.debug("ignoring invalid JSON WebSocket message")
+            continue
+        if not isinstance(command, dict):
+            logger.debug("ignoring non-object WebSocket JSON message")
+            continue
+
+        command_type = command.get("type")
+        if command_type == "record_start":
+            label = command.get("label")
+            if not isinstance(label, str):
+                logger.debug("ignoring malformed record_start message")
+                continue
+            pipeline.record_start(label, subscriber)
+        elif command_type == "record_stop":
+            pipeline.record_stop(subscriber)
+        else:
+            logger.debug("ignoring unknown WebSocket message type: %r", command_type)
+            continue
 
 
 #: Convenience target for `uvicorn backend.web.app:app` with default settings.
