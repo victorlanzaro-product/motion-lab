@@ -1739,7 +1739,7 @@ def test_ml_inference_failure_warns_once_and_pose_keeps_streaming(tmp_path, monk
     model_path.touch()
     monkeypatch.setattr(
         "backend.web.pipeline.load_ml_model",
-        lambda _path: {"classes": ["idle"], "columns": FEATURE_NAMES},
+        lambda _path, **_kwargs: {"classes": ["idle"], "columns": FEATURE_NAMES},
     )
     calls = 0
 

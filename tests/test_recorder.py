@@ -589,7 +589,7 @@ def test_camera_read_error_during_recording_closes_writer_and_stream_resumes(
                     final = message
                     break
             assert final is not None
-            assert final["error"] == "camera disconnected during active recording"
+            assert final["error"] == "A câmera parou de enviar imagens."
             assert await asyncio.to_thread(closed.wait, 3.0)
             assert await asyncio.to_thread(recovered_frame.wait, 3.0)
             assert await asyncio.to_thread(
