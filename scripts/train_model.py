@@ -115,9 +115,12 @@ def print_report(report) -> None:
     counts = ", ".join(f"{k}={v}" for k, v in report.counts.items())
     print(f"samples   {report.n_samples}  {counts}")
     cv = report.cv
+    if cv.get("macro_f1_oof") is not None:
+        print(f"macro-F1  {cv['macro_f1_oof']:.3f}  (LOSO, pooled out-of-fold predictions)")
+    cv_name = "LOSO fold mean" if cv.get("mode") == "loso" else "grouped CV"
     print(
         f"macro-F1  {cv['macro_f1_mean']:.3f} ± {cv['macro_f1_std']:.3f}  "
-        f"(grouped CV; {cv['folds_used']}/{cv['n_splits']} folds; "
+        f"({cv_name}; {cv['folds_used']}/{cv['n_splits']} folds; "
         f"{cv['folds_skipped']} skipped)"
     )
     print(f"accuracy  {report.accuracy * 100:.1f}%  (held-out test split)")
@@ -136,6 +139,10 @@ def main() -> int:
     parser.add_argument("--simulate", action="store_true", help="synthetic dataset, no recording")
     parser.add_argument("--dataset", type=Path, default=None, help="override the dataset CSV path")
     parser.add_argument("--model-out", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument(
+        "--cv", choices=("group-kfold", "loso"), default="group-kfold",
+        help="cross-validation method; loso holds out one session per fold",
+    )
     args = parser.parse_args()
 
     try:
@@ -150,9 +157,11 @@ def main() -> int:
             with tempfile.TemporaryDirectory() as tmp:
                 dataset_path = Path(tmp) / "dataset.csv"
                 build_synthetic_dataset(dataset_path)
-                report = train(dataset_path=dataset_path, model_path=args.model_out)
+                report = train(
+                    dataset_path=dataset_path, model_path=args.model_out, cv_mode=args.cv
+                )
         else:
-            kwargs = {"model_path": args.model_out}
+            kwargs = {"model_path": args.model_out, "cv_mode": args.cv}
             if args.dataset:
                 kwargs["dataset_path"] = args.dataset
             report = train(**kwargs)

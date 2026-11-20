@@ -176,6 +176,8 @@ def main() -> int:
     out_path.write_text(render_report(training, live, dataset))
 
     cv = training.get("cv")
+    if cv and cv.get("macro_f1_oof") is not None:
+        print(f"\nmacro-F1 LOSO  {cv['macro_f1_oof']:.3f}  (pooled out-of-fold predictions)")
     if cv and cv.get("macro_f1_mean") is not None and cv.get("macro_f1_std") is not None:
         print(
             f"\nmacro-F1 CV  {cv['macro_f1_mean']:.3f} ± {cv['macro_f1_std']:.3f}  "
