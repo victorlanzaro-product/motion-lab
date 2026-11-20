@@ -59,6 +59,12 @@
           <p class="hint hidden" id="hint">Entre no enquadramento para detectar o corpo</p>
           <p class="toast hidden" id="toast" aria-live="assertive"></p>
 
+          <div class="recording-banner hidden" id="recording-banner" role="status" aria-live="assertive">
+            <span class="recording-dot" aria-hidden="true"></span>
+            <span class="recording-title">GRAVANDO</span>
+            <span class="recording-detail" id="recording-banner-detail"></span>
+          </div>
+
           <div class="preset-dock" role="group" aria-label="Presets de visualização">
             <span class="preset-label">Visual</span>
             <button type="button" class="preset-button" data-preset="clean">Limpo</button>
@@ -188,6 +194,41 @@
                 </div>
               </div>
               <ul class="feed" id="gesture-feed" aria-live="polite"></ul>
+            </section>
+
+            <section class="live-section" id="recorder-panel" aria-label="Gravação de amostras rotuladas">
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">Dataset</p>
+                  <h2>Gravação</h2>
+                </div>
+                <span class="badge recorder-badge hidden" id="recorder-live-badge">ao vivo</span>
+              </div>
+              <p class="recorder-note hidden" id="recorder-remote-note">Outra aba está gravando — os botões ficam desabilitados aqui.</p>
+              <p class="recorder-countdown hidden" id="recorder-countdown" aria-live="polite"></p>
+              <p class="recorder-error hidden" id="recorder-error" role="alert"></p>
+              <div class="recorder-label-row" id="recorder-label-buttons" role="group" aria-label="Rótulos de gravação"></div>
+              <div class="recorder-stop-row">
+                <button type="button" class="recorder-stop" id="recorder-stop" disabled>
+                  Parar gravação <kbd>espaço</kbd>
+                </button>
+                <span class="recorder-cancel-hint hidden" id="recorder-cancel-hint"><kbd>Esc</kbd> cancela a contagem</span>
+              </div>
+              <dl class="summary-row recorder-counters">
+                <dt>amostras gravadas</dt>
+                <dd id="recorder-written">—</dd>
+                <dt>frames ignorados</dt>
+                <dd id="recorder-skipped">—</dd>
+              </dl>
+              <section class="recorder-last hidden" id="recorder-last" aria-label="Resumo da última sessão">
+                <h3 class="recorder-last-title">Última sessão</h3>
+                <dl class="compact-list">
+                  <dt>rótulo</dt><dd id="recorder-last-label">—</dd>
+                  <dt>sessão</dt><dd id="recorder-last-session">—</dd>
+                  <dt>gravadas / ignoradas</dt>
+                  <dd><span id="recorder-last-written">—</span> / <span id="recorder-last-skipped">—</span></dd>
+                </dl>
+              </section>
             </section>
           </section>
 
@@ -352,6 +393,7 @@
     <script src="/static/face-history.js"></script>
     <script src="/static/face-overlay.js"></script>
     <script src="/static/studio-controls.js"></script>
+    <script src="/static/recorder.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>
