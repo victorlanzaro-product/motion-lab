@@ -265,6 +265,8 @@ def frame_message(
     gestures: Optional[list[GestureEvent]] = None,
     ml: Optional[tuple[str, dict[str, float]]] = None,
     face: Optional[dict[str, Any]] = None,
+    rule_label: Optional[str] = None,
+    timings: Optional[Mapping[str, Optional[float]]] = None,
 ) -> dict[str, Any]:
     """One `type: "frame"` message: pixels, joints and numbers from the same frame.
 
@@ -272,12 +274,25 @@ def frame_message(
     bytes, but it would let the skeleton drift a frame or two away from the
     picture it is supposed to be drawn on.
     """
+    timing_values = timings or {}
     return {
         "type": "frame",
         "frame_index": snapshot.frame_index,
         "timestamp": _round(snapshot.timestamp, 3),
         "fps": _round(fps, 1),
         "inference_ms": _round(snapshot.inference_ms, 1),
+        "rule_label": rule_label,
+        "timings": {
+            name: _round(timing_values.get(name), 1)
+            for name in (
+                "capture_ms", "pose_ms", "features_ms", "ml_ms", "face_ms", "total_ms"
+            )
+        },
+        "health": {
+            "fps": _round(fps, 1),
+            "dropped_frames": 0,
+            "dropped_rate": 0.0,
+        },
         "detected": snapshot.detected,
         "confidence": _round(snapshot.confidence(), 3),
         "image": preview,
@@ -308,6 +323,7 @@ def hello_message(
     jpeg_quality: int = 70,
     ml_classes: Optional[list[str]] = None,
     face_enabled: bool = False,
+    report_available: bool = False,
 ) -> dict[str, Any]:
     """First message on every connection: everything the client needs to draw.
 
@@ -334,6 +350,9 @@ def hello_message(
         # Static config, known before the first frame -- lets the client show
         # the face toggle (or not) without waiting on a `frame.face` reason.
         "face_enabled": face_enabled,
+        # Snapshot only: report creation is an explicit offline action, never
+        # work performed as part of the WebSocket handshake.
+        "report_available": report_available,
         # Face overlay topology (Sprint 11) -- static domain knowledge, sent
         # unconditionally on `face_enabled` for the same reason `chains`/
         # `arm_landmarks` are sent unconditionally on the pose model existing:
