@@ -43,6 +43,14 @@ relatório, painel de cobertura).
 - `dropped`: chaves = motivos que o próprio loader de `train.py` já aplica
   (não inventar validação nova; reaproveitar a mesma função). Só motivos com
   contagem > 0.
+- **Decisão (rótulo desconhecido):** a validação por linha do loader é
+  extraída para uma função compartilhada que *classifica* a linha (ok ou
+  motivo). `load_dataset`/`train()` mantêm o comportamento atual: rótulo
+  desconhecido continua `DatasetError` (treino recusa). `dataset_stats()`
+  usa a mesma função mas **conta** em `dropped.unknown_label`, nunca lança;
+  qualquer `unknown_label > 0` força `ready=false` com problema
+  `"N linhas com rótulo desconhecido (treino vai recusar)"`. Rótulos
+  desconhecidos não entram em `labels` nem em `sessions`.
 - `ready` = toda classe de `DEFAULT_LABELS` com ≥ `min_sessions_per_label`
   sessões. `problems`: frases legíveis em português, uma por violação.
 - Lido do disco a cada request, fora do event loop (`run_in_threadpool`/
