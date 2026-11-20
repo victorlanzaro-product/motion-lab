@@ -30,6 +30,8 @@ from typing import Any, Optional
 import uvicorn
 
 from backend.camera import CameraConfig
+from backend.dataset.stats import dataset_stats
+from backend.dataset.writer import DEFAULT_DATASET_PATH
 from backend.gestures import GestureConfig
 from backend.ml import (
     DEFAULT_MODEL_PATH,
@@ -152,7 +154,10 @@ def main() -> int:
         "class_labels": bundle["classes"],
         "confusion_matrix": bundle["confusion_matrix"],
         "per_class": bundle["per_class"],
+        "cv": bundle.get("cv"),
     }
+    dataset_path = Path(bundle.get("dataset_path", DEFAULT_DATASET_PATH))
+    dataset = dataset_stats(dataset_path)
 
     live = None
     if args.no_live:
@@ -168,9 +173,19 @@ def main() -> int:
 
     out_path = args.out or args.model.with_name(args.model.stem + ".report.html")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(render_report(training, live))
+    out_path.write_text(render_report(training, live, dataset))
 
-    print(f"\naccuracy   {training['accuracy'] * 100:.1f}%  ({training['n_samples']} samples)")
+    cv = training.get("cv")
+    if cv and cv.get("macro_f1_oof") is not None:
+        print(f"\nmacro-F1 LOSO  {cv['macro_f1_oof']:.3f}  (pooled out-of-fold predictions)")
+    if cv and cv.get("macro_f1_mean") is not None and cv.get("macro_f1_std") is not None:
+        print(
+            f"\nmacro-F1 CV  {cv['macro_f1_mean']:.3f} ± {cv['macro_f1_std']:.3f}  "
+            f"({cv['folds_used']}/{cv['n_splits']} folds; {cv['folds_skipped']} skipped)"
+        )
+    else:
+        print("\nmacro-F1 CV  unavailable (model predates grouped cross-validation)")
+    print(f"split acc    {training['accuracy'] * 100:.1f}%  ({training['n_samples']} samples)")
     if live and live["agreement"]["rate"] is not None:
         print(f"agreement  {live['agreement']['rate'] * 100:.0f}% (rule vs ML)")
     print(f"report     {out_path}")

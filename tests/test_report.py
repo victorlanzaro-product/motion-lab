@@ -92,3 +92,103 @@ def test_report_handles_a_zero_compared_agreement_without_crashing():
     }
     html = render_report(TRAINING, live=live)
     assert "sem sinal de ML suficiente" in html
+
+
+def test_report_renders_dataset_coverage_and_problems():
+    dataset = {
+        "path": "data/training/dataset.csv",
+        "exists": True,
+        "total_rows": 12,
+        "usable_rows": 10,
+        "dropped": {"unknown_label": 2},
+        "labels": {
+            "arms_open": {"rows": 10, "sessions": 2, "seconds": 4.2},
+            "idle": {"rows": 0, "sessions": 0, "seconds": 0.0},
+        },
+        "sessions": [
+            {"session_id": "s<&1", "label": "arms_open", "rows": 10, "seconds": 4.2}
+        ],
+        "min_sessions_per_label": 2,
+        "ready": False,
+        "problems": ["idle: 0 sessões (mínimo 2)", "2 linhas com rótulo desconhecido (treino vai recusar)"],
+    }
+    html = render_report(TRAINING, dataset=dataset)
+
+    assert "<h2>Dataset</h2>" in html
+    assert "arms_open" in html and "10</td><td>2</td><td>4.2s" in html
+    assert "idle: 0 sessões (mínimo 2)" in html
+    assert "2 linhas com rótulo desconhecido (treino vai recusar)" in html
+    assert "s&lt;&amp;1" in html
+    assert "s<&1" not in html
+
+
+def test_report_handles_an_absent_dataset_without_fabricating_coverage():
+    dataset = {
+        "path": "missing.csv",
+        "exists": False,
+        "total_rows": 0,
+        "usable_rows": 0,
+        "dropped": {},
+        "labels": {},
+        "sessions": [],
+        "ready": False,
+        "problems": ["dataset ausente"],
+    }
+    html = render_report(TRAINING, dataset=dataset)
+
+    assert "Dataset ausente" in html
+    assert "missing.csv" in html
+    assert "Nenhuma sessão" not in html
+
+
+def test_report_renders_cv_summary_and_invalid_folds():
+    training = {
+        **TRAINING,
+        "cv": {
+            "n_splits": 3,
+            "folds_used": 2,
+            "folds_skipped": 1,
+            "macro_f1_mean": 0.81,
+            "macro_f1_std": 0.04,
+            "per_fold": [
+                {"fold": 1, "valid": True, "macro_f1": 0.85},
+                {
+                    "fold": 2,
+                    "valid": False,
+                    "macro_f1": None,
+                    "reason": "faltou arms_open no treino",
+                },
+                {"fold": 3, "valid": True, "macro_f1": 0.77},
+            ],
+        },
+    }
+    html = render_report(training)
+
+    assert "<h2>Validação cruzada</h2>" in html
+    assert "0.810 ± 0.040" in html
+    assert "1</td><td>0.850</td><td>incluída na média" in html
+    assert "2</td><td>—</td><td>ignorada" in html
+    assert "faltou arms_open no treino" in html
+    assert "2 dobras incluídas e" in html and "1 ignoradas" in html
+
+
+def test_report_distinguishes_pooled_loso_from_fold_mean():
+    training = {
+        **TRAINING,
+        "cv": {
+            "mode": "loso",
+            "macro_f1_oof": 0.9,
+            "macro_f1_mean": 0.24,
+            "macro_f1_std": 0.01,
+            "n_splits": 12,
+            "folds_used": 12,
+            "folds_skipped": 0,
+        },
+    }
+
+    html = render_report(training)
+
+    assert "macro-F1 LOSO: <strong>0.900</strong>" in html
+    assert "uma sessão por dobra" in html
+    assert "macro-F1 médio: <strong>0.240 ± 0.010</strong>" in html
+    assert "12 dobras incluídas" in html
