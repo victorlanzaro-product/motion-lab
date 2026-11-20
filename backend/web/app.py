@@ -88,7 +88,11 @@ def create_app(
         The CSV is re-read on every request so coverage reflects the latest
         recording; filesystem I/O runs in Starlette's worker thread pool.
         """
-        return await run_in_threadpool(dataset_stats, pipeline.config.dataset_path)
+        return await run_in_threadpool(
+            dataset_stats,
+            pipeline.config.dataset_path,
+            pipeline.config.record_labels,
+        )
 
     @app.websocket("/ws")
     async def stream(websocket: WebSocket) -> None:
@@ -99,6 +103,8 @@ def create_app(
                 still_threshold=pipeline.config.motion.still_threshold,
                 preview_width=pipeline.config.preview_width,
                 jpeg_quality=pipeline.config.jpeg_quality,
+                model_schema=pipeline.config.model_schema,
+                record_labels=pipeline.config.record_labels,
                 ml_classes=pipeline.ml_classes(),
                 face_enabled=pipeline.config.face_enabled,
             )

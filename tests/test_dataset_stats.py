@@ -9,7 +9,12 @@ import sys
 import pytest
 
 from backend.dataset.stats import MIN_SESSIONS_PER_LABEL, dataset_stats
-from backend.dataset.writer import DATASET_COLUMNS, DEFAULT_LABELS
+from backend.dataset.writer import (
+    DATASET_COLUMNS,
+    DEFAULT_LABELS,
+    DEFAULT_V2_DATASET_PATH,
+    V2_LABELS,
+)
 from backend.ml.train import DatasetError, MIN_SAMPLES_PER_CLASS, load_dataset
 from scripts.dataset_stats import main as dataset_stats_main
 
@@ -55,6 +60,18 @@ def test_missing_dataset_returns_the_contract_empty_shape(tmp_path):
         "ready": False,
         "problems": ["dataset ausente"],
     }
+
+
+def test_missing_v2_dataset_includes_an_empty_wave_coverage_entry(tmp_path):
+    path = tmp_path / "dataset_v2.csv"
+
+    stats = dataset_stats(path, allowed_labels=V2_LABELS)
+
+    assert DEFAULT_V2_DATASET_PATH.as_posix() == "data/training/dataset_v2.csv"
+    assert list(stats["labels"]) == list(V2_LABELS)
+    assert stats["labels"]["wave"] == {"rows": 0, "sessions": 0, "seconds": 0.0}
+    assert stats["ready"] is False
+    assert stats["problems"] == ["dataset ausente"]
 
 
 def test_json_cli_prints_the_contract_and_exits_one_when_not_ready(tmp_path, monkeypatch, capsys):
@@ -119,6 +136,30 @@ def test_stats_counts_rows_sessions_seconds_and_preserves_default_label_order(tm
     }
     assert stats["ready"] is True
     assert stats["problems"] == []
+
+
+def test_v2_stats_counts_wave_while_v1_stats_keeps_it_unknown(tmp_path):
+    path = tmp_path / "dataset_v2.csv"
+    rows = []
+    index = 0
+    for label in V2_LABELS:
+        for session in range(2):
+            for offset in (0.0, 0.5):
+                rows.append(
+                    _row(label, f"{label}-s{session}", index, session * 10 + offset)
+                )
+                index += 1
+    _write(path, rows)
+
+    v2_stats = dataset_stats(path, allowed_labels=V2_LABELS)
+    v1_stats = dataset_stats(path)
+
+    assert v2_stats["labels"]["wave"] == {"rows": 4, "sessions": 2, "seconds": 1.0}
+    assert v2_stats["ready"] is True
+    assert list(v2_stats["labels"]) == list(V2_LABELS)
+    assert "wave" not in v1_stats["labels"]
+    assert v1_stats["dropped"] == {"unknown_label": 4}
+    assert v1_stats["ready"] is False
 
 
 def test_one_session_for_a_label_is_not_ready_and_has_a_readable_problem(tmp_path):
