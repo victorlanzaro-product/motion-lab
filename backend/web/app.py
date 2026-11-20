@@ -25,7 +25,10 @@ from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
+from backend.dataset.stats import dataset_stats
+from backend.dataset.writer import DEFAULT_DATASET_PATH
 from backend.web.payload import hello_message
 from backend.web.pipeline import PipelineRunner, Subscriber, WebConfig
 
@@ -37,9 +40,15 @@ def create_app(
     config: Optional[WebConfig] = None,
     runner: Optional[PipelineRunner] = None,
     frontend_dir: Path = FRONTEND_DIR,
+    dataset_path: Path = DEFAULT_DATASET_PATH,
 ) -> FastAPI:
-    """Build the app. `runner` is injectable so tests can supply a fake camera."""
+    """Build the app with injectable pipeline and local dataset paths.
+
+    `runner` lets tests supply a fake camera. `dataset_path` remains an app
+    parameter until Sprint 12's `WebConfig` dataset-path field is integrated.
+    """
     pipeline = runner if runner is not None else PipelineRunner(config or WebConfig())
+    stats_path = Path(dataset_path)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -74,6 +83,15 @@ def create_app(
             # pipeline", not get muddied by an opt-in layer's own failure.
             "face_error": pipeline.face_error,
         }
+
+    @app.get("/dataset/stats")
+    async def get_dataset_stats() -> dict:
+        """Read current local coverage without blocking the event loop.
+
+        The CSV is re-read on every request so coverage reflects the latest
+        recording; filesystem I/O runs in Starlette's worker thread pool.
+        """
+        return await run_in_threadpool(dataset_stats, stats_path)
 
     @app.websocket("/ws")
     async def stream(websocket: WebSocket) -> None:
