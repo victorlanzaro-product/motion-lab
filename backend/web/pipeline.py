@@ -45,9 +45,10 @@ Four decisions carry this file:
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -55,9 +56,12 @@ from typing import Any, Callable, Optional
 from backend.camera import CameraConfig, CameraEngine, CameraOpenError, CameraReadError
 from backend.dataset.writer import (
     DEFAULT_DATASET_PATH,
+    DEFAULT_V2_DATASET_PATH,
+    DEFAULT_LABELS,
     DatasetWriterError,
-    validate_label,
+    V2_LABELS,
 )
+from backend.dataset.windows import build_window_input_row
 from backend.features import (
     FEATURE_NAMES,
     FaceMotionTracker,
@@ -69,8 +73,10 @@ from backend.features import (
 from backend.features.face_features import extract_face
 from backend.features.features import FrameFeatures
 from backend.features.velocity import MotionState
+from backend.features.window import WindowFeatures
 from backend.gestures import GestureConfig, GestureEngine
-from backend.ml import DEFAULT_MODEL_PATH, ModelError
+from backend.ml import DEFAULT_MODEL_PATH, DEFAULT_V2_MODEL_PATH, ModelError
+from backend.ml.rule_label import rule_label as compute_rule_label
 from backend.ml import load_model as load_ml_model
 from backend.ml import predict as ml_predict
 from backend.vision import (
@@ -87,6 +93,7 @@ from backend.vision import (
     ensure_model,
 )
 from backend.web.payload import (
+    PreviewError,
     encode_preview,
     error_message,
     face_payload,
@@ -94,7 +101,14 @@ from backend.web.payload import (
     record_status_message,
     status_message,
 )
-from backend.web.recorder import Recorder
+from backend.web.recorder import INVALID_RECORD_LABEL, Recorder, validate_record_label
+
+logger = logging.getLogger(__name__)
+PROJECT_DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+
+
+def default_report_path(model_path: Path) -> Path:
+    return PROJECT_DATA_DIR / "training" / f"{model_path.stem}.report.html"
 
 #: Wire names for the two arms, in the order the payload uses them.
 SIDES: dict[str, Side] = {"left": Side.LEFT, "right": Side.RIGHT}
@@ -115,7 +129,7 @@ class WebConfig:
     #: Path to a trained Sprint 08 model. Optional on purpose: the whole
     #: pipeline (pose, motion, rule-based gestures) works with no model at
     #: all — Live ML is a signal riding on top, never a dependency.
-    model_path: Path = DEFAULT_MODEL_PATH
+    model_path: Optional[Path] = None
     #: Width of the JPEG sent to the browser. Inference still runs on the full
     #: frame, so this trades picture size against bandwidth, never accuracy.
     preview_width: int = 640
@@ -150,7 +164,35 @@ class WebConfig:
     face_model_path: Path = DEFAULT_FACE_MODEL_PATH
     #: Shared labeled dataset target. Tests and alternate deployments can
     #: redirect writes without changing the DatasetWriter schema.
-    dataset_path: Path = DEFAULT_DATASET_PATH
+    dataset_path: Optional[Path] = None
+    #: Sprint 15 — last generated Sprint 10 HTML report. `None` follows the
+    #: model path using the same `<model-stem>.report.html` convention as
+    #: `scripts/report.py`; deployments can point the web app elsewhere.
+    report_path: Optional[Path] = None
+    #: Schema selected for live inference and recording labels. Appended to
+    #: preserve the positional field order of the pre-S14 WebConfig API.
+    model_schema: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.model_schema) is not int or self.model_schema not in (1, 2):
+            raise ValueError("model_schema must be 1 or 2")
+        model_default = DEFAULT_MODEL_PATH if self.model_schema == 1 else DEFAULT_V2_MODEL_PATH
+        dataset_default = (
+            DEFAULT_DATASET_PATH if self.model_schema == 1 else DEFAULT_V2_DATASET_PATH
+        )
+        object.__setattr__(
+            self, "model_path", Path(self.model_path) if self.model_path is not None else model_default
+        )
+        object.__setattr__(
+            self,
+            "dataset_path",
+            Path(self.dataset_path) if self.dataset_path is not None else dataset_default,
+        )
+
+    @property
+    def record_labels(self) -> tuple[str, ...]:
+        """Labels offered by the server for the selected recording schema."""
+        return DEFAULT_LABELS if self.model_schema == 1 else V2_LABELS
 
 
 class Subscriber:
@@ -160,6 +202,8 @@ class Subscriber:
     over from the pipeline thread, because `asyncio.Queue` is not thread-safe.
     """
 
+    MAX_CONTROL_MESSAGES = 64
+
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
         # Frames may be coalesced to keep latency bounded. Control messages
@@ -167,34 +211,145 @@ class Subscriber:
         # them, even if a new frame arrives in the meantime.
         self._latest_frame: Optional[dict[str, Any]] = None
         self._control: deque[dict[str, Any]] = deque()
+        # Start/stop state changes are boundaries, not disposable count
+        # updates. Keep their identities so queue pressure evicts rejections
+        # and replaceable controls first.
+        self._transition_ids: set[int] = set()
+        self._last_record_state: Optional[tuple[bool, Optional[str]]] = None
+        self._overloaded = False
         self._available = asyncio.Event()
         self.dropped = 0
+        self.sent = 0
 
     def offer(self, message: dict[str, Any]) -> None:
+        if self._overloaded:
+            return
         if message.get("type") == "frame":
             if self._latest_frame is not None:
                 self.dropped += 1
             self._latest_frame = message
-        elif message.get("type") == "record_status" and message.get("error") is None:
-            # Replacing an unread count update avoids turning the control
-            # queue into an old-status backlog for a slow browser. A session
-            # transition or private error forms a boundary and stays queued.
-            if self._control and self._control[-1].get("type") == "record_status":
-                pending = self._control[-1]
-                same_state = (
-                    pending.get("error") is None
-                    and pending.get("recording") == message.get("recording")
-                    and pending.get("session_id") == message.get("session_id")
-                )
-                if same_state:
-                    self._control[-1] = message
-                else:
-                    self._control.append(message)
-            else:
-                self._control.append(message)
         else:
-            self._control.append(message)
+            if self._coalesce_record_status(message):
+                self._available.set()
+                return
+            transition = self._is_record_transition(message)
+            if message.get("type") == "record_status" and (
+                message.get("error") is None or self._is_final_record_status(message)
+            ):
+                self._last_record_state = (
+                    bool(message.get("recording")), message.get("session_id")
+                )
+            self._append_control(message, preserve=transition)
         self._available.set()
+
+    def _coalesce_record_status(self, message: dict[str, Any]) -> bool:
+        """Replace duplicate rejections/count updates without hiding transitions."""
+        if message.get("type") != "record_status":
+            return False
+
+        if message.get("error") is not None and not self._is_final_record_status(message):
+            rejection_key = (
+                message.get("error"),
+                bool(message.get("recording")),
+                message.get("label"),
+                message.get("session_id"),
+                bool(message.get("owner")),
+            )
+            for index, pending in enumerate(self._control):
+                if pending.get("type") != "record_status" or pending.get("error") is None:
+                    continue
+                pending_key = (
+                    pending.get("error"),
+                    bool(pending.get("recording")),
+                    pending.get("label"),
+                    pending.get("session_id"),
+                    bool(pending.get("owner")),
+                )
+                if pending_key == rejection_key:
+                    self._control[index] = message
+                    return True
+            return False
+
+        state = (bool(message.get("recording")), message.get("session_id"))
+        is_transition = state != self._last_record_state
+        if (
+            not is_transition
+            and self._control
+            and self._control[-1].get("type") == "record_status"
+            and self._control[-1].get("error") is None
+            and (
+                bool(self._control[-1].get("recording")),
+                self._control[-1].get("session_id"),
+            )
+            == state
+            and id(self._control[-1]) not in self._transition_ids
+        ):
+            self._control[-1] = message
+            return True
+        return False
+
+    def _is_record_transition(self, message: dict[str, Any]) -> bool:
+        if message.get("type") != "record_status":
+            return False
+        if message.get("error") is not None and not self._is_final_record_status(message):
+            return False
+        state = (bool(message.get("recording")), message.get("session_id"))
+        return state != self._last_record_state
+
+    def _append_control(self, message: dict[str, Any], *, preserve: bool = False) -> None:
+        """Append within the bound, evicting rejections before state changes."""
+        if len(self._control) >= self.MAX_CONTROL_MESSAGES:
+            removable = self._find_removable_control()
+            if removable is None:
+                # The queue contains only protected transitions/finals/fatal
+                # controls. Silently dropping the new state here would let a
+                # slow socket drain stale statuses and never learn the real
+                # state. Close it so the client reconnects and receives a
+                # fresh snapshot (and fatal pipeline error replay if needed).
+                self._close_for_resnapshot()
+                return
+            old = self._control[removable]
+            self._transition_ids.discard(id(old))
+            del self._control[removable]
+        self._control.append(message)
+        if preserve:
+            self._transition_ids.add(id(message))
+
+    def _find_removable_control(self) -> Optional[int]:
+        """Choose the least important queued item without dropping finals."""
+        for index, pending in enumerate(self._control):
+            if (
+                pending.get("type") == "record_status"
+                and pending.get("error") is not None
+                and not self._is_final_record_status(pending)
+            ):
+                return index
+        for index, pending in enumerate(self._control):
+            if (
+                id(pending) not in self._transition_ids
+                and not self._is_final_record_status(pending)
+                and not self._is_fatal_control(pending)
+            ):
+                return index
+        return None
+
+    def _close_for_resnapshot(self) -> None:
+        self._overloaded = True
+        self._control.clear()
+        self._transition_ids.clear()
+        self._available.set()
+
+    @staticmethod
+    def _is_fatal_control(message: dict[str, Any]) -> bool:
+        return message.get("type") == "error" and message.get("fatal", True) is True
+
+    @staticmethod
+    def _is_final_record_status(message: dict[str, Any]) -> bool:
+        return (
+            message.get("type") == "record_status"
+            and message.get("recording") is False
+            and message.get("session_id") is not None
+        )
 
     def offer_threadsafe(self, message: dict[str, Any]) -> None:
         try:
@@ -206,11 +361,28 @@ class Subscriber:
 
     async def get(self) -> dict[str, Any]:
         while True:
+            if self._overloaded:
+                return {"type": "subscriber_overloaded"}
             if self._control:
-                return self._control.popleft()
+                message = self._control.popleft()
+                self._transition_ids.discard(id(message))
+                return message
             if self._latest_frame is not None:
-                message = self._latest_frame
+                message = dict(self._latest_frame)
                 self._latest_frame = None
+                first_frame = self.sent == 0
+                self.sent += 1
+                health = dict(message.get("health") or {})
+                if first_frame:
+                    # Establish the per-connection baseline at the first
+                    # frame even if startup coalesced before the writer ran.
+                    health["dropped_frames"] = 0
+                    health["dropped_rate"] = 0.0
+                else:
+                    health["dropped_frames"] = self.dropped
+                    total = self.sent + self.dropped
+                    health["dropped_rate"] = round(self.dropped / total, 2)
+                message["health"] = health
                 return message
             self._available.clear()
             await self._available.wait()
@@ -256,7 +428,10 @@ class PipelineRunner:
         self.camera_factory = camera_factory
         self.detector_factory = detector_factory
         self.face_detector_factory = face_detector_factory
-        self.recorder = Recorder(self.config.dataset_path)
+        self.recorder = Recorder(
+            self.config.dataset_path,
+            allowed_labels=self.config.record_labels,
+        )
 
         self.state = "idle"  # idle | starting | live | failed
         self.error: Optional[str] = None
@@ -271,7 +446,10 @@ class PipelineRunner:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
-        self._owner_disconnected = threading.Event()
+        # The active session ID is the disconnect signal. A bare Event can be
+        # set for session B and then cleared by completion of an older stop for
+        # session A, leaving B's writer open after its owner disconnects.
+        self._owner_disconnected_session: Optional[str] = None
         # A start request may reserve a session only while a pipeline thread
         # can consume it. This gate and its status delivery share `_lock` so a
         # start racing shutdown is either ordered before the final status or
@@ -288,9 +466,35 @@ class PipelineRunner:
         than reading a cached value that might not exist yet.
         """
         try:
-            return list(load_ml_model(self.config.model_path)["classes"])
-        except ModelError:
+            bundle = load_ml_model(
+                self.config.model_path,
+                schema=self.config.model_schema,
+            )
+            return list(bundle["classes"])
+        except Exception:  # noqa: BLE001 - optional live ML
+            logger.debug("ML model unavailable during WebSocket handshake", exc_info=True)
             return []
+
+    @property
+    def report_path(self) -> Path:
+        return self.config.report_path or default_report_path(self.config.model_path)
+
+    def safe_report_path(self) -> Optional[Path]:
+        """Resolve a regular report within data, rejecting symlinks."""
+        candidate = self.report_path.absolute()
+        try:
+            resolved = candidate.resolve()
+            if resolved != candidate or not resolved.is_relative_to(PROJECT_DATA_DIR):
+                logger.warning("Rejected report path outside the allowed location: %s", candidate)
+                return None
+            return resolved if resolved.is_file() else None
+        except (OSError, RuntimeError):
+            logger.exception("Could not resolve saved report")
+            return None
+
+    def report_available(self) -> bool:
+        """Whether the report can be served over HTTP."""
+        return self.safe_report_path() is not None
 
     # --- subscriptions -------------------------------------------------
     @property
@@ -326,29 +530,44 @@ class PipelineRunner:
             # tying ownership to the subscription guarantees a closed tab
             # cannot leave an open CSV session behind.
             if self.recorder.owner_disconnected(subscriber):
-                self._owner_disconnected.set()
+                self._owner_disconnected_session = self.recorder.status()["session_id"]
 
-    def record_start(self, label: str, subscriber: Subscriber) -> dict[str, Any]:
-        """Reserve a session only while a worker can consume its command."""
-        try:
-            label = validate_label(label)
-        except DatasetWriterError as exc:
-            with self._lock:
-                event = self.recorder.status()
-                event["error"] = str(exc)
-                self._offer_record_status(subscriber, event)
-                return event
+    def _clear_owner_disconnect_for(self, event: Optional[dict[str, Any]]) -> None:
+        """Clear only the disconnect signal belonging to this finished session."""
+        if event is None or event.get("session_id") is None:
+            return
+        with self._lock:
+            if self._owner_disconnected_session == event["session_id"]:
+                self._owner_disconnected_session = None
+
+    def _process_owner_disconnect(self) -> None:
+        """Finish a disconnected owner's session if its reservation is current."""
+        with self._lock:
+            disconnected_session = self._owner_disconnected_session
+        if disconnected_session is None:
+            return
+
+        snapshot = self.recorder.status()
+        if snapshot["recording"] and snapshot["session_id"] == disconnected_session:
+            self._close_recorder(resume_record_starts=True)
 
         with self._lock:
+            if self._owner_disconnected_session == disconnected_session:
+                self._owner_disconnected_session = None
+
+    def record_start(self, label: object, subscriber: Subscriber) -> dict[str, Any]:
+        """Reserve a session only while a worker can consume its command."""
+        with self._lock:
+            try:
+                label = validate_record_label(label, self.config.record_labels)
+            except DatasetWriterError:
+                return self._reject_record_start(subscriber, INVALID_RECORD_LABEL)
+
             if not self._accept_record_starts or self.state in ("recovering", "failed"):
-                event = self.recorder.status()
-                reason = self.error or "the camera stream is unavailable"
-                event["error"] = (
-                    f"Cannot start recording while the pipeline is not accepting "
-                    f"requests: {reason}"
+                reason = self.error or "A câmera ainda não está disponível."
+                return self._reject_record_start(
+                    subscriber, f"Não foi possível iniciar a gravação. {reason}"
                 )
-                self._offer_record_status(subscriber, event)
-                return event
 
             # request_start is validation/reservation only; file I/O remains
             # on the pipeline thread. Offer the accepted status under the
@@ -360,6 +579,12 @@ class PipelineRunner:
                 self._offer_record_status(subscriber, event)
             return event
 
+    def _reject_record_start(self, subscriber: Subscriber, error: str) -> dict[str, Any]:
+        snapshot = self.recorder.status_for(subscriber, error=error)
+        owner = snapshot.pop("owner")
+        subscriber.offer_threadsafe(record_status_message(**snapshot, owner=owner))
+        return snapshot
+
     def record_stop(self, subscriber: Subscriber) -> Optional[dict[str, Any]]:
         """Queue a stop request after the recorder checks tab ownership."""
         with self._lock:
@@ -370,7 +595,7 @@ class PipelineRunner:
 
     def recording_snapshot_for(self, subscriber: Subscriber) -> dict[str, Any]:
         """Current recorder state with ownership scoped to one browser tab."""
-        return self._record_wire_message(self.recorder.status(), subscriber)
+        return record_status_message(**self.recorder.status_for(subscriber))
 
     def recording_health(self) -> dict[str, Any]:
         """Current recorder state without leaking the in-process owner token."""
@@ -403,6 +628,8 @@ class PipelineRunner:
             return
         with self._lock:
             self._publish_record_event_locked(event)
+        if event["error"] is not None:
+            self._broadcast(error_message(event["error"], fatal=False))
 
     def _publish_record_event_locked(self, event: dict[str, Any]) -> None:
         """Queue one shared status while the subscriber set is stable."""
@@ -435,6 +662,8 @@ class PipelineRunner:
                 self._publish_record_event_locked(event)
             if resume_record_starts and self.state == "live" and not self._stop.is_set():
                 self._accept_record_starts = True
+        if error is None and event is not None and event["error"] is not None:
+            self._broadcast(error_message(event["error"], fatal=False))
 
     # --- lifecycle -----------------------------------------------------
     def _ensure_running(self) -> bool:
@@ -480,42 +709,23 @@ class PipelineRunner:
         for subscriber in subscribers:
             subscriber.offer_threadsafe(message)
 
-    def _disable_face(self, detector: Optional[FaceDetector], exc: Exception) -> str:
-        """Contain every optional-face lifecycle failure at its boundary.
-
-        `FaceModelError` already carries a clean, explainable message (missing
-        file, failed download) -- the same rule `_run` applies to
-        `PoseModelError`/`CameraError`. Only an *unexpected* exception (a
-        MediaPipe runtime hiccup, `close()` blowing up) gets its type name
-        prefixed, since there `str(exc)` alone (e.g. `"boom"`) would not be
-        enough context to tell a client-visible bug apart from an unrelated
-        message that happens to read the same.
-        """
-
-        def _describe(inner: Exception) -> str:
-            if isinstance(inner, FaceModelError):
-                return str(inner)
-            return f"{type(inner).__name__}: {inner}"
-
-        error = _describe(exc)
-        self.face_error = error
+    def _disable_face(self, detector: Optional[FaceDetector], message: str) -> str:
+        """Keep the public reason about face tracking and log the underlying failure."""
+        logger.exception("Face tracking unavailable")
+        self.face_error = message
+        self._broadcast(error_message(message, fatal=False))
         if detector is not None:
             try:
                 detector.close()
-            except Exception as close_exc:  # noqa: BLE001 - optional teardown
-                error = f"{error}; close failed: {_describe(close_exc)}"
-                self.face_error = error
-        return error
+            except Exception:  # noqa: BLE001 - optional teardown
+                logger.exception("Could not close face detector")
+        return message
 
     def _run(self) -> None:
         """Thread body: open the devices, stream, and always release them.
 
-        Wrapped in a bounded retry loop (class docstring, point 5): a
-        `CameraError` — whether it is the very first `open()` or the camera
-        going silent mid-stream — gets `max_camera_retries` attempts with an
-        exponential backoff before the runner gives up. A `PoseModelError` or
-        any other exception is not retried: the pose model file is not going
-        to appear on its own between one attempt and the next.
+        A camera read failure gets bounded retries with exponential backoff.
+        Camera open and pose model failures are fatal.
         """
         self.error = None
         attempt = 0
@@ -540,15 +750,22 @@ class PipelineRunner:
                 with self._lock:
                     self.state = "idle"
                 break
-            except CameraOpenError as exc:
+            except CameraOpenError:
+                logger.exception("Could not open camera")
                 with self._lock:
                     self._accept_record_starts = False
                     self.state = "failed"
-                    self.error = str(exc)
+                    self.error = (
+                        f"Não foi possível abrir a câmera (índice {self.config.camera.index}). "
+                        "Verifique se ela está conectada, livre e se o aplicativo tem "
+                        "permissão de acesso à câmera. No macOS, confira em Ajustes do Sistema "
+                        "> Privacidade e Segurança > Câmera e reinicie o aplicativo."
+                    )
                 self._close_recorder(error=self.error)
                 self._broadcast(error_message(self.error))
                 break
-            except CameraReadError as exc:
+            except CameraReadError:
+                logger.warning("Camera stopped delivering frames", exc_info=True)
                 with self._lock:
                     self._accept_record_starts = False
                 # At least one real frame got through before it died: that is
@@ -564,24 +781,26 @@ class PipelineRunner:
                 while flap_times and flap_times[0] < cutoff:
                     flap_times.pop(0)
                 flapping = len(flap_times) > self.config.max_flaps_per_window
-                with self._lock:
-                    self.error = str(exc)
+                message = "A câmera parou de enviar imagens."
                 if self._stop.is_set() or attempt > self.config.max_camera_retries or flapping:
+                    if flapping:
+                        message += (
+                            f" Houve {len(flap_times)} falhas em "
+                            f"{self.config.flap_window_seconds:.0f} s."
+                        )
+                    message += " As tentativas de reconexão foram encerradas."
                     with self._lock:
                         self.state = "failed"
-                    if flapping:
-                        self.error = (
-                            f"{self.error} (camera failed {len(flap_times)} times in "
-                            f"{self.config.flap_window_seconds:.0f}s — giving up instead "
-                            "of retrying forever)"
-                        )
-                    self._close_recorder(error=self.error)
-                    self._broadcast(error_message(self.error))
+                        self.error = message
+                    self._close_recorder(error=message)
+                    self._broadcast(error_message(message))
                     break
                 with self._lock:
                     self.state = "recovering"
-                self._close_recorder(error=self.error)
-                self._broadcast(status_message("recovering", self.error))
+                    self.error = message
+                self._close_recorder(error=message)
+                self._broadcast(error_message(message, fatal=False))
+                self._broadcast(status_message("recovering", message))
                 delay = min(
                     self.config.retry_backoff_base * (2 ** (attempt - 1)),
                     self.config.retry_backoff_cap,
@@ -590,24 +809,24 @@ class PipelineRunner:
                     with self._lock:
                         self.state = "idle"
                     break
-            except PoseModelError as exc:
-                # An expected, explainable failure: the pose model is missing
-                # or unusable. The user has to see it, so it goes to every
-                # client — and it will not fix itself on a retry.
+            except Exception as exc:  # noqa: BLE001 - surface fatal pipeline failures
+                logger.exception("Camera pipeline stopped")
+                if isinstance(exc, PoseModelError):
+                    message = (
+                        "Não foi possível baixar o modelo de pose. Verifique a conexão com a internet."
+                        if exc.__cause__ is not None
+                        else "O modelo de pose está indisponível. Verifique se ele foi instalado."
+                    )
+                elif isinstance(exc, PreviewError):
+                    message = str(exc)
+                else:
+                    message = "O processamento da câmera foi interrompido por uma falha interna."
                 with self._lock:
                     self._accept_record_starts = False
                     self.state = "failed"
-                    self.error = str(exc)
-                self._close_recorder(error=self.error)
-                self._broadcast(error_message(self.error))
-                break
-            except Exception as exc:  # noqa: BLE001 - a dead thread must not fail silently
-                with self._lock:
-                    self._accept_record_starts = False
-                    self.state = "failed"
-                    self.error = f"{type(exc).__name__}: {exc}"
-                self._close_recorder(error=self.error)
-                self._broadcast(error_message(self.error))
+                    self.error = message
+                self._close_recorder(error=message)
+                self._broadcast(error_message(message))
                 break
 
         with self._lock:
@@ -631,10 +850,34 @@ class PipelineRunner:
         # so training a model mid-session takes effect on the next reconnect
         # without a server restart. Missing or corrupt is not fatal — Live ML
         # is a signal on top of the pipeline, never a dependency of it.
+        ml_bundle = None
         try:
-            ml_bundle = load_ml_model(self.config.model_path)
-        except ModelError:
-            ml_bundle = None
+            if self.config.model_path.exists():
+                ml_bundle = load_ml_model(
+                    self.config.model_path,
+                    schema=self.config.model_schema,
+                )
+        except Exception:  # noqa: BLE001 - optional live ML
+            logger.exception("Could not load model for live inference")
+            self._broadcast(
+                error_message(
+                    "Não foi possível carregar o modelo de classificação ao vivo.", fatal=False
+                )
+            )
+
+        window_tracker: Optional[WindowFeatures] = None
+        if self.config.model_schema == 2 and ml_bundle is not None:
+            try:
+                window_tracker = WindowFeatures(
+                    window_seconds=ml_bundle["window_seconds"],
+                    max_gap=ml_bundle["max_gap"],
+                    min_samples=ml_bundle["min_samples"],
+                    deadband=ml_bundle["deadband"],
+                )
+            except (KeyError, TypeError, ValueError):
+                # Loading the optional model must never make pose, gestures,
+                # recording, or the web stream unavailable.
+                ml_bundle = None
 
         # Sprint 11 — facial signals, same isolation rule as the ML bundle
         # above: opt-in (`face_enabled`) and, once on, a missing/broken model
@@ -650,21 +893,38 @@ class PipelineRunner:
                 face_detector = self.face_detector_factory(self.config)
                 face_detector.open()
             except Exception as exc:  # noqa: BLE001 - optional subsystem boundary
-                face_error = self._disable_face(face_detector, exc)
+                message = "Não foi possível iniciar o rastreamento facial."
+                if isinstance(exc, FaceModelError):
+                    message = (
+                        "Não foi possível baixar o modelo facial. Verifique a conexão com a internet."
+                        if exc.__cause__ is not None
+                        else "O modelo facial está indisponível. Verifique se ele foi instalado."
+                    )
+                face_error = self._disable_face(face_detector, message)
                 face_detector = None
         self.face_error = face_error
 
+        def timed_frames():
+            """Measure the camera generator's read operation per frame."""
+            frames = iter(camera.frames())
+            while True:
+                capture_started = time.perf_counter()
+                try:
+                    captured = next(frames)
+                except StopIteration:
+                    return
+                capture_ms = (time.perf_counter() - capture_started) * 1000
+                yield captured, capture_started, capture_ms
+
         try:
-            for frame in camera.frames():
+            for frame, capture_started, capture_ms in timed_frames():
                 if self._stop.is_set():
                     return
 
                 if self.client_count == 0:
                     # Commands still need servicing during the camera's idle
                     # grace period, especially the owner's disconnect stop.
-                    if self._owner_disconnected.is_set():
-                        self._close_recorder(resume_record_starts=True)
-                        self._owner_disconnected.clear()
+                    self._process_owner_disconnect()
                     if idle_since is None:
                         # First frame with nobody watching: drop the temporal state.
                         # Whatever the arms did while the tab was closed is not part
@@ -674,6 +934,8 @@ class PipelineRunner:
                         tracker.reset()
                         gestures.reset()
                         face_tracker.reset()
+                        if window_tracker is not None:
+                            window_tracker.reset()
                         for trail in trails.values():
                             trail.clear()
                     if time.monotonic() - idle_since >= self.config.idle_seconds:
@@ -681,19 +943,60 @@ class PipelineRunner:
                     continue  # keep the device warm, but spend no CPU on pose
 
                 idle_since = None
+                # `PoseSnapshot.inference_ms` is timed by PoseDetector with
+                # perf_counter around the landmarker call itself.
                 snapshot = detector.detect(frame)
+                pose_ms = snapshot.inference_ms
+
+                features_started = time.perf_counter()
                 features = extract(snapshot, self.config.visibility_threshold)
                 motion = tracker.update(features)
                 fired = gestures.update(features, motion)
-                prediction = self._predict(ml_bundle, features, motion)
+                features_ms = (time.perf_counter() - features_started) * 1000
+
+                window_state = None
+                if window_tracker is not None:
+                    if snapshot.detected:
+                        window_state = window_tracker.push(features.timestamp, features)
+                    else:
+                        # A missing pose breaks temporal continuity. Do not
+                        # carry pre-loss movement into the first re-detected frame.
+                        window_tracker.reset()
+
+                ml_started = time.perf_counter()
+                try:
+                    prediction = self._predict(
+                        ml_bundle,
+                        features,
+                        motion,
+                        window_state=window_state,
+                    )
+                except Exception:  # noqa: BLE001 - optional live ML
+                    logger.exception("Disabling live ML after inference failed")
+                    self._broadcast(
+                        error_message(
+                            "A classificação ao vivo foi desativada após uma falha de inferência.",
+                            fatal=False,
+                        )
+                    )
+                    ml_bundle = None
+                    window_tracker = None
+                    prediction = None
+                ml_ms = (
+                    (time.perf_counter() - ml_started) * 1000
+                    if prediction is not None
+                    else None
+                )
                 for name, trail in trails.items():
                     trail.add_from(snapshot, SIDES[name], self.config.visibility_threshold)
 
                 face_dict = None
+                face_ms = None
                 if self.config.face_enabled:
                     if face_detector is None:
                         face_dict = face_payload(enabled=True, error=face_error)
                     else:
+                        face_started = time.perf_counter()
                         try:
                             face_snapshot = face_detector.detect(frame)
                             face_signals = extract_face(face_snapshot)
@@ -706,51 +1009,86 @@ class PipelineRunner:
                                 motion=face_motion,
                                 mesh=face_snapshot.mesh,
                             )
-                        except Exception as exc:  # noqa: BLE001 - optional layer,
+                        except Exception:  # noqa: BLE001 - optional layer,
                             # must never sink pose/web (requirement 4): one bad
                             # frame disables face for the rest of THIS session
                             # rather than crashing the whole pipeline thread —
                             # pose, motion, gestures, ML keep running untouched.
-                            face_error = self._disable_face(face_detector, exc)
+                            face_error = self._disable_face(
+                                face_detector, "Falha ao analisar o rosto. O rastreamento facial foi desativado."
+                            )
                             face_detector = None
                             face_dict = face_payload(enabled=True, error=face_error)
+                        finally:
+                            face_ms = (time.perf_counter() - face_started) * 1000
 
                 # The CSV writer runs here, on the pipeline thread, with the
                 # exact feature and motion objects derived from this frame.
                 record_event = self.recorder.record_frame(features, motion)
                 self._publish_record_events(record_event)
-                if record_event is not None:
-                    self._owner_disconnected.clear()
+                self._clear_owner_disconnect_for(record_event)
                 self._publish_record_counts_if_due()
 
-                self._broadcast(
-                    frame_message(
-                        snapshot=snapshot,
-                        features=features,
-                        motion=motion,
-                        preview=encode_preview(
-                            frame.image,  # raw, unmirrored: the browser flips at draw time
-                            width=self.config.preview_width,
-                            quality=self.config.jpeg_quality,
-                        ),
-                        fps=camera.fps,
-                        trails=trails,
-                        gestures=fired,
-                        ml=prediction,
-                        face=face_dict,
-                    )
+                timings: dict[str, Optional[float]] = {
+                    "capture_ms": capture_ms,
+                    "pose_ms": pose_ms,
+                    "features_ms": features_ms,
+                    "ml_ms": ml_ms,
+                    "face_ms": face_ms,
+                    # Filled immediately after the payload is constructed.
+                    "total_ms": None,
+                }
+                message = frame_message(
+                    snapshot=snapshot,
+                    features=features,
+                    motion=motion,
+                    preview=encode_preview(
+                        frame.image,  # raw, unmirrored: the browser flips at draw time
+                        width=self.config.preview_width,
+                        quality=self.config.jpeg_quality,
+                    ),
+                    fps=camera.fps,
+                    trails=trails,
+                    gestures=fired,
+                    ml=prediction,
+                    face=face_dict,
+                    rule_label=(
+                        compute_rule_label(
+                            features.to_dict(), self.config.gesture.open_threshold
+                        )
+                        if snapshot.detected
+                        else None
+                    ),
+                    timings=timings,
                 )
+
+                # Includes the camera read and all work through payload
+                # construction. Ensure rounded stage values never sum beyond
+                # the rounded total due to one-decimal rounding.
+                stage_total_ms = sum(
+                    round(value, 1)
+                    for name, value in timings.items()
+                    if name != "total_ms" and value is not None
+                )
+                elapsed_ms = (time.perf_counter() - capture_started) * 1000
+                message["timings"]["total_ms"] = round(
+                    max(elapsed_ms, stage_total_ms), 1
+                )
+                self._broadcast(message)
                 self.frames_served += 1
         finally:
             if face_detector is not None:
                 try:
                     face_detector.close()
-                except Exception as exc:  # noqa: BLE001 - optional teardown
-                    self._disable_face(None, exc)
+                except Exception:  # noqa: BLE001 - optional teardown
+                    self._disable_face(None, "Não foi possível encerrar o rastreamento facial.")
 
     @staticmethod
     def _predict(
-        bundle: Optional[dict], features: FrameFeatures, motion: MotionState
+        bundle: Optional[dict],
+        features: FrameFeatures,
+        motion: MotionState,
+        window_state=None,
     ) -> Optional[tuple[str, dict[str, float]]]:
         """Skip, don't guess: an incomplete frame never reaches the model.
 
@@ -777,6 +1115,11 @@ class PipelineRunner:
         """
         if bundle is None or not features.complete:
             return None
+        if bundle.get("schema_version", 1) == 2:
+            row = build_window_input_row(features, window_state)
+            if row is None:
+                return None
+            return ml_predict(bundle, row)
         columns = bundle.get("columns") or ()
         needs_motion = any(name not in FEATURE_NAMES for name in columns)
         if needs_motion and not motion.complete:

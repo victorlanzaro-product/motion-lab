@@ -25,15 +25,24 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
+from backend.dataset.stats import dataset_stats
 from backend.web.payload import hello_message
 from backend.web.pipeline import PipelineRunner, Subscriber, WebConfig
 
 #: backend/web/app.py -> backend/web -> backend -> project root
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 logger = logging.getLogger(__name__)
+MAX_WS_MESSAGE_BYTES = 4 * 1024
+REPORT_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'none'; style-src 'unsafe-inline'; sandbox; "
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    ),
+}
 
 
 def create_app(
@@ -79,29 +88,70 @@ def create_app(
             "recording": pipeline.recording_health(),
         }
 
+    @app.get("/report")
+    async def report() -> Response:
+        """Serve the last Sprint 10 report without generating it in a request."""
+        try:
+            html = await asyncio.to_thread(_read_saved_report, pipeline)
+        except (FileNotFoundError, IsADirectoryError):
+            return PlainTextResponse(
+                "relatório ainda não gerado — rode scripts/report.py",
+                status_code=404,
+                headers=REPORT_HEADERS,
+            )
+        except (OSError, UnicodeError):
+            logger.exception("Could not read the saved report")
+            return PlainTextResponse(
+                "Não foi possível ler o relatório salvo.", status_code=500, headers=REPORT_HEADERS
+            )
+        return HTMLResponse(html, headers=REPORT_HEADERS)
+
+    @app.get("/dataset/stats")
+    async def get_dataset_stats() -> dict:
+        """Read current local coverage without blocking the event loop.
+
+        The CSV is re-read on every request so coverage reflects the latest
+        recording; filesystem I/O runs in Starlette's worker thread pool.
+        """
+        return await run_in_threadpool(
+            dataset_stats,
+            pipeline.config.dataset_path,
+            pipeline.config.record_labels,
+        )
+
     @app.websocket("/ws")
     async def stream(websocket: WebSocket) -> None:
         await websocket.accept()
+        report_available = await asyncio.to_thread(pipeline.report_available)
         await websocket.send_json(
             hello_message(
                 visibility_threshold=pipeline.config.visibility_threshold,
                 still_threshold=pipeline.config.motion.still_threshold,
                 preview_width=pipeline.config.preview_width,
                 jpeg_quality=pipeline.config.jpeg_quality,
+                model_schema=pipeline.config.model_schema,
+                record_labels=pipeline.config.record_labels,
                 ml_classes=pipeline.ml_classes(),
                 face_enabled=pipeline.config.face_enabled,
+                report_available=report_available,
             )
         )
 
         # Subscribing after the hello guarantees the client holds the landmark
         # table and the bone topology before the first frame that needs them.
+        writer = None
+        reader = None
         subscriber = pipeline.subscribe(asyncio.get_running_loop())
-        # Every client receives the current shared recorder state immediately
-        # after hello, including a second tab joining an active session.
-        await websocket.send_json(pipeline.recording_snapshot_for(subscriber))
-        writer = asyncio.create_task(_write_frames(websocket, subscriber))
-        reader = asyncio.create_task(_read_client_messages(websocket, pipeline, subscriber))
         try:
+            # Every client receives the current shared recorder state immediately
+            # after hello, including a second tab joining an active session.
+            # This send belongs inside the cleanup region: if it fails, the
+            # subscription must still be removed so it cannot keep the camera on.
+            await websocket.send_json(pipeline.recording_snapshot_for(subscriber))
+            writer = asyncio.create_task(_write_frames(websocket, subscriber))
+            reader = asyncio.create_task(
+                _read_client_messages(websocket, pipeline, subscriber)
+            )
             done, pending = await asyncio.wait(
                 {writer, reader}, return_when=asyncio.FIRST_COMPLETED
             )
@@ -127,21 +177,45 @@ def create_app(
             # so the cancellation itself is never actually lost.
             pass
         finally:
-            for task in (writer, reader):
-                if not task.done():
-                    task.cancel()
-            pipeline.unsubscribe(subscriber)
+            try:
+                for task in (writer, reader):
+                    if task is not None and not task.done():
+                        task.cancel()
+                tasks = [task for task in (writer, reader) if task is not None]
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                # A second cancellation during task teardown must not leak a
+                # subscriber and keep the shared camera alive.
+                pipeline.unsubscribe(subscriber)
 
     return app
+
+
+def _read_saved_report(pipeline: PipelineRunner) -> str:
+    path = pipeline.safe_report_path()
+    if path is None:
+        raise FileNotFoundError
+    return path.read_text(encoding="utf-8")
 
 
 async def _write_frames(websocket: WebSocket, subscriber: Subscriber) -> None:
     """Forward messages until the pipeline reports a fatal error."""
     while True:
         message = await subscriber.get()
+        if message.get("type") == "subscriber_overloaded":
+            await websocket.close(
+                code=1013,
+                reason="Control queue overloaded; reconnect for a fresh state snapshot.",
+            )
+            return
         await websocket.send_json(message)
         if message.get("type") == "error" and message.get("fatal"):
             return
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
 
 
 async def _read_client_messages(
@@ -159,11 +233,18 @@ async def _read_client_messages(
             return
         raw = message.get("text")
         if not isinstance(raw, str):
-            logger.debug("ignoring non-text WebSocket message")
+            binary = message.get("bytes")
+            if binary is not None and len(binary) > MAX_WS_MESSAGE_BYTES:
+                logger.warning("Ignoring oversized binary WebSocket message")
+            else:
+                logger.debug("Ignoring non-text WebSocket message")
             continue
         try:
-            command = json.loads(raw)
-        except json.JSONDecodeError:
+            if len(raw) > MAX_WS_MESSAGE_BYTES or len(raw.encode("utf-8")) > MAX_WS_MESSAGE_BYTES:
+                logger.warning("Ignoring oversized text WebSocket message")
+                continue
+            command = json.loads(raw, parse_constant=_reject_json_constant)
+        except (ValueError, RecursionError):
             logger.debug("ignoring invalid JSON WebSocket message")
             continue
         if not isinstance(command, dict):
@@ -172,11 +253,7 @@ async def _read_client_messages(
 
         command_type = command.get("type")
         if command_type == "record_start":
-            label = command.get("label")
-            if not isinstance(label, str):
-                logger.debug("ignoring malformed record_start message")
-                continue
-            pipeline.record_start(label, subscriber)
+            pipeline.record_start(command.get("label"), subscriber)
         elif command_type == "record_stop":
             pipeline.record_stop(subscriber)
         else:

@@ -3,10 +3,12 @@
 from backend.dataset.writer import (
     DATASET_COLUMNS,
     DEFAULT_DATASET_PATH,
+    DEFAULT_V2_DATASET_PATH,
     DEFAULT_LABELS,
     MOTION_COLUMNS,
     NUMERIC_MOTION_COLUMNS,
     REMOVED_LABELS,
+    V2_LABELS,
     DatasetWriter,
     DatasetWriterError,
 )
@@ -14,10 +16,12 @@ from backend.dataset.writer import (
 __all__ = [
     "DATASET_COLUMNS",
     "DEFAULT_DATASET_PATH",
+    "DEFAULT_V2_DATASET_PATH",
     "DEFAULT_LABELS",
     "MOTION_COLUMNS",
     "NUMERIC_MOTION_COLUMNS",
     "REMOVED_LABELS",
+    "V2_LABELS",
     "DatasetWriter",
     "DatasetWriterError",
 ]

@@ -14,6 +14,7 @@ only turns on once a page is actually connected.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import sys
 import webbrowser
 
@@ -22,7 +23,7 @@ import uvicorn
 from pathlib import Path
 
 from backend.camera import CameraConfig
-from backend.ml import DEFAULT_MODEL_PATH
+from backend.dataset.writer import DEFAULT_DATASET_PATH, DEFAULT_V2_DATASET_PATH
 from backend.vision import (
     DEFAULT_FACE_MODEL_PATH,
     FaceModelError,
@@ -38,6 +39,9 @@ def main() -> int:
     # Loopback by default, and deliberately so: this endpoint streams a webcam
     # with no authentication. Binding 0.0.0.0 puts your living room on the LAN.
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--allow-lan", action="store_true", help="autoriza expor a câmera fora do loopback"
+    )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=1280)
@@ -50,10 +54,26 @@ def main() -> int:
     )
     parser.add_argument("--quality", type=int, default=70, help="JPEG quality, 1-100")
     parser.add_argument(
+        "--model-schema",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="model/data schema (1: per-frame, 2: temporal windows)",
+    )
+    parser.add_argument(
         "--model",
         type=Path,
-        default=DEFAULT_MODEL_PATH,
-        help="trained Sprint 08 model; missing is fine, Live ML just stays off",
+        default=None,
+        help="override the schema-specific model bundle; missing is fine, Live ML stays off",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=None,
+        help=(
+            "override the schema-specific recording dataset "
+            f"(v1: {DEFAULT_DATASET_PATH}; v2: {DEFAULT_V2_DATASET_PATH})"
+        ),
     )
     parser.add_argument(
         "--face",
@@ -63,12 +83,27 @@ def main() -> int:
     parser.add_argument("--face-model", type=Path, default=DEFAULT_FACE_MODEL_PATH)
     parser.add_argument("--open", action="store_true", help="open the browser on startup")
     args = parser.parse_args()
+    host = "127.0.0.1" if args.host.lower() == "localhost" else args.host
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        if not args.allow_lan:
+            parser.error("Um endereço fora do loopback exige --allow-lan.")
+        print(
+            "Aviso. A câmera e os comandos de gravação ficarão acessíveis sem autenticação "
+            "a quem puder se conectar. Use uma rede de confiança.",
+            file=sys.stderr,
+        )
 
     config = WebConfig(
         camera=CameraConfig(args.camera, args.width, args.height),
         preview_width=args.preview_width,
         jpeg_quality=args.quality,
         model_path=args.model,
+        model_schema=args.model_schema,
+        dataset_path=args.dataset,
         face_enabled=args.face,
         face_model_path=args.face_model,
     )
@@ -90,14 +125,15 @@ def main() -> int:
             # going with pose/gestures/ML/web fully working.
             print(f"WARN: face model unavailable, Sprint 11 signals stay off: {exc}")
 
-    url = f"http://{args.host}:{args.port}"
+    url_host = f"[{host}]" if ":" in host else host
+    url = f"http://{url_host}:{args.port}"
     print(f"Motion Lab web app on {url} — the camera starts when a page connects.")
     print("Ctrl+C to stop. No video is written to disk.")
     if args.open:
         webbrowser.open(url)
 
     try:
-        uvicorn.run(create_app(config), host=args.host, port=args.port, log_level="warning")
+        uvicorn.run(create_app(config), host=host, port=args.port, log_level="warning")
     except KeyboardInterrupt:
         pass
     return 0

@@ -28,7 +28,7 @@ from backend.features.face_features import FaceSignals
 from backend.features.face_motion import FaceMotionState
 from backend.features.features import FEATURE_NAMES, FrameFeatures
 from backend.features.velocity import MotionState, Trail
-from backend.dataset.writer import DEFAULT_LABELS
+from backend.dataset.writer import DEFAULT_LABELS, V2_LABELS
 from backend.gestures.engine import GestureEvent
 from backend.vision.face_landmarks import (
     FACE_CHAIN_GROUPS,
@@ -75,11 +75,17 @@ def encode_preview(image: np.ndarray, width: int = 640, quality: int = 70) -> di
     source_h, source_w = image.shape[:2]
     if width > 0 and source_w > width:
         height = max(1, int(round(source_h * width / source_w)))
-        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+        try:
+            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+        except cv2.error as exc:
+            raise PreviewError("Não foi possível redimensionar a imagem da câmera.") from exc
 
-    ok, buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    try:
+        ok, buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    except cv2.error as exc:
+        raise PreviewError("Não foi possível gerar a imagem da câmera em JPEG.") from exc
     if not ok:
-        raise PreviewError("OpenCV could not encode the frame as JPEG.")
+        raise PreviewError("Não foi possível gerar a imagem da câmera em JPEG.")
 
     return {
         "format": "jpeg",
@@ -265,6 +271,8 @@ def frame_message(
     gestures: Optional[list[GestureEvent]] = None,
     ml: Optional[tuple[str, dict[str, float]]] = None,
     face: Optional[dict[str, Any]] = None,
+    rule_label: Optional[str] = None,
+    timings: Optional[Mapping[str, Optional[float]]] = None,
 ) -> dict[str, Any]:
     """One `type: "frame"` message: pixels, joints and numbers from the same frame.
 
@@ -272,12 +280,25 @@ def frame_message(
     bytes, but it would let the skeleton drift a frame or two away from the
     picture it is supposed to be drawn on.
     """
+    timing_values = timings or {}
     return {
         "type": "frame",
         "frame_index": snapshot.frame_index,
         "timestamp": _round(snapshot.timestamp, 3),
         "fps": _round(fps, 1),
         "inference_ms": _round(snapshot.inference_ms, 1),
+        "rule_label": rule_label,
+        "timings": {
+            name: _round(timing_values.get(name), 1)
+            for name in (
+                "capture_ms", "pose_ms", "features_ms", "ml_ms", "face_ms", "total_ms"
+            )
+        },
+        "health": {
+            "fps": _round(fps, 1),
+            "dropped_frames": 0,
+            "dropped_rate": 0.0,
+        },
         "detected": snapshot.detected,
         "confidence": _round(snapshot.confidence(), 3),
         "image": preview,
@@ -306,16 +327,26 @@ def hello_message(
     still_threshold: float = 0.35,
     preview_width: int = 640,
     jpeg_quality: int = 70,
+    model_schema: int = 1,
+    record_labels: Optional[list[str] | tuple[str, ...]] = None,
     ml_classes: Optional[list[str]] = None,
     face_enabled: bool = False,
+    report_available: bool = False,
 ) -> dict[str, Any]:
     """First message on every connection: everything the client needs to draw.
 
     Sent up front so the frontend keeps no copy of the landmark table, the bone
     topology or the thresholds — change them in Python and the browser follows.
     """
+    if model_schema not in (1, 2):
+        raise ValueError("model_schema must be 1 or 2")
+    labels = record_labels
+    if labels is None:
+        labels = V2_LABELS if model_schema == 2 else DEFAULT_LABELS
+
     return {
         "type": "hello",
+        "model_schema": model_schema,
         "arm_landmarks": [int(lm) for lm in ARM_LANDMARKS],
         "landmark_names": {str(int(lm)): lm.name for lm in ARM_LANDMARKS},
         "chains": [[int(a), int(b)] for a, b in ARM_CHAINS],
@@ -323,7 +354,7 @@ def hello_message(
         "gesture_names": list(GESTURE_NAMES),
         # One source of truth for browser recording controls; keeping the
         # vocabulary here prevents a frontend copy from drifting from the CSV.
-        "record_labels": list(DEFAULT_LABELS),
+        "record_labels": list(labels),
         # Empty when no model is trained yet -- the client's cue to show
         # "sem modelo treinado" instead of waiting for an "ml" field that
         # will never arrive non-null.
@@ -334,6 +365,9 @@ def hello_message(
         # Static config, known before the first frame -- lets the client show
         # the face toggle (or not) without waiting on a `frame.face` reason.
         "face_enabled": face_enabled,
+        # Snapshot only: report creation is an explicit offline action, never
+        # work performed as part of the WebSocket handshake.
+        "report_available": report_available,
         # Face overlay topology (Sprint 11) -- static domain knowledge, sent
         # unconditionally on `face_enabled` for the same reason `chains`/
         # `arm_landmarks` are sent unconditionally on the pose model existing:
@@ -378,21 +412,14 @@ def record_status_message(
 
 
 def error_message(message: str, *, fatal: bool = True) -> dict[str, Any]:
-    """A failure the user has to see — camera denied, model missing, device gone.
-
-    The browser shows this instead of holding a frozen last frame: a live view
-    that silently stops looks exactly like a person standing very still.
-    """
+    """Send a user-facing failure; only fatal failures end the stream."""
     return {"type": "error", "message": message, "fatal": fatal}
 
 
 def status_message(state: str, message: str = "") -> dict[str, Any]:
     """A non-fatal lifecycle notice — the socket stays open, frames may resume.
 
-    Distinct from `error_message` on purpose: an `error` in this wire format
-    always means "the browser should show a stopped state" (see `app.js`).
-    A transient camera drop that `PipelineRunner` is actively retrying is not
-    that — the client should say "reconectando…", not "parado", and keep
-    listening on the same connection for the frames that resume it.
+    The recovering state lets the browser indicate it is reconnecting while
+    listening for frames to resume on the same connection.
     """
     return {"type": "status", "state": state, "message": message}

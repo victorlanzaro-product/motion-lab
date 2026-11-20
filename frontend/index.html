@@ -18,6 +18,13 @@
       </div>
 
       <div class="app-meta">
+        <a
+          class="report-link"
+          id="report-link"
+          href="/report"
+          target="_blank"
+          rel="noopener noreferrer"
+        >Relatório</a>
         <p class="privacy-pill" title="Os pixels ficam somente na memória">
           <span aria-hidden="true">●</span> processamento local
         </p>
@@ -59,7 +66,7 @@
           <p class="hint hidden" id="hint">Entre no enquadramento para detectar o corpo</p>
           <p class="toast hidden" id="toast" aria-live="assertive"></p>
 
-          <div class="recording-banner hidden" id="recording-banner" role="status" aria-live="assertive">
+          <div class="recording-banner hidden" id="recording-banner" hidden role="status" aria-live="assertive">
             <span class="recording-dot" aria-hidden="true"></span>
             <span class="recording-title">GRAVANDO</span>
             <span class="recording-detail" id="recording-banner-detail"></span>
@@ -230,6 +237,25 @@
                 </dl>
               </section>
             </section>
+
+            <section class="live-section" id="dataset-coverage-panel" aria-label="Cobertura do dataset de treino">
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">Dataset</p>
+                  <h2>Cobertura</h2>
+                </div>
+                <span class="badge coverage-badge" id="coverage-status-badge">carregando</span>
+              </div>
+              <p class="coverage-fetch-warning hidden" id="coverage-fetch-warning" role="status"></p>
+              <p class="coverage-summary" id="coverage-summary">Consultando estatísticas…</p>
+              <p class="coverage-path hidden" id="coverage-path"></p>
+              <ul class="coverage-problems hidden" id="coverage-problems" aria-label="Problemas de cobertura"></ul>
+              <div class="coverage-label-grid" id="coverage-label-grid" role="list" aria-label="Sessões por rótulo"></div>
+              <dl class="summary-row coverage-dropped hidden" id="coverage-dropped">
+                <dt>linhas descartadas</dt>
+                <dd id="coverage-dropped-detail">—</dd>
+              </dl>
+            </section>
           </section>
 
           <section
@@ -306,6 +332,31 @@
               <p>Ative os dados faciais para acompanhar os sinais no tempo.</p>
             </section>
 
+            <div class="chart-block" id="ml-confidence-timeline-block">
+              <div class="chart-heading">
+                <span>Confiança do ML · concordância regra</span>
+                <span class="chart-value" id="ml-agreement-rate">—</span>
+              </div>
+              <p class="timeline-legend" aria-hidden="true">
+                <span class="timeline-swatch agree">concorda</span>
+                <span class="timeline-swatch disagree">discorda</span>
+                <span class="timeline-swatch unknown">sem ML/regra</span>
+              </p>
+              <div class="chart-frame">
+                <span class="axis-label axis-top">1.0</span>
+                <span class="axis-label axis-bottom">0</span>
+                <canvas
+                  id="ml-confidence-chart"
+                  class="chart timeline-chart"
+                  width="520"
+                  height="132"
+                  role="img"
+                  aria-label="Confiança do ML nos últimos 30 segundos com faixa de concordância"
+                ></canvas>
+              </div>
+              <p class="chart-caption">−30s <span>agora · prob. do rótulo top · faixa por frame</span></p>
+            </div>
+
             <details class="explanation">
               <summary>Como interpretar estes sinais?</summary>
               <p>
@@ -338,6 +389,46 @@
                 <dt>inferência de pose</dt><dd><span id="inference">—</span> ms</dd>
                 <dt>confiança da pose</dt><dd id="confidence">—</dd>
                 <dt>frame</dt><dd id="frame-index">—</dd>
+              </dl>
+            </section>
+
+            <section class="diagnostic-card" id="pipeline-health-panel" aria-label="Saúde do pipeline">
+              <h3>Saúde do pipeline</h3>
+              <dl class="summary-row health-summary">
+                <dt>fps</dt><dd id="health-fps">—</dd>
+                <dt>frames descartados</dt><dd id="health-dropped-frames">—</dd>
+                <dt class="health-dropped-label">taxa de descarte</dt>
+                <dd id="health-dropped-rate">—</dd>
+              </dl>
+              <div class="timing-bars" id="health-timing-bars" aria-label="Latência por estágio">
+                <div class="timing-row" data-stage="capture_ms">
+                  <span class="timing-label">captura</span>
+                  <div class="timing-bar" aria-hidden="true"><span id="timing-bar-capture"></span></div>
+                  <span class="timing-value" id="timing-capture">—</span>
+                </div>
+                <div class="timing-row" data-stage="pose_ms">
+                  <span class="timing-label">pose</span>
+                  <div class="timing-bar" aria-hidden="true"><span id="timing-bar-pose"></span></div>
+                  <span class="timing-value" id="timing-pose">—</span>
+                </div>
+                <div class="timing-row" data-stage="features_ms">
+                  <span class="timing-label">features</span>
+                  <div class="timing-bar" aria-hidden="true"><span id="timing-bar-features"></span></div>
+                  <span class="timing-value" id="timing-features">—</span>
+                </div>
+                <div class="timing-row" data-stage="ml_ms">
+                  <span class="timing-label">ML</span>
+                  <div class="timing-bar" aria-hidden="true"><span id="timing-bar-ml"></span></div>
+                  <span class="timing-value" id="timing-ml">—</span>
+                </div>
+                <div class="timing-row" data-stage="face_ms">
+                  <span class="timing-label">rosto</span>
+                  <div class="timing-bar" aria-hidden="true"><span id="timing-bar-face"></span></div>
+                  <span class="timing-value" id="timing-face">—</span>
+                </div>
+              </div>
+              <dl class="summary-row">
+                <dt>latência total</dt><dd id="health-total-ms">—</dd>
               </dl>
             </section>
 
@@ -392,8 +483,12 @@
 
     <script src="/static/face-history.js"></script>
     <script src="/static/face-overlay.js"></script>
+    <script src="/static/confidence-timeline.js"></script>
+    <script src="/static/health-panel.js"></script>
     <script src="/static/studio-controls.js"></script>
     <script src="/static/recorder.js"></script>
+    <script src="/static/dataset-coverage.js"></script>
+    <script src="/static/protocol-hardening.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

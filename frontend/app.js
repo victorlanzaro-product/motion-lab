@@ -72,7 +72,13 @@ const state = {
   smoothedFaceLandmarks: null,
   activeTab: "now",
   lastFace: null,
+  reportAvailable: false,
+  coverageView: null,
+  coverageFetchWarning: null,
+  recordLabels: [],
 };
+
+const degradationTracker = ProtocolHardening.createDegradationTracker();
 
 const el = (id) => document.getElementById(id);
 const canvas = el("view");
@@ -87,6 +93,9 @@ function connect() {
 
   socket.onopen = () => {
     state.retries = 0;
+    degradationTracker.clear();
+    clearDegradationBanner();
+    confidenceTimeline.clear();
     // Not "ao vivo" yet: opening the webcam and loading the pose model takes a
     // few seconds on the first connection, and a green dot over a black canvas
     // reads as a broken app.
@@ -116,27 +125,45 @@ function connect() {
 function handle(message) {
   if (message.type === "hello") {
     state.config = message;
+    applyReportAvailable(message.report_available);
     applyFaceEnabled(message.face_enabled);
     setPresenceChip(
       "face",
       message.face_enabled ? "pending" : "off",
       message.face_enabled ? "procurando rosto" : "rosto desligado",
     );
-    if (Array.isArray(message.record_labels)) {
-      recorder.setLabels(message.record_labels);
-      buildRecorderButtons(message.record_labels);
-    }
+    applyRecordLabelsFromHello(message);
     renderRecorder();
     return;
   }
   if (message.type === "record_status") {
     recorder.applyStatus(message);
     renderRecorder();
+    if (
+      ProtocolHardening.isRecorderRejection(message) &&
+      ProtocolHardening.shouldToastRecorderRejection(isRecorderErrorPanelVisible())
+    ) {
+      flashToast(message.error);
+    }
+    if (!message.recording && message.session_id != null) {
+      fetchDatasetStats();
+    }
     return;
   }
   if (message.type === "error") {
-    setStatus("error", "parado");
-    show("banner", message.message);
+    if (ProtocolHardening.isFatalPipelineError(message)) {
+      degradationTracker.clear();
+      setStatus("error", "parado");
+      show("banner", message.message || "Pipeline interrompido.");
+      clearBannerDegradationClass();
+      return;
+    }
+    const { note } = degradationTracker.absorbError(message);
+    showDegradationBanner(
+      note || "Serviço parcialmente indisponível; o ao vivo continua.",
+    );
+    if (state.streaming) setStatus("live", "ao vivo (com aviso)");
+    else setStatus("off", "com aviso");
     return;
   }
   if (message.type === "status") {
@@ -150,7 +177,9 @@ function handle(message) {
     return;
   }
   if (message.type === "frame") {
-    hide("banner");
+    if (!degradationTracker.currentNote()) {
+      clearDegradationBanner();
+    }
     if (!state.streaming) {
       state.streaming = true;
       setStatus("live", "ao vivo");
@@ -163,6 +192,7 @@ function handle(message) {
     // the newest one, but the history still needs every message's timestamp
     // to keep the ~10s window accurate.
     recordFaceHistory(message);
+    recordConfidenceTimeline(message);
     state.pending = message;
     render();
   }
@@ -398,6 +428,130 @@ function fmt(value, digits = 2) {
   return value === null || value === undefined ? "—" : value.toFixed(digits);
 }
 
+// --- Sprint 15 dashboard ------------------------------------------------
+//
+// One global timeline (single camera / pipeline). The browser only stores and
+// draws what the frame payload already decided -- no feature recompute.
+
+const confidenceTimeline = ConfidenceTimeline.createTimeline();
+
+const TIMING_VALUE_IDS = {
+  capture_ms: "timing-capture",
+  pose_ms: "timing-pose",
+  features_ms: "timing-features",
+  ml_ms: "timing-ml",
+  face_ms: "timing-face",
+};
+
+const TIMING_BAR_IDS = {
+  capture_ms: "timing-bar-capture",
+  pose_ms: "timing-bar-pose",
+  features_ms: "timing-bar-features",
+  ml_ms: "timing-bar-ml",
+  face_ms: "timing-bar-face",
+};
+
+const AGREEMENT_COLORS = {
+  agree: COLORS.accent,
+  disagree: "#ff747b",
+  unknown: "rgba(141, 155, 173, 0.35)",
+};
+
+function applyReportAvailable(available) {
+  state.reportAvailable = Boolean(available);
+  const link = el("report-link");
+  if (!link) return;
+  // Maestro S15: the link always opens /report; 404 carries the short message.
+  // `report_available` only drives the hint, never disables navigation.
+  link.classList.toggle("pending", !state.reportAvailable);
+  link.title = state.reportAvailable
+    ? "Abre o último relatório HTML gerado no servidor"
+    : "Relatório ainda não gerado — rode scripts/report.py";
+}
+
+function recordConfidenceTimeline(message) {
+  confidenceTimeline.push(message);
+}
+
+function updateHealthPanel(message) {
+  const view = HealthPanel.snapshot(message);
+  el("health-fps").textContent = view.fpsDisplay;
+  if (view.dropped_frames === null || view.dropped_frames === undefined) {
+    el("health-dropped-frames").textContent = "—";
+  } else {
+    el("health-dropped-frames").textContent = String(view.dropped_frames);
+  }
+  const rateNode = el("health-dropped-rate");
+  rateNode.textContent = view.droppedRateDisplay;
+  rateNode.classList.toggle("alert", view.droppedRateAlert);
+  const rateLabel = el("pipeline-health-panel")?.querySelector(".health-dropped-label");
+  if (rateLabel) rateLabel.classList.toggle("alert", view.droppedRateAlert);
+  el("health-total-ms").textContent =
+    view.totalDisplay === "—" ? view.totalDisplay : `${view.totalDisplay} ms`;
+  for (const stage of view.stages) {
+    const valueId = TIMING_VALUE_IDS[stage.key];
+    const barId = TIMING_BAR_IDS[stage.key];
+    if (valueId) {
+      el(valueId).textContent = stage.display === "—" ? "—" : `${stage.display} ms`;
+    }
+    if (barId) el(barId).style.width = `${Math.round(stage.barFraction * 100)}%`;
+  }
+}
+
+const mlConfidenceCanvas = el("ml-confidence-chart");
+const mlConfidenceCtx = mlConfidenceCanvas ? mlConfidenceCanvas.getContext("2d") : null;
+
+function renderConfidenceTimeline() {
+  const rateNode = el("ml-agreement-rate");
+  if (!mlConfidenceCanvas || !mlConfidenceCtx) return;
+  if (state.activeTab !== "history") return;
+
+  clearChartCanvas(mlConfidenceCanvas, mlConfidenceCtx);
+  drawChartGrid(mlConfidenceCanvas, mlConfidenceCtx);
+
+  const now = confidenceTimeline.now();
+  if (now === null) {
+    if (rateNode) rateNode.textContent = "—";
+    return;
+  }
+
+  const points = confidenceTimeline.series(now);
+  const bandHeight = 10;
+  const padTop = 6;
+  const plotHeight = mlConfidenceCanvas.height - bandHeight - padTop - 4;
+  const width = mlConfidenceCanvas.width;
+  const slice =
+    points.length > 1 ? Math.max(1, Math.ceil(width / Math.max(points.length - 1, 1))) : 1;
+
+  for (const point of points) {
+    const x = Math.round(point.x * (width - 1));
+    let color = AGREEMENT_COLORS.unknown;
+    if (point.agreement === true) color = AGREEMENT_COLORS.agree;
+    else if (point.agreement === false) color = AGREEMENT_COLORS.disagree;
+    mlConfidenceCtx.fillStyle = color;
+    mlConfidenceCtx.fillRect(x, mlConfidenceCanvas.height - bandHeight - 2, slice, bandHeight);
+  }
+
+  mlConfidenceCtx.strokeStyle = COLORS.bone;
+  mlConfidenceCtx.lineWidth = 1.5;
+  mlConfidenceCtx.lineJoin = "round";
+  for (const run of confidenceTimeline.probabilityRuns(now)) {
+    mlConfidenceCtx.beginPath();
+    run.forEach((point, index) => {
+      const x = point.x * (width - 1);
+      const y = padTop + (1 - point.mlProbability) * plotHeight;
+      if (index === 0) mlConfidenceCtx.moveTo(x, y);
+      else mlConfidenceCtx.lineTo(x, y);
+    });
+    mlConfidenceCtx.stroke();
+  }
+
+  const rate = confidenceTimeline.agreementRate();
+  if (rateNode) {
+    rateNode.textContent = rate === null ? "—" : `${Math.round(rate * 100)}% concorda`;
+  }
+}
+
 function updatePanel(message) {
   state.lastFace = message.face;
   setPresenceChip(
@@ -413,6 +567,8 @@ function updatePanel(message) {
   updateMlPanel(message.ml);
   updateFacePanel(message.face);
   renderFaceCharts(message.face);
+  updateHealthPanel(message);
+  renderConfidenceTimeline();
 
   for (const side of ["left", "right"]) {
     const direction = message.motion[`${side}_direction`] || "unknown";
@@ -759,6 +915,28 @@ function hide(id) {
   el(id).classList.add("hidden");
 }
 
+function clearBannerDegradationClass() {
+  const banner = el("banner");
+  if (banner) banner.classList.remove("degradation");
+}
+
+function clearDegradationBanner() {
+  hide("banner");
+  clearBannerDegradationClass();
+}
+
+function showDegradationBanner(text) {
+  const banner = el("banner");
+  banner.textContent = text;
+  banner.classList.remove("hidden");
+  banner.classList.add("degradation");
+}
+
+function isRecorderErrorPanelVisible() {
+  const box = el("recorder-error");
+  return Boolean(box && !box.classList.contains("hidden") && box.textContent);
+}
+
 function toggle(id, visible) {
   el(id).classList.toggle("hidden", !visible);
 }
@@ -886,7 +1064,10 @@ function activateTab(name, focus = false) {
     if (active && focus) button.focus();
   }
   for (const panel of tabPanels) panel.hidden = panel.dataset.panel !== name;
-  if (name === "history") renderFaceCharts(state.lastFace, true);
+  if (name === "history") {
+    renderFaceCharts(state.lastFace, true);
+    renderConfidenceTimeline();
+  }
 }
 
 tabButtons.forEach((button, index) => {
@@ -989,29 +1170,49 @@ function ensureRecorderCountdownTimer() {
   }, 100);
 }
 
-function buildRecorderButtons(labels) {
+function applyRecordLabelsFromHello(hello) {
+  const labels = Recorder.recordLabelsForHello(hello);
+  state.recordLabels = labels;
+  recorder.setLabels(labels);
+  buildRecorderButtons(labels, hello && hello.model_schema);
+}
+
+function recorderModelSchema() {
+  return state.config && state.config.model_schema;
+}
+
+function buildRecorderButtons(labels, modelSchema) {
   recorderLabels = labels.slice();
   const host = el("recorder-label-buttons");
   host.replaceChildren();
-  labels.forEach((label, index) => {
-    const shortcut = String(index + 1);
+  const schema = modelSchema ?? recorderModelSchema();
+  for (const label of labels) {
+    const shortcut = Recorder.shortcutForLabel(label, labels, schema);
     const human = ML_LABEL[label] || label;
     const button = document.createElement("button");
     button.type = "button";
     button.className = "recorder-label-button";
+    if (label === "wave") button.classList.add("recorder-label-button-wave");
     button.dataset.recordLabel = label;
-    button.dataset.shortcut = shortcut;
+    if (shortcut) button.dataset.shortcut = shortcut;
     button.textContent = human;
-    const key = document.createElement("kbd");
-    key.textContent = shortcut;
-    button.append(key);
+    if (shortcut) {
+      const key = document.createElement("kbd");
+      key.textContent = shortcut;
+      button.append(key);
+    }
     button.addEventListener("click", () => startRecorderLabel(label));
     host.append(button);
-  });
+  }
 }
 
 function startRecorderLabel(label) {
-  if (!recorder.beginStart(label).ok) return;
+  const started = recorder.beginStart(label);
+  if (!started.ok) {
+    const hint = ProtocolHardening.clientRecorderReason(started.reason);
+    if (hint) flashToast(hint);
+    return;
+  }
   ensureRecorderCountdownTimer();
   flushRecorderOutbound();
   renderRecorder();
@@ -1034,7 +1235,7 @@ function renderRecorder() {
   const view = recorder.snapshot();
   const banner = el("recording-banner");
   const bannerDetail = el("recording-banner-detail");
-  toggle("recording-banner", view.showRecordingBanner);
+  ProtocolHardening.setRecordingBannerHidden(banner, view.showRecordingBanner);
   if (view.showRecordingBanner) {
     const human = ML_LABEL[view.status.label] || view.status.label || "—";
     bannerDetail.textContent = view.isRemoteRecording
@@ -1099,20 +1300,135 @@ function renderRecorder() {
 
 el("recorder-stop").addEventListener("click", () => stopRecorder());
 
+// --- Sprint 13 dataset coverage ----------------------------------------
+
+const COVERAGE_FETCH_WARNING =
+  "Não foi possível atualizar a cobertura do dataset. A gravação e o ao vivo seguem normais.";
+
+async function fetchDatasetStats() {
+  try {
+    const response = await fetch("/dataset/stats");
+    if (!response.ok) throw new Error(String(response.status));
+    const stats = await response.json();
+    state.coverageView = DatasetCoverage.buildCoverageView(stats, {
+      labelTitles: ML_LABEL,
+      coverageLabels: state.recordLabels.length ? state.recordLabels : undefined,
+    });
+    state.coverageFetchWarning = null;
+  } catch (_error) {
+    state.coverageFetchWarning = COVERAGE_FETCH_WARNING;
+  }
+  renderDatasetCoverage();
+}
+
+function renderDatasetCoverage() {
+  const warning = el("coverage-fetch-warning");
+  if (state.coverageFetchWarning) {
+    warning.textContent = state.coverageFetchWarning;
+    toggle("coverage-fetch-warning", true);
+  } else {
+    warning.textContent = "";
+    toggle("coverage-fetch-warning", false);
+  }
+
+  const view = state.coverageView;
+  if (!view || !view.valid) {
+    el("coverage-summary").textContent = state.coverageFetchWarning
+      ? "Cobertura desatualizada — última leitura indisponível."
+      : "Consultando estatísticas…";
+    el("coverage-status-badge").textContent = state.coverageFetchWarning ? "indisponível" : "carregando";
+    el("coverage-status-badge").className = "badge coverage-badge";
+    toggle("coverage-path", false);
+    toggle("coverage-problems", false);
+    el("coverage-label-grid").replaceChildren();
+    toggle("coverage-dropped", false);
+    return;
+  }
+
+  const badge = el("coverage-status-badge");
+  badge.textContent = view.statusText;
+  badge.className = `badge coverage-badge coverage-${view.statusKind}`;
+
+  el("coverage-summary").textContent = view.summaryLine;
+
+  const pathNode = el("coverage-path");
+  if (view.path) {
+    pathNode.textContent = `Arquivo: ${view.path}`;
+    toggle("coverage-path", true);
+  } else {
+    pathNode.textContent = "";
+    toggle("coverage-path", false);
+  }
+
+  const problems = el("coverage-problems");
+  problems.replaceChildren();
+  if (view.problems.length) {
+    for (const text of view.problems) {
+      const item = document.createElement("li");
+      item.textContent = text;
+      problems.appendChild(item);
+    }
+    toggle("coverage-problems", true);
+  } else {
+    toggle("coverage-problems", false);
+  }
+
+  const grid = el("coverage-label-grid");
+  grid.replaceChildren();
+  for (const row of view.labels) {
+    const card = document.createElement("article");
+    card.className = "coverage-label-card";
+    if (row.belowMinimum) card.classList.add("coverage-label-below");
+    card.setAttribute("role", "listitem");
+
+    const title = document.createElement("h3");
+    title.className = "coverage-label-name";
+    title.textContent = row.title;
+
+    const meta = document.createElement("dl");
+    meta.className = "coverage-label-meta";
+
+    const sessionsDt = document.createElement("dt");
+    sessionsDt.textContent = "sessões (mín.)";
+    const sessionsDd = document.createElement("dd");
+    sessionsDd.textContent = row.sessionsText;
+
+    const secondsDt = document.createElement("dt");
+    secondsDt.textContent = "segundos no CSV";
+    const secondsDd = document.createElement("dd");
+    secondsDd.textContent = row.secondsText;
+
+    meta.append(sessionsDt, sessionsDd, secondsDt, secondsDd);
+    card.append(title, meta);
+    grid.appendChild(card);
+  }
+
+  const droppedRows = view.dropped;
+  if (droppedRows.length) {
+    el("coverage-dropped-detail").textContent = droppedRows
+      .map((row) => `${row.title}: ${row.count}`)
+      .join(" · ");
+    toggle("coverage-dropped", true);
+  } else {
+    toggle("coverage-dropped", false);
+  }
+}
+
 document.addEventListener("keydown", (event) => {
   if (typingTarget(event.target)) return;
-  const digit = event.key.length === 1 && event.key >= "1" && event.key <= "9"
-    ? Number(event.key)
-    : null;
-  if (digit !== null && digit <= recorderLabels.length) {
-    const view = recorder.snapshot();
-    if (!view.startEnabled) {
-      flashToast("Gravação indisponível agora");
+  const digit = event.key.length === 1 && event.key >= "1" && event.key <= "9" ? event.key : null;
+  if (digit !== null) {
+    const labelIndex = Recorder.labelIndexForDigit(digit, recorderLabels, recorderModelSchema());
+    if (labelIndex >= 0 && labelIndex < recorderLabels.length) {
+      const view = recorder.snapshot();
+      if (!view.startEnabled) {
+        flashToast("Gravação indisponível agora");
+        return;
+      }
+      event.preventDefault();
+      startRecorderLabel(recorderLabels[labelIndex]);
       return;
     }
-    event.preventDefault();
-    startRecorderLabel(recorderLabels[digit - 1]);
-    return;
   }
   if (event.key === " " || event.code === "Space") {
     const view = recorder.snapshot();
@@ -1130,3 +1446,4 @@ document.addEventListener("keydown", (event) => {
 });
 
 connect();
+fetchDatasetStats();

@@ -21,6 +21,10 @@ armazenado — apenas landmarks temporários, dados de treino e o modelo treinad
 | 10 | Motion Lab (métricas, explicabilidade) | ✅ pronto |
 | 11 | Reações Faciais (sinais observáveis, opt-in) | ✅ pronto |
 | 12 | Recorder (gravação de dataset pelo navegador) | ✅ pronto (checkpoint com câmera pendente) |
+| 13 | Cobertura do dataset e validação por sessão | Em validação com dataset real pendente |
+| 14 | ML temporal v2, gravação de wave e inferência ao vivo | Implementado; gravações reais de wave e LOSO pendentes |
+| 15 | Dashboard ao vivo | ✅ pronto (checkpoint com câmera pendente) |
+| 16 | Hardening do protocolo e avaliação v1 × v2 × regra | Implementado; gates sem câmera verdes; revisão de segurança aprovada; sessões reais pendentes |
 
 ## Setup
 
@@ -150,6 +154,113 @@ Regra de acoplamento: cada camada recebe o **dado** da anterior, nunca o handle 
 `CameraEngine` entrega `Frame`, não um `cv2.VideoCapture` — por isso trocar webcam por
 arquivo de vídeo não toca em nada do lado da visão.
 
+### Decisões do Sprint 13 — Cobertura e validação por sessão
+
+- O Recorder e `GET /dataset/stats` usam o mesmo `WebConfig.dataset_path`.
+  O endpoint lê o CSV fora do event loop e o painel exibe a cobertura
+  recebida, atualizando após o fim de uma sessão.
+- A CLI, o endpoint e o relatório compartilham o cálculo da cobertura.
+  Rótulos desconhecidos contam em `dropped.unknown_label`, impedem
+  `ready=true` e continuam sendo recusados pelo treino.
+- As dobras preservam sessões inteiras. O relatório mostra as dobras
+  usadas e descartadas, a média e o desvio de macro-F1 e a matriz do
+  split de diagnóstico.
+- O aceite usa `uv run python scripts/train_model.py --cv loso`, com uma
+  sessão por dobra. A métrica principal reúne as predições fora da amostra
+  antes de calcular o macro-F1 dos quatro rótulos. O split de diagnóstico
+  reserva ao menos uma sessão de cada rótulo de cada lado quando cada
+  gravação tem um único rótulo.
+- O resultado em dado real será preenchido após as 12 gravações do
+  [roteiro da S13](docs/sprints/13-roteiro-gravacao.md).
+
+### Decisões do Sprint 14 — ML temporal e gravação de wave
+
+- O schema v1 mantém treino e inferência por frame e segue como padrão;
+  bundles sem `schema_version` continuam sendo interpretados como v1.
+- O schema v2 usa Random Forest com features estáticas do último frame e
+  14 features temporais reconstruídas por sessão a partir do CSV. O bundle
+  registra `schema_version`, `window_seconds`, `max_gap`, `min_samples` e
+  `deadband` usados no treino.
+- `wave` só é aceito no modo v2. `DEFAULT_LABELS` e `REMOVED_LABELS` do
+  `DatasetWriter` permanecem inalterados; rótulos permitidos dependem do
+  schema selecionado no servidor.
+- v1 e v2 usam validação agrupada por sessão e reportam macro-F1 médio e
+  desvio. A comparação lado a lado identifica dados sintéticos como teste
+  de plumbing, não evidência de qualidade real.
+- A inferência v2 ao vivo seleciona o bundle por `hello.model_schema`, usa
+  os quatro parâmetros temporais armazenados no bundle e aguarda uma janela
+  completa dos dois braços. Perda de pose, lacuna inválida ou nova sessão
+  limpa o histórico; não há predição durante o aquecimento.
+- **Pendência humana:** gravar sessões reais de `wave` e completar a
+  avaliação LOSO em sessões fora do treino antes de decidir a qualidade do
+  modelo temporal.
+
+### Decisões do Sprint 15: o dashboard só desenha o frame, nunca refaz o pipeline no navegador
+
+Contrato em `docs/sprints/15-dashboard.md`. Cada mensagem `frame` traz
+`rule_label`, `timings` e `health`; `hello` traz `report_available`; o
+relatório do Sprint 10 sai por `GET /report`. O Recorder do Sprint 12 não
+muda de contrato — gravação e coalescência de frames continuam como antes.
+
+Backend (`backend/ml/rule_label.py`, `backend/web/pipeline.py`, `app.py`):
+
+1. **`rule_label` é uma função compartilhada, não uma cópia no relatório.** Vive em
+   `backend/ml/rule_label.py`; a ordem estática (cruzado → aberto → levantado →
+   `idle`) é a mesma do Sprint 10. Valor de feature ausente vira `None`, nunca
+   um `idle` confiante — junta ocluída não é “parado”.
+2. **`timings` mede cada estágio no mesmo frame com `time.perf_counter()`.**
+   Estágio que não rodou (`ml_ms` sem modelo, `face_ms` sem `--face`) vai como
+   `null`, nunca `0`. `total_ms` cobre da leitura da câmera ao payload pronto e
+   nunca fica abaixo da soma dos estágios arredondados.
+3. **`health.dropped_*` é por assinante WebSocket.** O contador da coalescência do
+   Sprint 12 é injetado em `Subscriber.get()`; `dropped_rate` com duas casas; no
+   primeiro frame da conexão tudo zera até haver descartes.
+4. **`GET /report` só lê disco, nunca gera HTML na request.** O caminho segue
+   `<model-stem>.report.html` (ou `WebConfig.report_path`); leitura em
+   `asyncio.to_thread`; 404 com texto curto pedindo `scripts/report.py`.
+5. **`hello.report_available` espelha `pipeline.report_available()`.** O
+   navegador sabe se o arquivo existe sem abrir `/report` em cada frame.
+
+Frontend (`frontend/confidence-timeline.js`, `health-panel.js`, `app.js`):
+
+6. **Uma timeline global por página.** Há uma câmera e um pipeline — o buffer de
+   30 s vive em `app.js`, não por aba; reconectar zera o buffer.
+7. **Linha = confiança do rótulo top do ML; faixa fina = concordância.** A curva
+   usa só `ml.confidence`/`probabilities`; abaixo, três cores (concorda /
+   discorda / sem ML). Lacunas ficam visíveis — `probabilityRuns` não interpola
+   entre amostras.
+8. **Taxa de concordância = igualdade de strings, espelhando o Sprint 10.** Compara
+   `rule_label` do wire com o rótulo do ML; pula frames sem ML e ignora `wave`.
+9. **`HealthPanel` é view-model puro (`null` → "—").** Barras usam fração de
+   `total_ms`; `dropped_rate` > 0,10 ganha classe `alert` — nunca exibe 0 onde o
+   servidor mandou `null`.
+10. **Link “Relatório” sempre navegável.** `report_available` só muda o `title` e
+    a classe `.pending`; 404 no servidor carrega a mensagem curta — o cliente não
+    desabilita o link.
+### Decisões do Sprint 16 — hardening e avaliação local
+
+Contrato em `docs/sprints/16-hardening-avaliacao.md`.
+
+1. O servidor valida `record_start` antes de reservar uma gravação. Erros
+   apresentados à pessoa que opera ficam em português; detalhes técnicos vão
+   apenas para o log local. Falhas degradáveis mantêm o WebSocket ativo.
+2. `scripts/evaluate_live.py --model-v1 ... --model-v2 ...` valida os dois
+   bundles antes de iniciar câmera ou detector de pose e então conduz a captura
+   interativa. `--frames` e `--segments` selecionam o modo offline determinístico.
+3. v1, v2 e regra avaliam os mesmos frames da mesma sessão, usando
+   `LiveEvaluationSession`, `WindowFeatures`, `MotionTracker`, `GestureEngine`
+   e `PipelineRunner._predict`. O roteiro aceita `idle`, `arm_raised`,
+   `arms_open`, `arms_crossed`, `wave`, `wave_left`, `wave_right` e
+   `arm_raised_no_reversal`.
+4. O relatório é JSON agregado por trecho: disponibilidade, pares comparáveis,
+   concordância, confronto com o rótulo esperado e cobertura temporal de `wave`.
+   Aquecimento e transição são contados separadamente. Imagens, vídeo e dados
+   faciais não são persistidos.
+5. **Pendência humana:** Victor fará as sessões reais em câmera nova, avaliará
+   latência e cobertura e decidirá sobre manter ou aposentar `_WaveDetector`.
+   A revisão independente da superfície de segurança S16 também deve aprovar o
+   HEAD integrado antes da abertura do PR.
+
 ### Decisões do Sprint 12: gravar é um comando ao servidor, nunca um arquivo do navegador
 
 Contrato completo em `docs/sprints/12-recorder.md`. O navegador manda
@@ -170,7 +281,12 @@ Backend (`backend/web/recorder.py`):
    `label`, `session_id` e contagens com `owner=false`.
 5. Erro do Recorder nunca derruba pose, gestos, ML, face ou frames; depois de
    um retry da câmera, comandos voltam a ser aceitos.
-6. Cada assinante coalesce frames mas preserva mensagens de controle e finais.
+6. Cada assinante mantém o frame mais recente e até 64 mensagens de controle.
+   Atualizações de contagem e rejeições repetidas podem ser agrupadas.
+   Transições, finais e erros fatais têm prioridade. Se a fila contiver
+   somente mensagens prioritárias, o WebSocket fecha com código 1013 e
+   a reconexão recebe o estado atual. A desconexão do dono encerra só a
+   sessão que estava ativa para aquele assinante.
 
 Frontend (`frontend/recorder.js`, máquina de estados pura):
 
