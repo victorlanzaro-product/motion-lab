@@ -154,21 +154,22 @@ class WebConfig:
 
 
 class Subscriber:
-    """One browser's slot: always the newest message, never a backlog.
+    """One browser's latest frame and bounded queue of control messages.
 
-    `offer` runs on the event loop thread; `offer_threadsafe` hands a message
-    over from the pipeline thread, because `asyncio.Queue` is not thread-safe.
+    Producers update the buffer under a lock and share one pending event-loop
+    wakeup. The bound applies even while the event loop is busy.
     """
 
     MAX_CONTROL_MESSAGES = 64
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
+        self._lock = threading.Lock()
         # Frames may be coalesced to keep latency bounded. Control messages
         # carry state transitions and must remain queued until the client sees
         # them, even if a new frame arrives in the meantime.
         self._latest_frame: Optional[dict[str, Any]] = None
-        self._control: deque[dict[str, Any]] = deque()
+        self._control: deque[dict[str, Any]] = deque(maxlen=self.MAX_CONTROL_MESSAGES)
         # Start/stop state changes are boundaries, not disposable count
         # updates. Keep their identities so queue pressure evicts rejections
         # and replaceable controls first.
@@ -176,35 +177,44 @@ class Subscriber:
         self._last_record_state: Optional[tuple[bool, Optional[str]]] = None
         self._overloaded = False
         self._available = asyncio.Event()
+        self._wakeup_pending = False
         self.dropped = 0
 
     def offer(self, message: dict[str, Any]) -> None:
-        if self._overloaded:
-            return
-        if message.get("type") == "frame":
-            if self._latest_frame is not None:
-                self.dropped += 1
-            self._latest_frame = message
-        else:
-            if self._coalesce_record_status(message):
-                self._available.set()
+        """Buffer a message from either the pipeline thread or the event loop."""
+        with self._lock:
+            if self._overloaded:
                 return
-            transition = self._is_record_transition(message)
-            if message.get("type") == "record_status" and (
-                message.get("error") is None or self._is_final_record_status(message)
-            ):
-                self._last_record_state = (
-                    bool(message.get("recording")), message.get("session_id")
-                )
-            self._append_control(message, preserve=transition)
-        self._available.set()
+            if message.get("type") == "frame":
+                if self._latest_frame is not None:
+                    self.dropped += 1
+                self._latest_frame = message
+            elif not self._coalesce_record_status(message):
+                transition = self._is_record_transition(message)
+                if transition:
+                    self._last_record_state = (
+                        bool(message.get("recording")), message.get("session_id")
+                    )
+                self._append_control(message, preserve=transition)
+
+            if not self._wakeup_pending:
+                try:
+                    self._loop.call_soon_threadsafe(self._wake_reader)
+                except RuntimeError:
+                    return  # The event loop has already closed.
+                self._wakeup_pending = True
+
+    def _wake_reader(self) -> None:
+        with self._lock:
+            self._wakeup_pending = False
+            self._available.set()
 
     def _coalesce_record_status(self, message: dict[str, Any]) -> bool:
         """Replace duplicate rejections/count updates without hiding transitions."""
-        if message.get("type") != "record_status":
+        if message.get("type") != "record_status" or self._is_final_record_status(message):
             return False
 
-        if message.get("error") is not None and not self._is_final_record_status(message):
+        if message.get("error") is not None:
             rejection_key = (
                 message.get("error"),
                 bool(message.get("recording")),
@@ -258,6 +268,11 @@ class Subscriber:
         if len(self._control) >= self.MAX_CONTROL_MESSAGES:
             removable = self._find_removable_control()
             if removable is None:
+                if not (
+                    preserve or self._is_final_record_status(message)
+                    or self._is_fatal_control(message)
+                ):
+                    return
                 # The queue contains only protected transitions/finals/fatal
                 # controls. Silently dropping the new state here would let a
                 # slow socket drain stale statuses and never learn the real
@@ -294,7 +309,7 @@ class Subscriber:
         self._overloaded = True
         self._control.clear()
         self._transition_ids.clear()
-        self._available.set()
+        self._latest_frame = None
 
     @staticmethod
     def _is_fatal_control(message: dict[str, Any]) -> bool:
@@ -308,27 +323,20 @@ class Subscriber:
             and message.get("session_id") is not None
         )
 
-    def offer_threadsafe(self, message: dict[str, Any]) -> None:
-        try:
-            self._loop.call_soon_threadsafe(self.offer, message)
-        except RuntimeError:
-            # The loop is already closed: that client is gone, and its WebSocket
-            # handler unsubscribes on its way out.
-            pass
-
     async def get(self) -> dict[str, Any]:
         while True:
-            if self._overloaded:
-                return {"type": "subscriber_overloaded"}
-            if self._control:
-                message = self._control.popleft()
-                self._transition_ids.discard(id(message))
-                return message
-            if self._latest_frame is not None:
-                message = self._latest_frame
-                self._latest_frame = None
-                return message
-            self._available.clear()
+            with self._lock:
+                if self._overloaded:
+                    return {"type": "subscriber_overloaded"}
+                if self._control:
+                    message = self._control.popleft()
+                    self._transition_ids.discard(id(message))
+                    return message
+                if self._latest_frame is not None:
+                    message = self._latest_frame
+                    self._latest_frame = None
+                    return message
+                self._available.clear()
             await self._available.wait()
 
 
@@ -447,13 +455,10 @@ class PipelineRunner:
             if self.recorder.owner_disconnected(subscriber):
                 self._owner_disconnected_session = self.recorder.status()["session_id"]
 
-    def _clear_owner_disconnect_for(self, event: Optional[dict[str, Any]]) -> None:
+    def _clear_owner_disconnect_for_locked(self, session_id: Optional[str]) -> None:
         """Clear only the disconnect signal belonging to this finished session."""
-        if event is None or event.get("session_id") is None:
-            return
-        with self._lock:
-            if self._owner_disconnected_session == event["session_id"]:
-                self._owner_disconnected_session = None
+        if self._owner_disconnected_session == session_id:
+            self._owner_disconnected_session = None
 
     def _process_owner_disconnect(self) -> None:
         """Finish a disconnected owner's session if its reservation is current."""
@@ -467,8 +472,7 @@ class PipelineRunner:
             self._close_recorder(resume_record_starts=True)
 
         with self._lock:
-            if self._owner_disconnected_session == disconnected_session:
-                self._owner_disconnected_session = None
+            self._clear_owner_disconnect_for_locked(disconnected_session)
 
     def record_start(self, label: str, subscriber: Subscriber) -> dict[str, Any]:
         """Reserve a session only while a worker can consume its command."""
@@ -485,10 +489,13 @@ class PipelineRunner:
             if not self._accept_record_starts or self.state in ("recovering", "failed"):
                 event = self.recorder.status()
                 reason = self.error or "the camera stream is unavailable"
-                event["error"] = (
-                    f"Cannot start recording while the pipeline is not accepting "
-                    f"requests: {reason}"
-                )
+                if event["recording"] and self.state in ("starting", "live"):
+                    event["error"] = "A recording is already active."
+                else:
+                    event["error"] = (
+                        f"Cannot start recording while the pipeline is not accepting "
+                        f"requests: {reason}"
+                    )
                 self._offer_record_status(subscriber, event)
                 return event
 
@@ -538,18 +545,42 @@ class PipelineRunner:
         )
 
     def _offer_record_status(self, subscriber: Subscriber, event: dict[str, Any]) -> None:
-        subscriber.offer_threadsafe(self._record_wire_message(event, subscriber))
+        subscriber.offer(self._record_wire_message(event, subscriber))
 
-    def _publish_record_events(self, event: Optional[dict[str, Any]]) -> None:
-        if event is None:
-            return
+    def _record_and_publish_frame(
+        self, features: FrameFeatures, motion: MotionState
+    ) -> Optional[dict[str, Any]]:
+        """Serialize a frame's Recorder transition with later start requests.
+
+        File I/O stays outside the pipeline lifecycle lock. While an active
+        session is processed, the start gate is closed; its final event is
+        queued before the gate reopens under the same lock that record_start
+        uses. A new reservation therefore cannot overtake the previous
+        session's final status.
+        """
         with self._lock:
-            self._publish_record_event_locked(event)
+            if not self.recorder.status()["recording"]:
+                # No reservation exists yet, so there cannot be a command to
+                # consume. Returning while still under the lifecycle lock
+                # leaves any later start for the next frame, where its gate
+                # can be closed before record_frame reads the queue.
+                return None
+            self._accept_record_starts = False
+
+        event = self.recorder.record_frame(features, motion)
+
+        with self._lock:
+            if event is not None:
+                self._publish_record_event_locked(event)
+                self._clear_owner_disconnect_for_locked(event["session_id"])
+            if self.state == "live" and not self._stop.is_set():
+                self._accept_record_starts = True
+        return event
 
     def _publish_record_event_locked(self, event: dict[str, Any]) -> None:
         """Queue one shared status while the subscriber set is stable."""
         for subscriber in self._subscribers:
-            subscriber.offer_threadsafe(self._record_wire_message(event, subscriber))
+            self._offer_record_status(subscriber, event)
 
     def _publish_record_counts_if_due(self) -> None:
         snapshot = self.recorder.status_if_due()
@@ -561,7 +592,7 @@ class PipelineRunner:
         with self._lock:
             subscribers = list(self._subscribers)
         for subscriber in subscribers:
-            subscriber.offer_threadsafe(self._record_wire_message(snapshot, subscriber))
+            self._offer_record_status(subscriber, snapshot)
 
     def _close_recorder(
         self, error: Optional[str] = None, *, resume_record_starts: bool = False
@@ -575,6 +606,7 @@ class PipelineRunner:
         with self._lock:
             if event is not None:
                 self._publish_record_event_locked(event)
+                self._clear_owner_disconnect_for_locked(event["session_id"])
             if resume_record_starts and self.state == "live" and not self._stop.is_set():
                 self._accept_record_starts = True
 
@@ -620,7 +652,7 @@ class PipelineRunner:
         with self._lock:
             subscribers = list(self._subscribers)
         for subscriber in subscribers:
-            subscriber.offer_threadsafe(message)
+            subscriber.offer(message)
 
     def _disable_face(self, detector: Optional[FaceDetector], exc: Exception) -> str:
         """Contain every optional-face lifecycle failure at its boundary.
@@ -857,9 +889,7 @@ class PipelineRunner:
 
                 # The CSV writer runs here, on the pipeline thread, with the
                 # exact feature and motion objects derived from this frame.
-                record_event = self.recorder.record_frame(features, motion)
-                self._publish_record_events(record_event)
-                self._clear_owner_disconnect_for(record_event)
+                self._record_and_publish_frame(features, motion)
                 self._publish_record_counts_if_due()
 
                 self._broadcast(
