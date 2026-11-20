@@ -22,6 +22,7 @@ armazenado — apenas landmarks temporários, dados de treino e o modelo treinad
 | 11 | Reações Faciais (sinais observáveis, opt-in) | ✅ pronto |
 | 12 | Recorder (gravação de dataset pelo navegador) | ✅ pronto (checkpoint com câmera pendente) |
 | 13 | Cobertura do dataset e validação por sessão | Em validação com dataset real pendente |
+| 14 | ML temporal v2, gravação de wave e inferência ao vivo | Implementado; gravações reais de wave e LOSO pendentes |
 
 ## Setup
 
@@ -169,6 +170,28 @@ arquivo de vídeo não toca em nada do lado da visão.
   gravação tem um único rótulo.
 - O resultado em dado real será preenchido após as 12 gravações do
   [roteiro da S13](docs/sprints/13-roteiro-gravacao.md).
+
+### Decisões do Sprint 14 — ML temporal e gravação de wave
+
+- O schema v1 mantém treino e inferência por frame e segue como padrão;
+  bundles sem `schema_version` continuam sendo interpretados como v1.
+- O schema v2 usa Random Forest com features estáticas do último frame e
+  14 features temporais reconstruídas por sessão a partir do CSV. O bundle
+  registra `schema_version`, `window_seconds`, `max_gap`, `min_samples` e
+  `deadband` usados no treino.
+- `wave` só é aceito no modo v2. `DEFAULT_LABELS` e `REMOVED_LABELS` do
+  `DatasetWriter` permanecem inalterados; rótulos permitidos dependem do
+  schema selecionado no servidor.
+- v1 e v2 usam validação agrupada por sessão e reportam macro-F1 médio e
+  desvio. A comparação lado a lado identifica dados sintéticos como teste
+  de plumbing, não evidência de qualidade real.
+- A inferência v2 ao vivo seleciona o bundle por `hello.model_schema`, usa
+  os quatro parâmetros temporais armazenados no bundle e aguarda uma janela
+  completa dos dois braços. Perda de pose, lacuna inválida ou nova sessão
+  limpa o histórico; não há predição durante o aquecimento.
+- **Pendência humana:** gravar sessões reais de `wave` e completar a
+  avaliação LOSO em sessões fora do treino antes de decidir a qualidade do
+  modelo temporal.
 
 ### Decisões do Sprint 12: gravar é um comando ao servidor, nunca um arquivo do navegador
 
