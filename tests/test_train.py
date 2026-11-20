@@ -15,6 +15,7 @@ from backend.features import ArmMotion, Direction, FEATURE_NAMES, FrameFeatures,
 from backend.ml import (
     MIN_SAMPLES_PER_CLASS,
     TRAINING_COLUMNS,
+    Dataset,
     DatasetError,
     ModelError,
     load_dataset,
@@ -22,6 +23,7 @@ from backend.ml import (
     predict,
     train,
 )
+from backend.ml.train import _grouped_cv, classify_dataset_row
 
 #: Trivially separable prototypes, one per label, jittered per sample so the
 #: Forest sees variation instead of N copies of the same row.
@@ -413,6 +415,101 @@ def test_load_dataset_rejects_a_row_with_an_unknown_label(tmp_path):
 
     with pytest.raises(DatasetError, match="not one of the current trainable classes"):
         load_dataset(path)
+
+
+def test_shared_row_classifier_reports_loader_reasons_for_stats():
+    valid = {"label": "idle", **{name: "0" for name in TRAINING_COLUMNS}}
+    reason, vector = classify_dataset_row(valid)
+    assert reason is None
+    assert vector == [0.0] * len(TRAINING_COLUMNS)
+
+    missing_label, _ = classify_dataset_row({**valid, "label": "  "})
+    unknown_label, _ = classify_dataset_row({**valid, "label": "sitting"})
+    missing_feature, _ = classify_dataset_row({**valid, TRAINING_COLUMNS[0]: ""})
+    non_finite, _ = classify_dataset_row({**valid, TRAINING_COLUMNS[0]: "nan"})
+
+    assert (missing_label, unknown_label, missing_feature, non_finite) == (
+        "missing_label",
+        "unknown_label",
+        "missing_feature",
+        "non_finite",
+    )
+
+
+# --- grouped cross-validation (Sprint 13) --------------------------------
+
+
+def _six_session_cv_dataset() -> Dataset:
+    """Six equal-size groups make GroupKFold's paired first fold explicit."""
+    labels = []
+    groups = []
+    X = []
+    for session_index in range(6):
+        session = f"s{session_index}"
+        # This class only appears in s0 and s5. GroupKFold(5) holds those two
+        # sessions together in its first fold, so exactly one fold is invalid.
+        session_labels = ["arm_raised", "arms_crossed", "idle"] * 3
+        if session in {"s0", "s5"}:
+            session_labels += ["arms_open"] * 11
+        else:
+            session_labels += ["arm_raised"] * 11
+        for row_index, label in enumerate(session_labels):
+            labels.append(label)
+            groups.append(session)
+            X.append([float(session_index), float(row_index)])
+    return Dataset(
+        X=X,
+        y=labels,
+        groups=groups,
+        counts={label: labels.count(label) for label in set(labels)},
+    )
+
+
+def test_grouped_cv_counts_folds_missing_a_training_class():
+    cv = _grouped_cv(_six_session_cv_dataset(), n_estimators=5, random_state=23)
+
+    assert cv["n_splits"] == 5
+    assert cv["folds_used"] == 4
+    assert cv["folds_skipped"] == 1
+    assert len(cv["per_fold"]) == 5
+    assert cv["per_fold"][0]["valid"] is False
+    assert cv["per_fold"][0]["macro_f1"] is None
+    assert "arms_open" in cv["per_fold"][0]["reason"]
+    assert all(fold["valid"] for fold in cv["per_fold"][1:])
+
+
+def test_grouped_cv_fails_when_every_training_fold_is_missing_a_class():
+    dataset = Dataset(
+        X=[[0.0], [1.0]],
+        y=["arm_raised", "arms_open"],
+        groups=["only-raised", "only-open"],
+        counts={"arm_raised": 1, "arms_open": 1},
+    )
+
+    with pytest.raises(DatasetError, match="zero valid folds"):
+        _grouped_cv(dataset, n_estimators=5, random_state=23)
+
+
+def test_training_reports_deterministic_grouped_cv_and_saves_it(tmp_path):
+    dataset_path = build_synthetic_dataset(tmp_path, per_class=40)
+    first = train(
+        dataset_path=dataset_path,
+        model_path=tmp_path / "first.joblib",
+        random_state=19,
+    )
+    second = train(
+        dataset_path=dataset_path,
+        model_path=tmp_path / "second.joblib",
+        random_state=19,
+    )
+
+    assert first.cv == second.cv
+    assert first.cv["n_splits"] == 4
+    assert first.cv["folds_used"] == 4
+    assert first.cv["folds_skipped"] == 0
+    assert len(first.cv["per_fold"]) == 4
+    assert load_model(first.model_path)["cv"] == first.cv
+    assert load_model(first.model_path)["dataset_path"] == str(dataset_path)
 
 
 # --- grouped split retries seeds until every class covers both sides ------

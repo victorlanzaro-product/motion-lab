@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from backend.camera import CameraConfig, CameraEngine  # noqa: E402
 from backend.dataset import DATASET_COLUMNS, DEFAULT_LABELS, DatasetWriter  # noqa: E402
+from backend.dataset.stats import dataset_stats  # noqa: E402
 from backend.features import (  # noqa: E402
     FEATURE_NAMES,
     ArmMotion,
@@ -798,6 +799,19 @@ def test_camera_stays_closed_until_a_client_connects():
             socket.receive_json()
             assert len(captures) == 1
     runner.stop()
+
+
+def test_dataset_stats_route_returns_the_shared_stats_for_its_configured_path(tmp_path):
+    """The endpoint exposes the same on-disk snapshot as the CLI/report code."""
+    dataset_path = tmp_path / "missing.csv"
+
+    with TestClient(create_app(WebConfig(dataset_path=dataset_path))) as client:
+        response = client.get("/dataset/stats")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == dataset_stats(dataset_path)
+    assert response.json()["exists"] is False
 
 
 def test_camera_is_released_after_the_last_client_leaves():
