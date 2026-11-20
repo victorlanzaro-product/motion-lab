@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import csv
 import math
+import random
 import statistics
 import time
 from dataclasses import dataclass, field
@@ -85,7 +86,7 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
 )
-from sklearn.model_selection import GroupKFold, GroupShuffleSplit
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit, LeaveOneGroupOut
 
 from backend.dataset.writer import (
     DATASET_COLUMNS,
@@ -440,7 +441,8 @@ def _grouped_split(
 
 
 def _grouped_cv(
-    dataset: "Dataset", n_estimators: int, random_state: int
+    dataset: "Dataset", n_estimators: int, random_state: int, *,
+    cv_mode: str = "group-kfold", oof_labels: tuple[str, ...] = DEFAULT_LABELS,
 ) -> dict[str, Any]:
     """Measure macro-F1 on deterministic held-out session folds.
 
@@ -450,10 +452,18 @@ def _grouped_cv(
     therefore score zero rather than disappearing from the headline.
     """
     class_labels = sorted(set(dataset.y))
-    n_splits = min(5, len(set(dataset.groups)))
-    splitter = GroupKFold(n_splits=n_splits)
+    if cv_mode == "loso":
+        splitter = LeaveOneGroupOut()
+        n_splits = splitter.get_n_splits(groups=dataset.groups)
+    elif cv_mode == "group-kfold":
+        n_splits = min(5, len(set(dataset.groups)))
+        splitter = GroupKFold(n_splits=n_splits)
+    else:
+        raise DatasetError(f"Unknown cross-validation mode: {cv_mode!r}")
     scores: list[float] = []
     per_fold: list[dict[str, Any]] = []
+    oof_truth: list[str] = []
+    oof_predicted: list[str] = []
 
     for fold_number, (train_idx, test_idx) in enumerate(
         splitter.split(dataset.X, dataset.y, groups=dataset.groups), start=1
@@ -482,10 +492,14 @@ def _grouped_cv(
             [dataset.X[index] for index in train_idx],
             [dataset.y[index] for index in train_idx],
         )
+        truth = [dataset.y[index] for index in test_idx]
         predicted = fold_model.predict([dataset.X[index] for index in test_idx])
+        if cv_mode == "loso":
+            oof_truth.extend(truth)
+            oof_predicted.extend(predicted)
         score = float(
             f1_score(
-                [dataset.y[index] for index in test_idx],
+                truth,
                 predicted,
                 labels=class_labels,
                 average="macro",
@@ -510,7 +524,7 @@ def _grouped_cv(
             "sessions across every label with hello_dataset.py."
         )
 
-    return {
+    result = {
         "n_splits": n_splits,
         "folds_used": len(scores),
         "folds_skipped": n_splits - len(scores),
@@ -518,6 +532,48 @@ def _grouped_cv(
         "macro_f1_std": statistics.pstdev(scores),
         "per_fold": per_fold,
     }
+    if cv_mode == "loso":
+        result["mode"] = "loso"
+        result["macro_f1_oof"] = float(
+            f1_score(
+                oof_truth, oof_predicted, labels=oof_labels, average="macro", zero_division=0
+            )
+        )
+    return result
+
+
+def _loso_diagnostic_split(
+    dataset: "Dataset", test_size: float, random_state: int
+) -> tuple[list[int], list[int]]:
+    """Keep the diagnostic split feasible for single-label Recorder sessions."""
+    labels_by_session: dict[str, set[str]] = {}
+    for label, group in zip(dataset.y, dataset.groups):
+        labels_by_session.setdefault(group, set()).add(label)
+    if any(len(labels) != 1 for labels in labels_by_session.values()):
+        return _grouped_split(dataset, test_size, random_state)
+
+    sessions_by_label: dict[str, list[str]] = {}
+    for session, labels in sorted(labels_by_session.items()):
+        label = next(iter(labels))
+        sessions_by_label.setdefault(label, []).append(session)
+    n_classes = len(sessions_by_label)
+    n_sessions = len(labels_by_session)
+    # Keep at least one session of every class on each side. In the 12-session
+    # recording script, the default 25% would otherwise test only 3 sessions.
+    if not 0 < test_size < 1:
+        raise ValueError("test_size must be between 0 and 1")
+    n_test = min(n_sessions - n_classes, max(n_classes, math.ceil(test_size * n_sessions)))
+    rng = random.Random(random_state)
+    test_sessions: set[str] = set()
+    extra_sessions: list[str] = []
+    for sessions in sessions_by_label.values():
+        rng.shuffle(sessions)
+        test_sessions.add(sessions[0])
+        extra_sessions.extend(sessions[2:])
+    test_sessions.update(rng.sample(extra_sessions, n_test - n_classes))
+    train_idx = [i for i, group in enumerate(dataset.groups) if group not in test_sessions]
+    test_idx = [i for i, group in enumerate(dataset.groups) if group in test_sessions]
+    return train_idx, test_idx
 
 
 @dataclass
@@ -564,6 +620,8 @@ def train(
     max_gap: float = 0.30,
     min_samples: int = 4,
     deadband: float = DEFAULT_WINDOW_DEADBAND,
+    *,
+    cv_mode: str = "group-kfold",
 ) -> TrainingReport:
     """Load, split, fit, evaluate, save. One call, one artifact.
 
@@ -628,8 +686,12 @@ def train(
             "that also covers that label."
         )
 
-    cv = _grouped_cv(dataset, n_estimators=n_estimators, random_state=random_state)
-    train_idx, test_idx = _grouped_split(dataset, test_size, random_state)
+    cv = _grouped_cv(
+        dataset, n_estimators=n_estimators, random_state=random_state, cv_mode=cv_mode,
+        oof_labels=V2_LABELS if schema == 2 else DEFAULT_LABELS,
+    )
+    split = _loso_diagnostic_split if cv_mode == "loso" else _grouped_split
+    train_idx, test_idx = split(dataset, test_size, random_state)
     X_train = [dataset.X[i] for i in train_idx]
     X_test = [dataset.X[i] for i in test_idx]
     y_train = [dataset.y[i] for i in train_idx]
