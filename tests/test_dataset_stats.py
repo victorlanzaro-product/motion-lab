@@ -275,4 +275,3 @@ def test_invalid_timestamp_returns_exists_true_without_raising(tmp_path):
     assert stats["sessions"] == []
     assert any("timestamp inválido" in problem for problem in stats["problems"])
     assert any("Linha 3" in problem for problem in stats["problems"])
-
