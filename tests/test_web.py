@@ -44,6 +44,7 @@ from backend.vision import (  # noqa: E402
     PoseLandmark,
 )
 from backend.web import WebConfig, create_app  # noqa: E402
+from backend.web.app import _write_frames  # noqa: E402
 from backend.web.pipeline import PipelineRunner, Subscriber  # noqa: E402
 
 LEFT_WRIST_X = 0.2  # off-centre on purpose: a mirrored copy would read 0.8
@@ -291,6 +292,78 @@ def test_hello_carries_the_face_overlay_topology_regardless_of_face_enabled():
     for name, pairs in hello["face_chains"].items():
         assert pairs == [[a, b] for a, b in FACE_CHAIN_GROUPS[name]]
     assert isinstance(hello["face_mesh_version"], int) and hello["face_mesh_version"] >= 1
+
+
+def test_failed_initial_record_status_send_unsubscribes_client():
+    """A failed snapshot send must not leave a camera-owning subscriber."""
+    runner, _ = build()
+    app = create_app(runner=runner)
+    websocket_route = next(route for route in app.routes if getattr(route, "path", None) == "/ws")
+
+    class FailingSocket:
+        async def accept(self):
+            pass
+
+        async def send_json(self, message):
+            if message.get("type") == "record_status":
+                raise RuntimeError("initial record status send failed")
+
+    try:
+        with pytest.raises(RuntimeError, match="initial record status send failed"):
+            asyncio.run(websocket_route.endpoint(FailingSocket()))
+
+        assert runner.client_count == 0
+    finally:
+        runner.stop()
+
+
+def test_second_cancellation_during_child_cleanup_still_unsubscribes(monkeypatch):
+    """Cancellation of gather in finally must not skip subscription cleanup."""
+
+    async def scenario():
+        runner, _ = build()
+        app = create_app(runner=runner)
+        websocket_route = next(
+            route for route in app.routes if getattr(route, "path", None) == "/ws"
+        )
+        children_started = asyncio.Event()
+        child_cleanup_started = asyncio.Event()
+        started_count = 0
+
+        async def stalled_child(*_args):
+            nonlocal started_count
+            started_count += 1
+            if started_count == 2:
+                children_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                child_cleanup_started.set()
+                await asyncio.Future()
+
+        monkeypatch.setattr("backend.web.app._write_frames", stalled_child)
+        monkeypatch.setattr("backend.web.app._read_client_messages", stalled_child)
+
+        class Socket:
+            async def accept(self):
+                pass
+
+            async def send_json(self, _message):
+                pass
+
+        task = asyncio.create_task(websocket_route.endpoint(Socket()))
+        try:
+            await asyncio.wait_for(children_started.wait(), timeout=2.0)
+            task.cancel()
+            await asyncio.wait_for(child_cleanup_started.wait(), timeout=2.0)
+            task.cancel()  # interrupts the gather inside stream()'s finally
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert runner.client_count == 0
+        finally:
+            runner.stop()
+
+    asyncio.run(scenario())
 
 
 # --- browser recorder ---------------------------------------------------
@@ -1001,6 +1074,130 @@ def test_a_slow_client_gets_the_newest_frame_not_a_backlog():
     message, dropped = asyncio.run(scenario())
     assert message["frame_index"] == 3
     assert dropped == 2
+
+
+def test_control_flood_is_bounded_and_keeps_recording_transitions():
+    """A rejected-command flood cannot hide the start or final stop status."""
+
+    async def scenario():
+        subscriber = Subscriber(asyncio.get_running_loop())
+        started = {
+            "type": "record_status",
+            "recording": True,
+            "label": "idle",
+            "session_id": "session-1",
+            "written": 0,
+            "skipped": 0,
+            "owner": True,
+            "error": None,
+        }
+        subscriber.offer(started)
+
+        for index in range(Subscriber.MAX_CONTROL_MESSAGES * 4):
+            subscriber.offer(
+                {
+                    **started,
+                    "owner": False,
+                    "error": f"request {index} rejected while recording",
+                }
+            )
+
+        repeated_rejection = {
+            **started,
+            "owner": False,
+            "error": "another recording is already active",
+        }
+        for _ in range(1000):
+            subscriber.offer(repeated_rejection)
+
+        stopped = {
+            "type": "record_status",
+            "recording": False,
+            "label": "idle",
+            "session_id": "session-1",
+            "written": 125,
+            "skipped": 2,
+            "owner": False,
+            "error": "camera disconnected during active recording",
+        }
+        subscriber.offer(stopped)
+        queued = len(subscriber._control)
+        messages = [await subscriber.get() for _ in range(queued)]
+        return queued, messages, started, stopped, repeated_rejection
+
+    queued, messages, started, stopped, repeated_rejection = asyncio.run(scenario())
+
+    assert queued <= Subscriber.MAX_CONTROL_MESSAGES
+    assert messages[0] == started
+    assert messages[-1] == stopped
+    assert messages.count(repeated_rejection) == 1
+
+
+@pytest.mark.parametrize(
+    "overflow_message",
+    [
+        pytest.param(
+            {"type": "error", "message": "camera permanently denied", "fatal": True},
+            id="fatal-error",
+        ),
+        pytest.param(
+            {
+                "type": "record_status",
+                "recording": True,
+                "label": "idle",
+                "session_id": "current-session",
+                "written": 1,
+                "skipped": 0,
+                "owner": True,
+                "error": None,
+            },
+            id="current-recording-state",
+        ),
+    ],
+)
+def test_final_only_control_overflow_closes_socket_for_fresh_snapshot(overflow_message):
+    """A saturated final-only queue cannot leave a client on stale state."""
+
+    async def scenario():
+        subscriber = Subscriber(asyncio.get_running_loop())
+        for index in range(Subscriber.MAX_CONTROL_MESSAGES):
+            subscriber.offer(
+                {
+                    "type": "record_status",
+                    "recording": False,
+                    "label": "idle",
+                    "session_id": f"session-{index}",
+                    "written": index,
+                    "skipped": 0,
+                    "owner": False,
+                    "error": None,
+                }
+            )
+        assert len(subscriber._control) == Subscriber.MAX_CONTROL_MESSAGES
+        assert all(subscriber._is_final_record_status(item) for item in subscriber._control)
+
+        subscriber.offer(overflow_message)
+
+        class Socket:
+            def __init__(self):
+                self.sent = []
+                self.close_args = None
+
+            async def send_json(self, message):
+                self.sent.append(message)
+
+            async def close(self, *, code, reason):
+                self.close_args = (code, reason)
+
+        socket = Socket()
+        await _write_frames(socket, subscriber)
+        return socket
+
+    socket = asyncio.run(scenario())
+    assert socket.sent == []
+    assert socket.close_args is not None
+    assert socket.close_args[0] == 1013
+    assert "fresh state snapshot" in socket.close_args[1]
 
 
 # --- static ------------------------------------------------------------

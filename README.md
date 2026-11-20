@@ -185,7 +185,12 @@ Backend (`backend/web/recorder.py`):
    `label`, `session_id` e contagens com `owner=false`.
 5. Erro do Recorder nunca derruba pose, gestos, ML, face ou frames; depois de
    um retry da câmera, comandos voltam a ser aceitos.
-6. Cada assinante coalesce frames mas preserva mensagens de controle e finais.
+6. Cada assinante mantém o frame mais recente e até 64 mensagens de controle.
+   Atualizações de contagem e rejeições repetidas podem ser agrupadas.
+   Transições, finais e erros fatais têm prioridade. Se a fila contiver
+   somente mensagens prioritárias, o WebSocket fecha com código 1013 e
+   a reconexão recebe o estado atual. A desconexão do dono encerra só a
+   sessão que estava ativa para aquele assinante.
 
 Frontend (`frontend/recorder.js`, máquina de estados pura):
 

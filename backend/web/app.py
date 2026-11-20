@@ -106,13 +106,19 @@ def create_app(
 
         # Subscribing after the hello guarantees the client holds the landmark
         # table and the bone topology before the first frame that needs them.
+        writer = None
+        reader = None
         subscriber = pipeline.subscribe(asyncio.get_running_loop())
-        # Every client receives the current shared recorder state immediately
-        # after hello, including a second tab joining an active session.
-        await websocket.send_json(pipeline.recording_snapshot_for(subscriber))
-        writer = asyncio.create_task(_write_frames(websocket, subscriber))
-        reader = asyncio.create_task(_read_client_messages(websocket, pipeline, subscriber))
         try:
+            # Every client receives the current shared recorder state immediately
+            # after hello, including a second tab joining an active session.
+            # This send belongs inside the cleanup region: if it fails, the
+            # subscription must still be removed so it cannot keep the camera on.
+            await websocket.send_json(pipeline.recording_snapshot_for(subscriber))
+            writer = asyncio.create_task(_write_frames(websocket, subscriber))
+            reader = asyncio.create_task(
+                _read_client_messages(websocket, pipeline, subscriber)
+            )
             done, pending = await asyncio.wait(
                 {writer, reader}, return_when=asyncio.FIRST_COMPLETED
             )
@@ -138,10 +144,17 @@ def create_app(
             # so the cancellation itself is never actually lost.
             pass
         finally:
-            for task in (writer, reader):
-                if not task.done():
-                    task.cancel()
-            pipeline.unsubscribe(subscriber)
+            try:
+                for task in (writer, reader):
+                    if task is not None and not task.done():
+                        task.cancel()
+                tasks = [task for task in (writer, reader) if task is not None]
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                # A second cancellation during task teardown must not leak a
+                # subscriber and keep the shared camera alive.
+                pipeline.unsubscribe(subscriber)
 
     return app
 
@@ -150,6 +163,12 @@ async def _write_frames(websocket: WebSocket, subscriber: Subscriber) -> None:
     """Forward messages until the pipeline reports a fatal error."""
     while True:
         message = await subscriber.get()
+        if message.get("type") == "subscriber_overloaded":
+            await websocket.close(
+                code=1013,
+                reason="Control queue overloaded; reconnect for a fresh state snapshot.",
+            )
+            return
         await websocket.send_json(message)
         if message.get("type") == "error" and message.get("fatal"):
             return
