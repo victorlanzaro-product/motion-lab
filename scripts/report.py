@@ -42,6 +42,7 @@ from backend.ml import (
     render_report,
 )
 from backend.web import WebConfig, create_app
+from backend.web.pipeline import default_report_path
 
 
 def free_port() -> int:
@@ -64,7 +65,7 @@ async def pull_session(url: str, duration_s: float, timeout: float) -> dict[str,
         while time.perf_counter() < deadline:
             raw = await asyncio.wait_for(connection.recv(), timeout)
             message = json.loads(raw)
-            if message.get("type") == "error":
+            if message.get("type") == "error" and message.get("fatal", True):
                 return {"error": message.get("message", "unknown pipeline error")}
             if message.get("type") == "frame":
                 frames.append(message)
@@ -157,14 +158,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Render the Motion Lab metrics + explainability report."
     )
-    parser.add_argument("--model", type=Path, default=None, help="v1 model (default: standard v1 bundle)")
+    parser.add_argument(
+        "--model", type=Path, default=None, help="v1 model (default: standard v1 bundle)"
+    )
     parser.add_argument(
         "--model-v2",
         type=Path,
         default=None,
         help="v2 model (default: standard v2 bundle)",
     )
-    parser.add_argument("--out", type=Path, default=None, help="default: <model>.report.html")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="default: data/training/<model-stem>.report.html",
+    )
     parser.add_argument("--seconds", type=float, default=8.0, help="live sampling window")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=1280)
@@ -220,10 +228,11 @@ def main() -> int:
             live = summarize_live(result["frames"], GestureConfig().open_threshold)
             print(f"Sampled {live['frames']} frames." if live else "No frames arrived in time.")
 
-    out_path = args.out or model_path.with_name(model_path.stem + ".report.html")
+    out_path = args.out or default_report_path(model_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
-        render_report(training, live, dataset, schema_comparison=schema_comparison)
+        render_report(training, live, dataset, schema_comparison=schema_comparison),
+        encoding="utf-8",
     )
 
     for name in ("v1", "v2"):
