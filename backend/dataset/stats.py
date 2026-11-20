@@ -14,9 +14,16 @@ from pathlib import Path
 from typing import Any
 
 from backend.dataset.writer import DATASET_COLUMNS, DEFAULT_DATASET_PATH, DEFAULT_LABELS
-from backend.ml.train import DatasetError, classify_dataset_row
+from backend.ml.train import classify_dataset_row
 
 MIN_SESSIONS_PER_LABEL = 2
+
+
+class _InvalidTimestamp(ValueError):
+    """Usable row has a timestamp that cannot represent session duration."""
+
+    def __init__(self, row_number: int, raw: Any) -> None:
+        super().__init__(row_number, raw)
 
 
 def _empty_stats(path: Path) -> dict[str, Any]:
@@ -38,8 +45,34 @@ def _empty_stats(path: Path) -> dict[str, Any]:
     }
 
 
-def _timestamp(row: dict[str, Any], row_number: int, path: Path) -> float:
-    """Read a usable row's timestamp or fail visibly on a corrupt CSV value.
+def _corrupt_stats(
+    path: Path,
+    problem: str,
+    *,
+    total_rows: int = 0,
+    usable_rows: int = 0,
+    dropped: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Return a non-ready snapshot when the file exists but cannot be fully inspected."""
+    return {
+        "path": str(path),
+        "exists": True,
+        "total_rows": total_rows,
+        "usable_rows": usable_rows,
+        "dropped": dropped or {},
+        "labels": {
+            label: {"rows": 0, "sessions": 0, "seconds": 0.0}
+            for label in DEFAULT_LABELS
+        },
+        "sessions": [],
+        "min_sessions_per_label": MIN_SESSIONS_PER_LABEL,
+        "ready": False,
+        "problems": [problem],
+    }
+
+
+def _timestamp(row: dict[str, Any], row_number: int) -> float:
+    """Read a usable row's timestamp or signal a corrupt CSV value.
 
     The writer guarantees finite numeric timestamps. Replacing a damaged or
     missing value with zero would understate session duration without evidence.
@@ -48,15 +81,9 @@ def _timestamp(row: dict[str, Any], row_number: int, path: Path) -> float:
     try:
         value = float(raw)
     except (TypeError, ValueError) as exc:
-        raise DatasetError(
-            f"{path} row {row_number} has an invalid timestamp {raw!r}; "
-            "dataset coverage cannot measure session duration."
-        ) from exc
+        raise _InvalidTimestamp(row_number, raw) from exc
     if not math.isfinite(value):
-        raise DatasetError(
-            f"{path} row {row_number} has a non-finite timestamp {raw!r}; "
-            "dataset coverage cannot measure session duration."
-        )
+        raise _InvalidTimestamp(row_number, raw)
     return value
 
 
@@ -86,12 +113,15 @@ def dataset_stats(path: Path = DEFAULT_DATASET_PATH) -> dict[str, Any]:
     with path.open(newline="") as handle:
         reader = csv.DictReader(handle)
         header = set(reader.fieldnames or ())
-        missing_columns = set(DATASET_COLUMNS) - header
+        missing_columns = sorted(set(DATASET_COLUMNS) - header)
         if missing_columns:
-            raise DatasetError(
-                f"{path} is missing column(s) {sorted(missing_columns)} — its header "
-                "does not match backend/dataset/writer.py:DATASET_COLUMNS. Re-record "
-                "with the current hello_dataset.py rather than hand-editing the CSV."
+            missing = ", ".join(missing_columns)
+            return _corrupt_stats(
+                path,
+                (
+                    f"Cabeçalho do CSV incompleto: faltam as colunas {missing}. "
+                    "Regrave com o gravador atual; o treino vai recusar este arquivo."
+                ),
             )
 
         for row_number, row in enumerate(reader, start=2):
@@ -105,7 +135,22 @@ def dataset_stats(path: Path = DEFAULT_DATASET_PATH) -> dict[str, Any]:
             # with all training features present and finite.
             label = (row.get("label") or "").strip()
             session_id = row.get("session_id") or ""
-            timestamp = _timestamp(row, row_number, path)
+            try:
+                timestamp = _timestamp(row, row_number)
+            except _InvalidTimestamp as exc:
+                row_no, raw = exc.args
+                dropped_out = {reason: count for reason, count in dropped.items() if count > 0}
+                return _corrupt_stats(
+                    path,
+                    (
+                        f"Linha {row_no}: timestamp inválido ({raw!r}). "
+                        "A cobertura não pode medir a duração das sessões; "
+                        "o treino vai recusar linhas assim."
+                    ),
+                    total_rows=total_rows,
+                    usable_rows=usable_rows,
+                    dropped=dropped_out,
+                )
             usable_rows += 1
             labels[label]["rows"] += 1
 
