@@ -182,9 +182,12 @@ def print_report(report, schema: int = 1) -> None:
     counts = ", ".join(f"{k}={v}" for k, v in report.counts.items())
     print(f"samples   {report.n_samples}  {counts}")
     cv = report.cv
+    if cv.get("macro_f1_oof") is not None:
+        print(f"macro-F1  {cv['macro_f1_oof']:.3f}  (LOSO, pooled out-of-fold predictions)")
+    cv_name = "LOSO fold mean" if cv.get("mode") == "loso" else "grouped CV"
     print(
         f"macro-F1  {cv['macro_f1_mean']:.3f} ± {cv['macro_f1_std']:.3f}  "
-        f"(grouped CV; {cv['folds_used']}/{cv['n_splits']} folds; "
+        f"({cv_name}; {cv['folds_used']}/{cv['n_splits']} folds; "
         f"{cv['folds_skipped']} skipped)"
     )
     print(f"accuracy  {report.accuracy * 100:.1f}%  (held-out test split)")
@@ -210,6 +213,10 @@ def main() -> int:
         default=1,
         help="training schema (1: per-frame default, 2: temporal windows)",
     )
+    parser.add_argument(
+        "--cv", choices=("group-kfold", "loso"), default="group-kfold",
+        help="cross-validation method; loso holds out one session per fold",
+    )
     args = parser.parse_args()
     model_path = args.model_out or (
         DEFAULT_V2_MODEL_PATH if args.schema == 2 else DEFAULT_MODEL_PATH
@@ -234,9 +241,10 @@ def main() -> int:
                     dataset_path=dataset_path,
                     model_path=model_path,
                     schema=args.schema,
+                    cv_mode=args.cv,
                 )
         else:
-            kwargs = {"model_path": model_path, "schema": args.schema}
+            kwargs = {"model_path": model_path, "schema": args.schema, "cv_mode": args.cv}
             if args.dataset:
                 kwargs["dataset_path"] = args.dataset
             report = train(**kwargs)

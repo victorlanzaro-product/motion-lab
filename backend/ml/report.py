@@ -232,6 +232,14 @@ def _cross_validation_section(cv: Optional[dict[str, Any]]) -> str:
     else:
         headline = f"macro-F1 médio: <strong>{float(mean):.3f} ± {float(std):.3f}</strong>"
 
+    oof = cv.get("macro_f1_oof")
+    pooled = ""
+    if oof is not None:
+        pooled = (
+            f"<p>macro-F1 LOSO: <strong>{float(oof):.3f}</strong> "
+            "(predições fora da amostra reunidas nos rótulos do schema, uma sessão por dobra).</p>"
+        )
+
     rows = []
     for entry in cv.get("per_fold", []):
         fold = entry.get("fold", entry.get("fold_index", "?"))
@@ -262,6 +270,7 @@ def _cross_validation_section(cv: Optional[dict[str, Any]]) -> str:
     return f"""
     <section>
       <h2>Validação cruzada</h2>
+      {pooled}
       <p>{headline}</p>
       <p class="muted">{int(cv.get('folds_used', 0))} dobras incluídas e
         {int(cv.get('folds_skipped', 0))} ignoradas, de até {int(cv.get('n_splits', 0))}.</p>
@@ -401,7 +410,11 @@ def render_report(
     bars = "".join(_bar(name, value, max_importance) for name, value in importances)
     counts = ", ".join(f"{label}={n}" for label, n in training["counts"].items())
     cv = training.get("cv") or {}
-    if cv.get("macro_f1_mean") is not None and cv.get("macro_f1_std") is not None:
+    if cv.get("macro_f1_oof") is not None:
+        cv_headline = (
+            f"macro-F1 LOSO: <strong>{float(cv['macro_f1_oof']):.3f}</strong>"
+        )
+    elif cv.get("macro_f1_mean") is not None and cv.get("macro_f1_std") is not None:
         cv_headline = (
             "macro-F1 na validação cruzada agrupada: "
             f"<strong>{float(cv['macro_f1_mean']):.3f} ± {float(cv['macro_f1_std']):.3f}</strong>"
