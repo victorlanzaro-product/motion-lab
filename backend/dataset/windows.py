@@ -10,10 +10,11 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from backend.features.features import FEATURE_NAMES
+from backend.features.features import FEATURE_NAMES, FrameFeatures
 from backend.features.window import (
     DEFAULT_WINDOW_DEADBAND,
     ArmWindowFeatures,
+    WindowState,
     rebuild_windows,
 )
 
@@ -68,21 +69,38 @@ def build_window_rows(
 
     output: list[dict[str, Any]] = []
     for row, window in zip(sorted_rows, rebuilt):
-        state = window.features
-        if state is None or state.left is None or state.right is None:
-            continue
-
-        result: dict[str, Any] = {
-            "session_id": window.session_id,
-            "frame_index": window.frame_index,
-            "timestamp": window.timestamp,
-            "label": _label(row.get("label")),
-        }
-        result.update({name: row.get(name) for name in FEATURE_NAMES})
-        result.update(_arm_values("left", state.left))
-        result.update(_arm_values("right", state.right))
-        output.append(result)
+        result = build_window_input_row(row, window.features)
+        if result is not None:
+            result["session_id"] = window.session_id
+            result["frame_index"] = window.frame_index
+            result["timestamp"] = window.timestamp
+            output.append(result)
     return output
+
+
+def build_window_input_row(
+    features: FrameFeatures | Mapping[str, Any],
+    window: WindowState | None,
+) -> dict[str, Any] | None:
+    """Combine a frame's static values with a complete temporal window.
+
+    This is the shared training/inference row builder. Returning ``None`` for
+    either missing arm keeps an incomplete temporal vector out of the model;
+    absent measurements are never filled with zero.
+    """
+    if window is None or window.left is None or window.right is None:
+        return None
+
+    source = features.to_dict() if isinstance(features, FrameFeatures) else features
+    row: dict[str, Any] = {name: source.get(name) for name in FEATURE_NAMES}
+    for name in ("session_id", "label"):
+        if name in source:
+            row[name] = _label(source[name]) if name == "label" else source[name]
+    row["frame_index"] = source.get("frame_index")
+    row["timestamp"] = window.timestamp
+    row.update(_arm_values("left", window.left))
+    row.update(_arm_values("right", window.right))
+    return row
 
 
 def _sort_key(item: tuple[int, Mapping[str, Any]]) -> tuple[str, int, float, int]:

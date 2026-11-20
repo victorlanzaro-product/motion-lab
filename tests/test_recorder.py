@@ -16,6 +16,7 @@ from backend.camera import CameraReadError, Frame
 from backend.dataset.writer import (
     DATASET_COLUMNS,
     REMOVED_LABELS,
+    V2_LABELS,
     DatasetWriter,
     DatasetWriterError,
 )
@@ -229,6 +230,54 @@ def test_invalid_labels_are_rejected_before_file_open(
     assert message in rejected["error"]
     assert not path.exists()
     assert recorder.status()["recording"] is False
+
+
+def test_writer_rejects_wave_by_default_before_open_but_v2_opt_in_records_it(tmp_path):
+    path = tmp_path / "dataset-v2.csv"
+    features, motion = frame(0)
+
+    default_writer = DatasetWriter(path, session_id="default-session")
+    with pytest.raises(DatasetWriterError, match=re.escape(REMOVED_LABELS["wave"])):
+        default_writer.write("wave", features, motion)
+    assert not path.exists()
+
+    writer = DatasetWriter(
+        path, session_id="v2-session", allowed_labels=V2_LABELS
+    )
+    assert writer.write("wave", features, motion) is True
+    writer.close()
+
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+        assert tuple(reader.fieldnames or ()) == DATASET_COLUMNS
+    assert len(rows) == 1
+    assert rows[0]["label"] == "wave"
+    assert rows[0]["session_id"] == "v2-session"
+
+
+def test_recorder_v2_opt_in_reserves_and_writes_wave_to_the_same_csv_schema(tmp_path):
+    path = tmp_path / "dataset_v2.csv"
+    recorder = Recorder(path, allowed_labels=V2_LABELS)
+    owner = object()
+
+    started = recorder.request_start("wave", owner)
+
+    assert started["error"] is None
+    assert started["recording"] is True
+    assert not path.exists(), "the queued start must not open the CSV yet"
+    features, motion = frame(0)
+    assert recorder.record_frame(features, motion) is None
+    assert recorder.request_stop(owner) is None
+    stopped = recorder.record_frame(features, motion)
+
+    assert stopped["recording"] is False
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+        assert tuple(reader.fieldnames or ()) == DATASET_COLUMNS
+    assert len(rows) == 1
+    assert rows[0]["label"] == "wave"
 
 
 def test_only_one_start_and_only_owner_can_stop(tmp_path: Path):

@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 
 from backend.dataset.writer import (
     DEFAULT_DATASET_PATH,
+    DEFAULT_LABELS,
     DatasetWriter,
     DatasetWriterError,
     validate_label,
@@ -41,9 +42,11 @@ class Recorder:
         self,
         path: Path = DEFAULT_DATASET_PATH,
         writer_factory: Callable[..., DatasetWriter] = DatasetWriter,
+        allowed_labels: tuple[str, ...] = DEFAULT_LABELS,
     ) -> None:
         self.path = Path(path)
         self.writer_factory = writer_factory
+        self.allowed_labels = tuple(allowed_labels)
         self._lock = threading.Lock()
         self._commands: deque[tuple[str, Any]] = deque()
         self._recording = False
@@ -66,7 +69,7 @@ class Recorder:
         create the dataset file.
         """
         try:
-            clean_label = validate_label(label)
+            clean_label = validate_label(label, self.allowed_labels)
         except DatasetWriterError as exc:
             with self._lock:
                 return self._snapshot_locked(error=str(exc))
@@ -135,7 +138,10 @@ class Recorder:
                 label, session_id = value
                 writer = None
                 try:
-                    writer = self.writer_factory(self.path, session_id=session_id)
+                    writer_kwargs = {"session_id": session_id}
+                    if self.allowed_labels != DEFAULT_LABELS:
+                        writer_kwargs["allowed_labels"] = self.allowed_labels
+                    writer = self.writer_factory(self.path, **writer_kwargs)
                     writer.open()
                     self._writer = writer
                 except Exception as exc:  # noqa: BLE001 - optional layer boundary

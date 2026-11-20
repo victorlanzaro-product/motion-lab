@@ -55,9 +55,13 @@ from typing import Any, Callable, Optional
 from backend.camera import CameraConfig, CameraEngine, CameraOpenError, CameraReadError
 from backend.dataset.writer import (
     DEFAULT_DATASET_PATH,
+    DEFAULT_V2_DATASET_PATH,
+    DEFAULT_LABELS,
     DatasetWriterError,
+    V2_LABELS,
     validate_label,
 )
+from backend.dataset.windows import build_window_input_row
 from backend.features import (
     FEATURE_NAMES,
     FaceMotionTracker,
@@ -69,8 +73,9 @@ from backend.features import (
 from backend.features.face_features import extract_face
 from backend.features.features import FrameFeatures
 from backend.features.velocity import MotionState
+from backend.features.window import WindowFeatures
 from backend.gestures import GestureConfig, GestureEngine
-from backend.ml import DEFAULT_MODEL_PATH, ModelError
+from backend.ml import DEFAULT_MODEL_PATH, DEFAULT_V2_MODEL_PATH, ModelError
 from backend.ml import load_model as load_ml_model
 from backend.ml import predict as ml_predict
 from backend.vision import (
@@ -115,7 +120,7 @@ class WebConfig:
     #: Path to a trained Sprint 08 model. Optional on purpose: the whole
     #: pipeline (pose, motion, rule-based gestures) works with no model at
     #: all — Live ML is a signal riding on top, never a dependency.
-    model_path: Path = DEFAULT_MODEL_PATH
+    model_path: Optional[Path] = None
     #: Width of the JPEG sent to the browser. Inference still runs on the full
     #: frame, so this trades picture size against bandwidth, never accuracy.
     preview_width: int = 640
@@ -150,7 +155,31 @@ class WebConfig:
     face_model_path: Path = DEFAULT_FACE_MODEL_PATH
     #: Shared labeled dataset target. Tests and alternate deployments can
     #: redirect writes without changing the DatasetWriter schema.
-    dataset_path: Path = DEFAULT_DATASET_PATH
+    dataset_path: Optional[Path] = None
+    #: Schema selected for live inference and recording labels. Appended to
+    #: preserve the positional field order of the pre-S14 WebConfig API.
+    model_schema: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.model_schema) is not int or self.model_schema not in (1, 2):
+            raise ValueError("model_schema must be 1 or 2")
+        model_default = DEFAULT_MODEL_PATH if self.model_schema == 1 else DEFAULT_V2_MODEL_PATH
+        dataset_default = (
+            DEFAULT_DATASET_PATH if self.model_schema == 1 else DEFAULT_V2_DATASET_PATH
+        )
+        object.__setattr__(
+            self, "model_path", Path(self.model_path) if self.model_path is not None else model_default
+        )
+        object.__setattr__(
+            self,
+            "dataset_path",
+            Path(self.dataset_path) if self.dataset_path is not None else dataset_default,
+        )
+
+    @property
+    def record_labels(self) -> tuple[str, ...]:
+        """Labels offered by the server for the selected recording schema."""
+        return DEFAULT_LABELS if self.model_schema == 1 else V2_LABELS
 
 
 class Subscriber:
@@ -372,7 +401,10 @@ class PipelineRunner:
         self.camera_factory = camera_factory
         self.detector_factory = detector_factory
         self.face_detector_factory = face_detector_factory
-        self.recorder = Recorder(self.config.dataset_path)
+        self.recorder = Recorder(
+            self.config.dataset_path,
+            allowed_labels=self.config.record_labels,
+        )
 
         self.state = "idle"  # idle | starting | live | failed
         self.error: Optional[str] = None
@@ -407,7 +439,11 @@ class PipelineRunner:
         than reading a cached value that might not exist yet.
         """
         try:
-            return list(load_ml_model(self.config.model_path)["classes"])
+            bundle = load_ml_model(
+                self.config.model_path,
+                schema=self.config.model_schema,
+            )
+            return list(bundle["classes"])
         except ModelError:
             return []
 
@@ -473,7 +509,7 @@ class PipelineRunner:
     def record_start(self, label: str, subscriber: Subscriber) -> dict[str, Any]:
         """Reserve a session only while a worker can consume its command."""
         try:
-            label = validate_label(label)
+            label = validate_label(label, allowed_labels=self.config.record_labels)
         except DatasetWriterError as exc:
             with self._lock:
                 event = self.recorder.status()
@@ -774,9 +810,26 @@ class PipelineRunner:
         # without a server restart. Missing or corrupt is not fatal — Live ML
         # is a signal on top of the pipeline, never a dependency of it.
         try:
-            ml_bundle = load_ml_model(self.config.model_path)
+            ml_bundle = load_ml_model(
+                self.config.model_path,
+                schema=self.config.model_schema,
+            )
         except ModelError:
             ml_bundle = None
+
+        window_tracker: Optional[WindowFeatures] = None
+        if self.config.model_schema == 2 and ml_bundle is not None:
+            try:
+                window_tracker = WindowFeatures(
+                    window_seconds=ml_bundle["window_seconds"],
+                    max_gap=ml_bundle["max_gap"],
+                    min_samples=ml_bundle["min_samples"],
+                    deadband=ml_bundle["deadband"],
+                )
+            except (KeyError, TypeError, ValueError):
+                # Loading the optional model must never make pose, gestures,
+                # recording, or the web stream unavailable.
+                ml_bundle = None
 
         # Sprint 11 — facial signals, same isolation rule as the ML bundle
         # above: opt-in (`face_enabled`) and, once on, a missing/broken model
@@ -814,6 +867,8 @@ class PipelineRunner:
                         tracker.reset()
                         gestures.reset()
                         face_tracker.reset()
+                        if window_tracker is not None:
+                            window_tracker.reset()
                         for trail in trails.values():
                             trail.clear()
                     if time.monotonic() - idle_since >= self.config.idle_seconds:
@@ -825,7 +880,20 @@ class PipelineRunner:
                 features = extract(snapshot, self.config.visibility_threshold)
                 motion = tracker.update(features)
                 fired = gestures.update(features, motion)
-                prediction = self._predict(ml_bundle, features, motion)
+                window_state = None
+                if window_tracker is not None:
+                    if snapshot.detected:
+                        window_state = window_tracker.push(features.timestamp, features)
+                    else:
+                        # A missing pose breaks temporal continuity. Do not
+                        # carry pre-loss movement into the first re-detected frame.
+                        window_tracker.reset()
+                prediction = self._predict(
+                    ml_bundle,
+                    features,
+                    motion,
+                    window_state=window_state,
+                )
                 for name, trail in trails.items():
                     trail.add_from(snapshot, SIDES[name], self.config.visibility_threshold)
 
@@ -889,7 +957,10 @@ class PipelineRunner:
 
     @staticmethod
     def _predict(
-        bundle: Optional[dict], features: FrameFeatures, motion: MotionState
+        bundle: Optional[dict],
+        features: FrameFeatures,
+        motion: MotionState,
+        window_state=None,
     ) -> Optional[tuple[str, dict[str, float]]]:
         """Skip, don't guess: an incomplete frame never reaches the model.
 
@@ -916,6 +987,11 @@ class PipelineRunner:
         """
         if bundle is None or not features.complete:
             return None
+        if bundle.get("schema_version", 1) == 2:
+            row = build_window_input_row(features, window_state)
+            if row is None:
+                return None
+            return ml_predict(bundle, row)
         columns = bundle.get("columns") or ()
         needs_motion = any(name not in FEATURE_NAMES for name in columns)
         if needs_motion and not motion.complete:

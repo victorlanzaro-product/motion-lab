@@ -373,14 +373,14 @@ def _schema_comparison_section(
       <li><code>wave</code> pertence ao vocabulário v2; gravação e rótulos padrão do DatasetWriter continuam v1.</li>
       <li>A comparação usa macro-F1 médio ± desvio em validação agrupada por sessão; dados sintéticos não medem qualidade no mundo real.</li>
     </ol>"""
-    live_note = """<p class="muted"><strong>Inferência ao vivo v2 pendente:</strong>
-      PipelineRunner precisa selecionar explicitamente o bundle pelo futuro <code>hello.model_schema</code>,
-      manter um buffer temporal por sessão e alimentá-lo com timestamp, altura e offset de cada quadro.
-      Deve usar <code>window_seconds</code>, <code>max_gap</code>, <code>min_samples</code> e
-      <code>deadband</code> salvos no bundle, combinar a janela com as features estáticas do último
-      quadro, limpar o buffer em nova sessão ou lacuna inválida e não emitir previsão durante o
-      aquecimento. O contrato do Recorder/frontend para anunciar v2 ainda depende da especificação
-      do maestro. Este relatório não executa inferência v2 ao vivo.</p>"""
+    live_note = """<p class="muted"><strong>Inferência ao vivo v2 implementada:</strong>
+      <code>WebConfig</code> e <code>hello_web.py --model-schema</code> selecionam o schema anunciado
+      em <code>hello.model_schema</code>. O PipelineRunner mantém um tracker por stream, usa os
+      parâmetros temporais do bundle e combina a janela completa dos dois braços com as features
+      estáticas do último quadro. Aquecimento, lacuna inválida, perda de pose ou modelo incompatível
+      mantêm <code>ml: null</code>; pose, gestos, face e gravação continuam. No modo v2 o Recorder
+      aceita <code>wave</code> e <code>/dataset/stats</code> inclui sua cobertura. Os números desta
+      comparação continuam sendo métricas offline do bundle, não uma avaliação de câmera ao vivo.</p>"""
 
     return f"""
     <section>
