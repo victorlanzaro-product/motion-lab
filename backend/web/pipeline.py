@@ -55,9 +55,13 @@ from typing import Any, Callable, Optional
 from backend.camera import CameraConfig, CameraEngine, CameraOpenError, CameraReadError
 from backend.dataset.writer import (
     DEFAULT_DATASET_PATH,
+    DEFAULT_V2_DATASET_PATH,
+    DEFAULT_LABELS,
     DatasetWriterError,
+    V2_LABELS,
     validate_label,
 )
+from backend.dataset.windows import build_window_input_row
 from backend.features import (
     FEATURE_NAMES,
     FaceMotionTracker,
@@ -69,8 +73,9 @@ from backend.features import (
 from backend.features.face_features import extract_face
 from backend.features.features import FrameFeatures
 from backend.features.velocity import MotionState
+from backend.features.window import WindowFeatures
 from backend.gestures import GestureConfig, GestureEngine
-from backend.ml import DEFAULT_MODEL_PATH, ModelError
+from backend.ml import DEFAULT_MODEL_PATH, DEFAULT_V2_MODEL_PATH, ModelError
 from backend.ml.rule_label import rule_label as compute_rule_label
 from backend.ml import load_model as load_ml_model
 from backend.ml import predict as ml_predict
@@ -116,7 +121,7 @@ class WebConfig:
     #: Path to a trained Sprint 08 model. Optional on purpose: the whole
     #: pipeline (pose, motion, rule-based gestures) works with no model at
     #: all — Live ML is a signal riding on top, never a dependency.
-    model_path: Path = DEFAULT_MODEL_PATH
+    model_path: Optional[Path] = None
     #: Width of the JPEG sent to the browser. Inference still runs on the full
     #: frame, so this trades picture size against bandwidth, never accuracy.
     preview_width: int = 640
@@ -151,11 +156,35 @@ class WebConfig:
     face_model_path: Path = DEFAULT_FACE_MODEL_PATH
     #: Shared labeled dataset target. Tests and alternate deployments can
     #: redirect writes without changing the DatasetWriter schema.
-    dataset_path: Path = DEFAULT_DATASET_PATH
+    dataset_path: Optional[Path] = None
     #: Sprint 15 — last generated Sprint 10 HTML report. `None` follows the
     #: model path using the same `<model-stem>.report.html` convention as
     #: `scripts/report.py`; deployments can point the web app elsewhere.
     report_path: Optional[Path] = None
+    #: Schema selected for live inference and recording labels. Appended to
+    #: preserve the positional field order of the pre-S14 WebConfig API.
+    model_schema: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.model_schema) is not int or self.model_schema not in (1, 2):
+            raise ValueError("model_schema must be 1 or 2")
+        model_default = DEFAULT_MODEL_PATH if self.model_schema == 1 else DEFAULT_V2_MODEL_PATH
+        dataset_default = (
+            DEFAULT_DATASET_PATH if self.model_schema == 1 else DEFAULT_V2_DATASET_PATH
+        )
+        object.__setattr__(
+            self, "model_path", Path(self.model_path) if self.model_path is not None else model_default
+        )
+        object.__setattr__(
+            self,
+            "dataset_path",
+            Path(self.dataset_path) if self.dataset_path is not None else dataset_default,
+        )
+
+    @property
+    def record_labels(self) -> tuple[str, ...]:
+        """Labels offered by the server for the selected recording schema."""
+        return DEFAULT_LABELS if self.model_schema == 1 else V2_LABELS
 
 
 class Subscriber:
@@ -165,6 +194,8 @@ class Subscriber:
     over from the pipeline thread, because `asyncio.Queue` is not thread-safe.
     """
 
+    MAX_CONTROL_MESSAGES = 64
+
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
         # Frames may be coalesced to keep latency bounded. Control messages
@@ -172,35 +203,145 @@ class Subscriber:
         # them, even if a new frame arrives in the meantime.
         self._latest_frame: Optional[dict[str, Any]] = None
         self._control: deque[dict[str, Any]] = deque()
+        # Start/stop state changes are boundaries, not disposable count
+        # updates. Keep their identities so queue pressure evicts rejections
+        # and replaceable controls first.
+        self._transition_ids: set[int] = set()
+        self._last_record_state: Optional[tuple[bool, Optional[str]]] = None
+        self._overloaded = False
         self._available = asyncio.Event()
         self.dropped = 0
         self.sent = 0
 
     def offer(self, message: dict[str, Any]) -> None:
+        if self._overloaded:
+            return
         if message.get("type") == "frame":
             if self._latest_frame is not None:
                 self.dropped += 1
             self._latest_frame = message
-        elif message.get("type") == "record_status" and message.get("error") is None:
-            # Replacing an unread count update avoids turning the control
-            # queue into an old-status backlog for a slow browser. A session
-            # transition or private error forms a boundary and stays queued.
-            if self._control and self._control[-1].get("type") == "record_status":
-                pending = self._control[-1]
-                same_state = (
-                    pending.get("error") is None
-                    and pending.get("recording") == message.get("recording")
-                    and pending.get("session_id") == message.get("session_id")
-                )
-                if same_state:
-                    self._control[-1] = message
-                else:
-                    self._control.append(message)
-            else:
-                self._control.append(message)
         else:
-            self._control.append(message)
+            if self._coalesce_record_status(message):
+                self._available.set()
+                return
+            transition = self._is_record_transition(message)
+            if message.get("type") == "record_status" and (
+                message.get("error") is None or self._is_final_record_status(message)
+            ):
+                self._last_record_state = (
+                    bool(message.get("recording")), message.get("session_id")
+                )
+            self._append_control(message, preserve=transition)
         self._available.set()
+
+    def _coalesce_record_status(self, message: dict[str, Any]) -> bool:
+        """Replace duplicate rejections/count updates without hiding transitions."""
+        if message.get("type") != "record_status":
+            return False
+
+        if message.get("error") is not None and not self._is_final_record_status(message):
+            rejection_key = (
+                message.get("error"),
+                bool(message.get("recording")),
+                message.get("label"),
+                message.get("session_id"),
+                bool(message.get("owner")),
+            )
+            for index, pending in enumerate(self._control):
+                if pending.get("type") != "record_status" or pending.get("error") is None:
+                    continue
+                pending_key = (
+                    pending.get("error"),
+                    bool(pending.get("recording")),
+                    pending.get("label"),
+                    pending.get("session_id"),
+                    bool(pending.get("owner")),
+                )
+                if pending_key == rejection_key:
+                    self._control[index] = message
+                    return True
+            return False
+
+        state = (bool(message.get("recording")), message.get("session_id"))
+        is_transition = state != self._last_record_state
+        if (
+            not is_transition
+            and self._control
+            and self._control[-1].get("type") == "record_status"
+            and self._control[-1].get("error") is None
+            and (
+                bool(self._control[-1].get("recording")),
+                self._control[-1].get("session_id"),
+            )
+            == state
+            and id(self._control[-1]) not in self._transition_ids
+        ):
+            self._control[-1] = message
+            return True
+        return False
+
+    def _is_record_transition(self, message: dict[str, Any]) -> bool:
+        if message.get("type") != "record_status":
+            return False
+        if message.get("error") is not None and not self._is_final_record_status(message):
+            return False
+        state = (bool(message.get("recording")), message.get("session_id"))
+        return state != self._last_record_state
+
+    def _append_control(self, message: dict[str, Any], *, preserve: bool = False) -> None:
+        """Append within the bound, evicting rejections before state changes."""
+        if len(self._control) >= self.MAX_CONTROL_MESSAGES:
+            removable = self._find_removable_control()
+            if removable is None:
+                # The queue contains only protected transitions/finals/fatal
+                # controls. Silently dropping the new state here would let a
+                # slow socket drain stale statuses and never learn the real
+                # state. Close it so the client reconnects and receives a
+                # fresh snapshot (and fatal pipeline error replay if needed).
+                self._close_for_resnapshot()
+                return
+            old = self._control[removable]
+            self._transition_ids.discard(id(old))
+            del self._control[removable]
+        self._control.append(message)
+        if preserve:
+            self._transition_ids.add(id(message))
+
+    def _find_removable_control(self) -> Optional[int]:
+        """Choose the least important queued item without dropping finals."""
+        for index, pending in enumerate(self._control):
+            if (
+                pending.get("type") == "record_status"
+                and pending.get("error") is not None
+                and not self._is_final_record_status(pending)
+            ):
+                return index
+        for index, pending in enumerate(self._control):
+            if (
+                id(pending) not in self._transition_ids
+                and not self._is_final_record_status(pending)
+                and not self._is_fatal_control(pending)
+            ):
+                return index
+        return None
+
+    def _close_for_resnapshot(self) -> None:
+        self._overloaded = True
+        self._control.clear()
+        self._transition_ids.clear()
+        self._available.set()
+
+    @staticmethod
+    def _is_fatal_control(message: dict[str, Any]) -> bool:
+        return message.get("type") == "error" and message.get("fatal", True) is True
+
+    @staticmethod
+    def _is_final_record_status(message: dict[str, Any]) -> bool:
+        return (
+            message.get("type") == "record_status"
+            and message.get("recording") is False
+            and message.get("session_id") is not None
+        )
 
     def offer_threadsafe(self, message: dict[str, Any]) -> None:
         try:
@@ -212,8 +353,12 @@ class Subscriber:
 
     async def get(self) -> dict[str, Any]:
         while True:
+            if self._overloaded:
+                return {"type": "subscriber_overloaded"}
             if self._control:
-                return self._control.popleft()
+                message = self._control.popleft()
+                self._transition_ids.discard(id(message))
+                return message
             if self._latest_frame is not None:
                 message = dict(self._latest_frame)
                 self._latest_frame = None
@@ -275,7 +420,10 @@ class PipelineRunner:
         self.camera_factory = camera_factory
         self.detector_factory = detector_factory
         self.face_detector_factory = face_detector_factory
-        self.recorder = Recorder(self.config.dataset_path)
+        self.recorder = Recorder(
+            self.config.dataset_path,
+            allowed_labels=self.config.record_labels,
+        )
 
         self.state = "idle"  # idle | starting | live | failed
         self.error: Optional[str] = None
@@ -290,7 +438,10 @@ class PipelineRunner:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
-        self._owner_disconnected = threading.Event()
+        # The active session ID is the disconnect signal. A bare Event can be
+        # set for session B and then cleared by completion of an older stop for
+        # session A, leaving B's writer open after its owner disconnects.
+        self._owner_disconnected_session: Optional[str] = None
         # A start request may reserve a session only while a pipeline thread
         # can consume it. This gate and its status delivery share `_lock` so a
         # start racing shutdown is either ordered before the final status or
@@ -307,7 +458,11 @@ class PipelineRunner:
         than reading a cached value that might not exist yet.
         """
         try:
-            return list(load_ml_model(self.config.model_path)["classes"])
+            bundle = load_ml_model(
+                self.config.model_path,
+                schema=self.config.model_schema,
+            )
+            return list(bundle["classes"])
         except ModelError:
             return []
 
@@ -357,12 +512,35 @@ class PipelineRunner:
             # tying ownership to the subscription guarantees a closed tab
             # cannot leave an open CSV session behind.
             if self.recorder.owner_disconnected(subscriber):
-                self._owner_disconnected.set()
+                self._owner_disconnected_session = self.recorder.status()["session_id"]
+
+    def _clear_owner_disconnect_for(self, event: Optional[dict[str, Any]]) -> None:
+        """Clear only the disconnect signal belonging to this finished session."""
+        if event is None or event.get("session_id") is None:
+            return
+        with self._lock:
+            if self._owner_disconnected_session == event["session_id"]:
+                self._owner_disconnected_session = None
+
+    def _process_owner_disconnect(self) -> None:
+        """Finish a disconnected owner's session if its reservation is current."""
+        with self._lock:
+            disconnected_session = self._owner_disconnected_session
+        if disconnected_session is None:
+            return
+
+        snapshot = self.recorder.status()
+        if snapshot["recording"] and snapshot["session_id"] == disconnected_session:
+            self._close_recorder(resume_record_starts=True)
+
+        with self._lock:
+            if self._owner_disconnected_session == disconnected_session:
+                self._owner_disconnected_session = None
 
     def record_start(self, label: str, subscriber: Subscriber) -> dict[str, Any]:
         """Reserve a session only while a worker can consume its command."""
         try:
-            label = validate_label(label)
+            label = validate_label(label, allowed_labels=self.config.record_labels)
         except DatasetWriterError as exc:
             with self._lock:
                 event = self.recorder.status()
@@ -663,9 +841,26 @@ class PipelineRunner:
         # without a server restart. Missing or corrupt is not fatal — Live ML
         # is a signal on top of the pipeline, never a dependency of it.
         try:
-            ml_bundle = load_ml_model(self.config.model_path)
+            ml_bundle = load_ml_model(
+                self.config.model_path,
+                schema=self.config.model_schema,
+            )
         except ModelError:
             ml_bundle = None
+
+        window_tracker: Optional[WindowFeatures] = None
+        if self.config.model_schema == 2 and ml_bundle is not None:
+            try:
+                window_tracker = WindowFeatures(
+                    window_seconds=ml_bundle["window_seconds"],
+                    max_gap=ml_bundle["max_gap"],
+                    min_samples=ml_bundle["min_samples"],
+                    deadband=ml_bundle["deadband"],
+                )
+            except (KeyError, TypeError, ValueError):
+                # Loading the optional model must never make pose, gestures,
+                # recording, or the web stream unavailable.
+                ml_bundle = None
 
         # Sprint 11 — facial signals, same isolation rule as the ML bundle
         # above: opt-in (`face_enabled`) and, once on, a missing/broken model
@@ -705,9 +900,7 @@ class PipelineRunner:
                 if self.client_count == 0:
                     # Commands still need servicing during the camera's idle
                     # grace period, especially the owner's disconnect stop.
-                    if self._owner_disconnected.is_set():
-                        self._close_recorder(resume_record_starts=True)
-                        self._owner_disconnected.clear()
+                    self._process_owner_disconnect()
                     if idle_since is None:
                         # First frame with nobody watching: drop the temporal state.
                         # Whatever the arms did while the tab was closed is not part
@@ -717,6 +910,8 @@ class PipelineRunner:
                         tracker.reset()
                         gestures.reset()
                         face_tracker.reset()
+                        if window_tracker is not None:
+                            window_tracker.reset()
                         for trail in trails.values():
                             trail.clear()
                     if time.monotonic() - idle_since >= self.config.idle_seconds:
@@ -735,8 +930,22 @@ class PipelineRunner:
                 fired = gestures.update(features, motion)
                 features_ms = (time.perf_counter() - features_started) * 1000
 
+                window_state = None
+                if window_tracker is not None:
+                    if snapshot.detected:
+                        window_state = window_tracker.push(features.timestamp, features)
+                    else:
+                        # A missing pose breaks temporal continuity. Do not
+                        # carry pre-loss movement into the first re-detected frame.
+                        window_tracker.reset()
+
                 ml_started = time.perf_counter()
-                prediction = self._predict(ml_bundle, features, motion)
+                prediction = self._predict(
+                    ml_bundle,
+                    features,
+                    motion,
+                    window_state=window_state,
+                )
                 ml_ms = (
                     (time.perf_counter() - ml_started) * 1000
                     if prediction is not None
@@ -779,8 +988,7 @@ class PipelineRunner:
                 # exact feature and motion objects derived from this frame.
                 record_event = self.recorder.record_frame(features, motion)
                 self._publish_record_events(record_event)
-                if record_event is not None:
-                    self._owner_disconnected.clear()
+                self._clear_owner_disconnect_for(record_event)
                 self._publish_record_counts_if_due()
 
                 timings: dict[str, Optional[float]] = {
@@ -839,7 +1047,10 @@ class PipelineRunner:
 
     @staticmethod
     def _predict(
-        bundle: Optional[dict], features: FrameFeatures, motion: MotionState
+        bundle: Optional[dict],
+        features: FrameFeatures,
+        motion: MotionState,
+        window_state=None,
     ) -> Optional[tuple[str, dict[str, float]]]:
         """Skip, don't guess: an incomplete frame never reaches the model.
 
@@ -866,6 +1077,11 @@ class PipelineRunner:
         """
         if bundle is None or not features.complete:
             return None
+        if bundle.get("schema_version", 1) == 2:
+            row = build_window_input_row(features, window_state)
+            if row is None:
+                return None
+            return ml_predict(bundle, row)
         columns = bundle.get("columns") or ()
         needs_motion = any(name not in FEATURE_NAMES for name in columns)
         if needs_motion and not motion.complete:
