@@ -34,6 +34,19 @@ descartados) e o relatório do Sprint 10 servido pelo próprio servidor.
   `dropped_rate` = descartados / (enviados + descartados), 2 casas.
 - `inference_ms` existente continua (compatibilidade).
 
+### Decisões do maestro (dúvidas Bigorna × Pincel)
+
+1. `rule_label = null` quando `detected=false` ou falta feature necessária ao
+   predicado; `"idle"` só com pose detectada e nenhum predicado verdadeiro.
+2. Fatias: `capture_ms` = leitura da câmera; `pose_ms` = landmarker (mesmo valor
+   de `inference_ms`, que segue por compatibilidade); `features_ms` = features +
+   motion + gestos; `ml_ms`; `face_ms`; `total_ms` = início da captura → payload
+   montado (≥ soma das fatias não nulas).
+3. `health.fps` repete `fps` de propósito: o bloco `health` é autocontido.
+4. Primeiro frame de um cliente: `dropped_frames=0`, `dropped_rate=0.0` (nunca `null`).
+5. `report_available` é snapshot só no `hello`; o link sempre tenta `/report` e
+   o 404 mostra a mensagem — não há push de mudança.
+
 ### `hello` ganha `"report_available": true|false`
 
 ### `GET /report`
