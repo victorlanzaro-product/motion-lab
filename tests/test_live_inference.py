@@ -116,6 +116,12 @@ def test_stream_clears_v2_window_history_after_pose_loss(monkeypatch):
     import backend.web.pipeline as pipeline_module
 
     predictions = []
+    resets = []
+    current_frame_index = None
+    window_seconds = 1.0
+    pose_loss_frame_index = 11
+    pose_loss_timestamp = pose_loss_frame_index / 10
+    first_eligible_timestamp = pose_loss_timestamp + window_seconds
 
     class SpyWindowFeatures(WindowFeatures):
         instances = []
@@ -126,6 +132,9 @@ def test_stream_clears_v2_window_history_after_pose_loss(monkeypatch):
             self.instances.append(self)
 
         def reset(self):
+            resets.append(
+                (current_frame_index, bool(self._samples["left"] or self._samples["right"]))
+            )
             self.reset_count += 1
             super().reset()
 
@@ -151,6 +160,8 @@ def test_stream_clears_v2_window_history_after_pose_loss(monkeypatch):
 
     class Detector:
         def detect(self, frame):
+            nonlocal current_frame_index
+            current_frame_index = frame.frame_index
             return SimpleNamespace(
                 detected=frame.detected,
                 frame_index=frame.frame_index,
@@ -188,7 +199,7 @@ def test_stream_clears_v2_window_history_after_pose_loss(monkeypatch):
         "load_ml_model",
         lambda *_args, **_kwargs: {
             **_v2_bundle(),
-            "window_seconds": 1.0,
+            "window_seconds": window_seconds,
             "max_gap": 0.30,
             "min_samples": 4,
             "deadband": 0.35,
@@ -206,10 +217,16 @@ def test_stream_clears_v2_window_history_after_pose_loss(monkeypatch):
     finally:
         runner.stop()
 
-    assert SpyWindowFeatures.instances[0].reset_count >= 1
+    assert (pose_loss_frame_index, True) in resets
     assert any(timestamp <= 1.0 for timestamp in predictions)
-    # Pre-loss predictions are valid. After the lost-pose frame at 1.1s, the
-    # tracker must collect a fresh full one-second window before predicting.
-    after_loss = [timestamp for timestamp in predictions if timestamp > 1.1]
+    # Pre-loss predictions are valid. After pose loss, there must be no
+    # prediction until a full configured window has elapsed.
+    assert not any(
+        pose_loss_timestamp < timestamp < first_eligible_timestamp
+        for timestamp in predictions
+    )
+    after_loss = [
+        timestamp for timestamp in predictions if timestamp >= first_eligible_timestamp
+    ]
     assert after_loss
-    assert min(after_loss) >= 2.2
+    assert min(after_loss) >= first_eligible_timestamp
