@@ -71,6 +71,7 @@ from backend.features.features import FrameFeatures
 from backend.features.velocity import MotionState
 from backend.gestures import GestureConfig, GestureEngine
 from backend.ml import DEFAULT_MODEL_PATH, ModelError
+from backend.ml.rule_label import rule_label as compute_rule_label
 from backend.ml import load_model as load_ml_model
 from backend.ml import predict as ml_predict
 from backend.vision import (
@@ -151,6 +152,10 @@ class WebConfig:
     #: Shared labeled dataset target. Tests and alternate deployments can
     #: redirect writes without changing the DatasetWriter schema.
     dataset_path: Path = DEFAULT_DATASET_PATH
+    #: Sprint 15 — last generated Sprint 10 HTML report. `None` follows the
+    #: model path using the same `<model-stem>.report.html` convention as
+    #: `scripts/report.py`; deployments can point the web app elsewhere.
+    report_path: Optional[Path] = None
 
 
 class Subscriber:
@@ -169,6 +174,7 @@ class Subscriber:
         self._control: deque[dict[str, Any]] = deque()
         self._available = asyncio.Event()
         self.dropped = 0
+        self.sent = 0
 
     def offer(self, message: dict[str, Any]) -> None:
         if message.get("type") == "frame":
@@ -209,8 +215,21 @@ class Subscriber:
             if self._control:
                 return self._control.popleft()
             if self._latest_frame is not None:
-                message = self._latest_frame
+                message = dict(self._latest_frame)
                 self._latest_frame = None
+                first_frame = self.sent == 0
+                self.sent += 1
+                health = dict(message.get("health") or {})
+                if first_frame:
+                    # Establish the per-connection baseline at the first
+                    # frame even if startup coalesced before the writer ran.
+                    health["dropped_frames"] = 0
+                    health["dropped_rate"] = 0.0
+                else:
+                    health["dropped_frames"] = self.dropped
+                    total = self.sent + self.dropped
+                    health["dropped_rate"] = round(self.dropped / total, 2)
+                message["health"] = health
                 return message
             self._available.clear()
             await self._available.wait()
@@ -291,6 +310,18 @@ class PipelineRunner:
             return list(load_ml_model(self.config.model_path)["classes"])
         except ModelError:
             return []
+
+    @property
+    def report_path(self) -> Path:
+        """Configured report target, or the Sprint 10 default beside the model."""
+        if self.config.report_path is not None:
+            return self.config.report_path
+        model_path = self.config.model_path
+        return model_path.with_name(f"{model_path.stem}.report.html")
+
+    def report_available(self) -> bool:
+        """Whether the last generated report exists; this never generates it."""
+        return self.report_path.is_file()
 
     # --- subscriptions -------------------------------------------------
     @property
@@ -654,8 +685,20 @@ class PipelineRunner:
                 face_detector = None
         self.face_error = face_error
 
+        def timed_frames():
+            """Measure the camera generator's read operation per frame."""
+            frames = iter(camera.frames())
+            while True:
+                capture_started = time.perf_counter()
+                try:
+                    captured = next(frames)
+                except StopIteration:
+                    return
+                capture_ms = (time.perf_counter() - capture_started) * 1000
+                yield captured, capture_started, capture_ms
+
         try:
-            for frame in camera.frames():
+            for frame, capture_started, capture_ms in timed_frames():
                 if self._stop.is_set():
                     return
 
@@ -681,19 +724,34 @@ class PipelineRunner:
                     continue  # keep the device warm, but spend no CPU on pose
 
                 idle_since = None
+                # `PoseSnapshot.inference_ms` is timed by PoseDetector with
+                # perf_counter around the landmarker call itself.
                 snapshot = detector.detect(frame)
+                pose_ms = snapshot.inference_ms
+
+                features_started = time.perf_counter()
                 features = extract(snapshot, self.config.visibility_threshold)
                 motion = tracker.update(features)
                 fired = gestures.update(features, motion)
+                features_ms = (time.perf_counter() - features_started) * 1000
+
+                ml_started = time.perf_counter()
                 prediction = self._predict(ml_bundle, features, motion)
+                ml_ms = (
+                    (time.perf_counter() - ml_started) * 1000
+                    if prediction is not None
+                    else None
+                )
                 for name, trail in trails.items():
                     trail.add_from(snapshot, SIDES[name], self.config.visibility_threshold)
 
                 face_dict = None
+                face_ms = None
                 if self.config.face_enabled:
                     if face_detector is None:
                         face_dict = face_payload(enabled=True, error=face_error)
                     else:
+                        face_started = time.perf_counter()
                         try:
                             face_snapshot = face_detector.detect(frame)
                             face_signals = extract_face(face_snapshot)
@@ -714,6 +772,8 @@ class PipelineRunner:
                             face_error = self._disable_face(face_detector, exc)
                             face_detector = None
                             face_dict = face_payload(enabled=True, error=face_error)
+                        finally:
+                            face_ms = (time.perf_counter() - face_started) * 1000
 
                 # The CSV writer runs here, on the pipeline thread, with the
                 # exact feature and motion objects derived from this frame.
@@ -723,23 +783,52 @@ class PipelineRunner:
                     self._owner_disconnected.clear()
                 self._publish_record_counts_if_due()
 
-                self._broadcast(
-                    frame_message(
-                        snapshot=snapshot,
-                        features=features,
-                        motion=motion,
-                        preview=encode_preview(
-                            frame.image,  # raw, unmirrored: the browser flips at draw time
-                            width=self.config.preview_width,
-                            quality=self.config.jpeg_quality,
-                        ),
-                        fps=camera.fps,
-                        trails=trails,
-                        gestures=fired,
-                        ml=prediction,
-                        face=face_dict,
-                    )
+                timings: dict[str, Optional[float]] = {
+                    "capture_ms": capture_ms,
+                    "pose_ms": pose_ms,
+                    "features_ms": features_ms,
+                    "ml_ms": ml_ms,
+                    "face_ms": face_ms,
+                    # Filled immediately after the payload is constructed.
+                    "total_ms": None,
+                }
+                message = frame_message(
+                    snapshot=snapshot,
+                    features=features,
+                    motion=motion,
+                    preview=encode_preview(
+                        frame.image,  # raw, unmirrored: the browser flips at draw time
+                        width=self.config.preview_width,
+                        quality=self.config.jpeg_quality,
+                    ),
+                    fps=camera.fps,
+                    trails=trails,
+                    gestures=fired,
+                    ml=prediction,
+                    face=face_dict,
+                    rule_label=(
+                        compute_rule_label(
+                            features.to_dict(), self.config.gesture.open_threshold
+                        )
+                        if snapshot.detected
+                        else None
+                    ),
+                    timings=timings,
                 )
+
+                # Includes the camera read and all work through payload
+                # construction. Ensure rounded stage values never sum beyond
+                # the rounded total due to one-decimal rounding.
+                stage_total_ms = sum(
+                    round(value, 1)
+                    for name, value in timings.items()
+                    if name != "total_ms" and value is not None
+                )
+                elapsed_ms = (time.perf_counter() - capture_started) * 1000
+                message["timings"]["total_ms"] = round(
+                    max(elapsed_ms, stage_total_ms), 1
+                )
+                self._broadcast(message)
                 self.frames_served += 1
         finally:
             if face_detector is not None:

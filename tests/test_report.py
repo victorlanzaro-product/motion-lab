@@ -23,20 +23,74 @@ TRAINING = {
 
 
 def test_rule_label_reads_the_three_static_predicates():
-    assert rule_label({"wrists_crossed": True}, open_threshold=2.4) == "arms_crossed"
-    assert rule_label({"wrist_distance": 3.0}, open_threshold=2.4) == "arms_open"
-    assert rule_label({"left_wrist_above_shoulder": True}, open_threshold=2.4) == "arm_raised"
-    assert rule_label({}, open_threshold=2.4) == "idle"
+    quiet = {
+        "wrists_crossed": False,
+        "wrist_distance": 1.0,
+        "left_wrist_above_shoulder": False,
+        "right_wrist_above_shoulder": False,
+    }
+    assert (
+        rule_label({**quiet, "wrists_crossed": True}, open_threshold=2.4)
+        == "arms_crossed"
+    )
+    assert (
+        rule_label({**quiet, "wrist_distance": 3.0}, open_threshold=2.4)
+        == "arms_open"
+    )
+    assert (
+        rule_label({**quiet, "left_wrist_above_shoulder": True}, open_threshold=2.4)
+        == "arm_raised"
+    )
+    assert rule_label(quiet, open_threshold=2.4) == "idle"
+    assert rule_label({}, open_threshold=2.4) is None
 
 
 def test_rule_label_treats_a_missing_wrist_distance_as_not_open():
-    assert rule_label({"wrist_distance": None}, open_threshold=2.4) == "idle"
+    # Without the other predicate inputs this is not evidence for "idle".
+    assert rule_label({"wrist_distance": None}, open_threshold=2.4) is None
+
+
+def test_rule_label_only_returns_idle_when_every_predicate_is_observable():
+    features = {
+        "wrists_crossed": False,
+        "wrist_distance": 1.0,
+        "left_wrist_above_shoulder": False,
+        "right_wrist_above_shoulder": False,
+    }
+    assert rule_label(features, open_threshold=2.4) == "idle"
+
+
+def test_rule_label_returns_unknown_when_a_required_predicate_feature_is_missing():
+    features = {
+        "wrists_crossed": False,
+        "wrist_distance": 1.0,
+        "left_wrist_above_shoulder": False,
+        # The missing right wrist could have been raised, so "idle" is not
+        # supported by this frame.
+    }
+    assert rule_label(features, open_threshold=2.4) is None
 
 
 def test_compute_agreement_counts_matches_and_mismatches():
     frames = [
-        {"features": {"wrists_crossed": True}, "ml": {"label": "arms_crossed"}},  # match
-        {"features": {"wrist_distance": 3.0}, "ml": {"label": "idle"}},  # mismatch
+        {
+            "features": {
+                "wrists_crossed": True,
+                "wrist_distance": 1.0,
+                "left_wrist_above_shoulder": False,
+                "right_wrist_above_shoulder": False,
+            },
+            "ml": {"label": "arms_crossed"},
+        },  # match
+        {
+            "features": {
+                "wrists_crossed": False,
+                "wrist_distance": 3.0,
+                "left_wrist_above_shoulder": False,
+                "right_wrist_above_shoulder": False,
+            },
+            "ml": {"label": "idle"},
+        },  # mismatch
         {"features": {}, "ml": None},  # no signal, not counted
     ]
     result = compute_agreement(frames, open_threshold=2.4)
