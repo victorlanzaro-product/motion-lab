@@ -25,12 +25,20 @@ from backend.features.velocity import (
     Trail,
     classify,
 )
+from backend.features.window import (
+    ArmWindowFeatures,
+    WindowFeatures,
+    WindowRow,
+    WindowState,
+    rebuild_windows,
+)
 
 __all__ = [
     "FACE_MOTION_COLUMNS",
     "FACE_SIGNAL_NAMES",
     "FEATURE_NAMES",
     "ArmMotion",
+    "ArmWindowFeatures",
     "Direction",
     "FaceMotionState",
     "FaceMotionTracker",
@@ -41,6 +49,9 @@ __all__ = [
     "MotionTracker",
     "SignalTrack",
     "Trail",
+    "WindowFeatures",
+    "WindowRow",
+    "WindowState",
     "angle_between",
     "classify",
     "distance",
@@ -55,4 +66,5 @@ __all__ = [
     "wrist_height",
     "wrist_offset_x",
     "wrists_crossed",
+    "rebuild_windows",
 ]
