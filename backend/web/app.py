@@ -34,6 +34,13 @@ from backend.web.pipeline import PipelineRunner, Subscriber, WebConfig
 #: backend/web/app.py -> backend/web -> backend -> project root
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 logger = logging.getLogger(__name__)
+MAX_WS_MESSAGE_BYTES = 4 * 1024
+REPORT_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'none'; style-src 'unsafe-inline'; sandbox; "
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    ),
+}
 
 
 def create_app(
@@ -83,12 +90,19 @@ def create_app(
     async def report() -> Response:
         """Serve the last Sprint 10 report without generating it in a request."""
         try:
-            html = await asyncio.to_thread(pipeline.report_path.read_text, encoding="utf-8")
+            html = await asyncio.to_thread(_read_saved_report, pipeline)
         except (FileNotFoundError, IsADirectoryError):
             return PlainTextResponse(
-                "relatório ainda não gerado — rode scripts/report.py", status_code=404
+                "relatório ainda não gerado — rode scripts/report.py",
+                status_code=404,
+                headers=REPORT_HEADERS,
             )
-        return HTMLResponse(html)
+        except (OSError, UnicodeError):
+            logger.exception("Could not read the saved report")
+            return PlainTextResponse(
+                "Não foi possível ler o relatório salvo.", status_code=500, headers=REPORT_HEADERS
+            )
+        return HTMLResponse(html, headers=REPORT_HEADERS)
 
     @app.websocket("/ws")
     async def stream(websocket: WebSocket) -> None:
@@ -148,6 +162,13 @@ def create_app(
     return app
 
 
+def _read_saved_report(pipeline: PipelineRunner) -> str:
+    path = pipeline.safe_report_path()
+    if path is None:
+        raise FileNotFoundError
+    return path.read_text(encoding="utf-8")
+
+
 async def _write_frames(websocket: WebSocket, subscriber: Subscriber) -> None:
     """Forward messages until the pipeline reports a fatal error."""
     while True:
@@ -155,6 +176,10 @@ async def _write_frames(websocket: WebSocket, subscriber: Subscriber) -> None:
         await websocket.send_json(message)
         if message.get("type") == "error" and message.get("fatal"):
             return
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
 
 
 async def _read_client_messages(
@@ -172,11 +197,18 @@ async def _read_client_messages(
             return
         raw = message.get("text")
         if not isinstance(raw, str):
-            logger.debug("ignoring non-text WebSocket message")
+            binary = message.get("bytes")
+            if binary is not None and len(binary) > MAX_WS_MESSAGE_BYTES:
+                logger.warning("Ignoring oversized binary WebSocket message")
+            else:
+                logger.debug("Ignoring non-text WebSocket message")
             continue
         try:
-            command = json.loads(raw)
-        except json.JSONDecodeError:
+            if len(raw) > MAX_WS_MESSAGE_BYTES or len(raw.encode("utf-8")) > MAX_WS_MESSAGE_BYTES:
+                logger.warning("Ignoring oversized text WebSocket message")
+                continue
+            command = json.loads(raw, parse_constant=_reject_json_constant)
+        except (ValueError, RecursionError):
             logger.debug("ignoring invalid JSON WebSocket message")
             continue
         if not isinstance(command, dict):
@@ -185,11 +217,7 @@ async def _read_client_messages(
 
         command_type = command.get("type")
         if command_type == "record_start":
-            label = command.get("label")
-            if not isinstance(label, str):
-                logger.debug("ignoring malformed record_start message")
-                continue
-            pipeline.record_start(label, subscriber)
+            pipeline.record_start(command.get("label"), subscriber)
         elif command_type == "record_stop":
             pipeline.record_stop(subscriber)
         else:

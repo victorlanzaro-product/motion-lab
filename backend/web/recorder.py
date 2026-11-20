@@ -8,6 +8,8 @@ two tabs cannot win a start race, then hands every file operation to
 
 from __future__ import annotations
 
+import errno
+import logging
 import secrets
 import threading
 import time
@@ -24,6 +26,25 @@ from backend.dataset.writer import (
 )
 from backend.features.features import FrameFeatures
 from backend.features.velocity import MotionState
+
+
+logger = logging.getLogger(__name__)
+
+INVALID_RECORD_LABEL = "Informe um rótulo de gravação válido."
+
+
+def validate_record_label(label: object) -> str:
+    if not isinstance(label, str):
+        raise DatasetWriterError(INVALID_RECORD_LABEL)
+    return validate_label(label)
+
+
+def _file_error(message: str, exc: Exception) -> str:
+    if isinstance(exc, PermissionError):
+        return f"{message} Verifique a permissão de acesso ao arquivo de gravação."
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return f"{message} Não há espaço livre para gravar."
+    return message
 
 
 class Recorder:
@@ -58,7 +79,7 @@ class Recorder:
         # Only the pipeline thread reads or writes this handle.
         self._writer: Optional[DatasetWriter] = None
 
-    def request_start(self, label: str, owner: Any) -> dict[str, Any]:
+    def request_start(self, label: object, owner: Any) -> dict[str, Any]:
         """Reserve a new session and enqueue its writer open for the pipeline.
 
         Label validation is pure and shared with ``DatasetWriter``. It happens
@@ -66,21 +87,22 @@ class Recorder:
         create the dataset file.
         """
         try:
-            clean_label = validate_label(label)
-        except DatasetWriterError as exc:
+            clean_label = validate_record_label(label)
+        except DatasetWriterError:
             with self._lock:
-                return self._snapshot_locked(error=str(exc))
+                return self._snapshot_locked(error=INVALID_RECORD_LABEL)
 
         with self._lock:
             if self._recording:
-                return self._snapshot_locked(error="A recording is already active.")
+                return self._snapshot_locked(error="Já há uma gravação em andamento.")
 
             # Session generation runs on the event loop; keep even a broken
             # randomness source from escaping and closing this WebSocket.
             try:
                 session_id = self._new_session_id()
-            except Exception as exc:  # noqa: BLE001
-                return self._snapshot_locked(error=self._describe_error(exc))
+            except Exception:  # noqa: BLE001
+                logger.exception("Could not allocate recording session ID")
+                return self._snapshot_locked(error="Não foi possível criar a sessão de gravação.")
             self._recording = True
             self._label = clean_label
             self._session_id = session_id
@@ -96,10 +118,10 @@ class Recorder:
         """Queue a stop only for the owning tab; return a requester-only error."""
         with self._lock:
             if not self._recording:
-                return self._snapshot_locked(error="No recording is active.")
+                return self._snapshot_locked(error="Nenhuma gravação está em andamento.")
             if owner is not self._owner:
                 return self._snapshot_locked(
-                    error="Only the tab that started this recording can stop it."
+                    error="Somente a aba que iniciou a gravação pode encerrá-la."
                 )
             self._queue_stop_locked()
             return None
@@ -139,12 +161,19 @@ class Recorder:
                     writer.open()
                     self._writer = writer
                 except Exception as exc:  # noqa: BLE001 - optional layer boundary
-                    error = self._describe_error(exc)
+                    logger.exception("Could not open dataset for recording")
                     if writer is not None:
                         try:
                             writer.close()
-                        except Exception as close_exc:  # noqa: BLE001 - contain teardown
-                            error = f"{error}; close failed: {self._describe_error(close_exc)}"
+                        except Exception:  # noqa: BLE001 - contain teardown
+                            logger.exception("Could not close dataset after open failed")
+                    if isinstance(exc, DatasetWriterError):
+                        error = (
+                            "O arquivo de gravação tem colunas incompatíveis. "
+                            "Mova ou renomeie o arquivo antes de tentar de novo."
+                        )
+                    else:
+                        error = _file_error("Não foi possível abrir o arquivo de gravação.", exc)
                     return self._finish_on_pipeline_thread(error)
             elif command == "stop":
                 return self._finish_on_pipeline_thread()
@@ -159,7 +188,10 @@ class Recorder:
         try:
             written = self._writer.write(label, features, motion)
         except Exception as exc:  # noqa: BLE001 - optional layer boundary
-            return self._finish_on_pipeline_thread(self._describe_error(exc))
+            logger.exception("Could not write dataset frame")
+            return self._finish_on_pipeline_thread(
+                _file_error("Não foi possível salvar o quadro da gravação.", exc)
+            )
 
         with self._lock:
             # A frame has only one pipeline writer, so this session cannot
@@ -175,6 +207,14 @@ class Recorder:
         """Return the current state; an idle snapshot has no old session data."""
         with self._lock:
             return self._snapshot_locked()
+
+    def status_for(self, owner: Any, error: Optional[str] = None) -> dict[str, Any]:
+        """Capture status and ownership together for a single subscriber."""
+        with self._lock:
+            return {
+                **self._snapshot_locked(error=error),
+                "owner": self._recording and owner is self._owner,
+            }
 
     def status_if_due(self) -> Optional[dict[str, Any]]:
         """Return live counts no more often than the wire contract permits."""
@@ -226,7 +266,8 @@ class Recorder:
             try:
                 writer.close()
             except Exception as exc:  # noqa: BLE001 - contain optional teardown
-                close_error = self._describe_error(exc)
+                logger.exception("Could not close recording dataset")
+                close_error = _file_error("Não foi possível fechar o arquivo de gravação.", exc)
 
         with self._lock:
             final_error = error or close_error
@@ -266,7 +307,3 @@ class Recorder:
             "skipped": 0,
             "error": error,
         }
-
-    @staticmethod
-    def _describe_error(exc: Exception) -> str:
-        return str(exc) or f"{type(exc).__name__} while recording the dataset."

@@ -39,6 +39,7 @@ from backend.ml import (
     render_report,
 )
 from backend.web import WebConfig, create_app
+from backend.web.pipeline import default_report_path
 
 
 def free_port() -> int:
@@ -61,7 +62,7 @@ async def pull_session(url: str, duration_s: float, timeout: float) -> dict[str,
         while time.perf_counter() < deadline:
             raw = await asyncio.wait_for(connection.recv(), timeout)
             message = json.loads(raw)
-            if message.get("type") == "error":
+            if message.get("type") == "error" and message.get("fatal", True):
                 return {"error": message.get("message", "unknown pipeline error")}
             if message.get("type") == "frame":
                 frames.append(message)
@@ -125,7 +126,7 @@ def main() -> int:
         description="Render the Motion Lab metrics + explainability report."
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
-    parser.add_argument("--out", type=Path, default=None, help="default: <model>.report.html")
+    parser.add_argument("--out", type=Path, default=None, help="default: data/training/<model-stem>.report.html")
     parser.add_argument("--seconds", type=float, default=8.0, help="live sampling window")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=1280)
@@ -166,9 +167,9 @@ def main() -> int:
             live = summarize_live(result["frames"], GestureConfig().open_threshold)
             print(f"Sampled {live['frames']} frames." if live else "No frames arrived in time.")
 
-    out_path = args.out or args.model.with_name(args.model.stem + ".report.html")
+    out_path = args.out or default_report_path(args.model)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(render_report(training, live))
+    out_path.write_text(render_report(training, live), encoding="utf-8")
 
     print(f"\naccuracy   {training['accuracy'] * 100:.1f}%  ({training['n_samples']} samples)")
     if live and live["agreement"]["rate"] is not None:

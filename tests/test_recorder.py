@@ -157,10 +157,7 @@ def test_repeated_session_id_suffix_collision_returns_error_without_hanging(
         "session_id": None,
         "written": 0,
         "skipped": 0,
-        "error": (
-            "Could not generate a unique Recorder session ID suffix after "
-            f"{Recorder.SESSION_SUFFIX_ATTEMPTS} attempts."
-        ),
+        "error": "Não foi possível criar a sessão de gravação.",
     }
     assert not path.exists()
 
@@ -175,13 +172,13 @@ def test_session_id_suffix_space_exhaustion_returns_error(tmp_path: Path, monkey
     assert rejected["label"] is None
     assert rejected["session_id"] is None
     assert rejected["written"] == rejected["skipped"] == 0
-    assert rejected["error"] == "Recorder session ID suffix space is exhausted."
+    assert rejected["error"] == "Não foi possível criar a sessão de gravação."
     assert recorder.status()["recording"] is False
     assert not (tmp_path / "dataset.csv").exists()
 
 
 def test_session_id_generator_exception_becomes_a_rejection(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, caplog
 ):
     def fail(_bytes):
         raise OSError("secure randomness unavailable")
@@ -194,27 +191,20 @@ def test_session_id_generator_exception_becomes_a_rejection(
     assert rejected["recording"] is False
     assert rejected["label"] is None
     assert rejected["session_id"] is None
-    assert rejected["error"] == "secure randomness unavailable"
+    assert rejected["error"] == "Não foi possível criar a sessão de gravação."
+    assert "secure randomness unavailable" in caplog.text
     assert not (tmp_path / "dataset.csv").exists()
 
 
-@pytest.mark.parametrize(
-    ("label", "message"),
-    [
-        ("wave", REMOVED_LABELS["wave"]),
-        ("unknown_pose", "is not a recognized label"),
-    ],
-)
-def test_invalid_labels_are_rejected_before_file_open(
-    tmp_path: Path, label: str, message: str
-):
+@pytest.mark.parametrize("label", [None, 1, "", *REMOVED_LABELS, "unknown_pose"])
+def test_invalid_labels_are_rejected_before_file_open(tmp_path: Path, label: object):
     path = tmp_path / "dataset.csv"
     recorder = Recorder(path)
 
     rejected = recorder.request_start(label, object())
 
     assert rejected["recording"] is False
-    assert message in rejected["error"]
+    assert rejected["error"] == "Informe um rótulo de gravação válido."
     assert not path.exists()
     assert recorder.status()["recording"] is False
 
@@ -227,10 +217,10 @@ def test_only_one_start_and_only_owner_can_stop(tmp_path: Path):
     started = recorder.request_start("idle", owner)
     assert started["error"] is None
     conflict = recorder.request_start("arms_open", other)
-    assert "already active" in conflict["error"]
+    assert conflict["error"] == "Já há uma gravação em andamento."
     denied = recorder.request_stop(other)
     assert denied is not None
-    assert "Only the tab" in denied["error"]
+    assert denied["error"] == "Somente a aba que iniciou a gravação pode encerrá-la."
 
     features, motion = frame(0)
     recorder.record_frame(features, motion)
@@ -253,6 +243,23 @@ def test_owner_disconnect_queues_a_final_stop(tmp_path: Path):
     stopped = recorder.record_frame(features, motion)
     assert stopped["recording"] is False
     assert stopped["label"] == "idle"
+
+
+def test_incompatible_dataset_header_explains_why_recording_could_not_start(tmp_path, caplog):
+    path = tmp_path / "dataset.csv"
+    path.write_text("old,header\n")
+    recorder = Recorder(path)
+    recorder.request_start("idle", object())
+
+    failed = recorder.record_frame(*frame(1))
+
+    assert failed["recording"] is False
+    assert failed["error"] == (
+        "O arquivo de gravação tem colunas incompatíveis. "
+        "Mova ou renomeie o arquivo antes de tentar de novo."
+    )
+    assert path.read_text() == "old,header\n"
+    assert str(path) in caplog.text
 
 
 def test_writer_failure_closes_recording_and_becomes_status(tmp_path: Path):
@@ -282,7 +289,7 @@ def test_writer_failure_closes_recording_and_becomes_status(tmp_path: Path):
     failed = recorder.record_frame(features, motion)
 
     assert failed["recording"] is False
-    assert failed["error"] == "forced write failure"
+    assert failed["error"] == "Não foi possível salvar o quadro da gravação."
     assert recorder.status()["recording"] is False
     assert closed == [True]
 
