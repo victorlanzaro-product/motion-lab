@@ -109,6 +109,31 @@ class DatasetWriterError(RuntimeError):
     `skipped`/`FrameFeatures.complete` already models (an occluded joint)."""
 
 
+def validate_label(label: str) -> str:
+    """Return the canonical label or raise the writer's own explanation.
+
+    The browser must reject a bad label before opening the shared CSV. Keeping
+    this check beside `DatasetWriter.write` gives the recorder the same label
+    vocabulary and error wording without creating a second validation rule.
+    """
+    label = (label or "").strip()
+    if not label:
+        raise DatasetWriterError("label must be a non-empty string.")
+    if label in REMOVED_LABELS:
+        raise DatasetWriterError(REMOVED_LABELS[label])
+    if label not in DEFAULT_LABELS:
+        casefolded = label.casefold()
+        match = next((known for known in DEFAULT_LABELS if known.casefold() == casefolded), None)
+        hint = f" Did you mean {match!r}? Labels are case-sensitive." if match else ""
+        raise DatasetWriterError(
+            f"{label!r} is not a recognized label -- DatasetWriter only accepts "
+            f"{DEFAULT_LABELS} (whitespace already stripped, case must match "
+            f"exactly).{hint} A genuinely new class needs a product decision to "
+            "add it to backend/dataset/writer.py:DEFAULT_LABELS first."
+        )
+    return label
+
+
 def _row(session_id: str, label: str, features: FrameFeatures, motion: MotionState) -> dict:
     row: dict = {
         "session_id": session_id,
@@ -205,21 +230,7 @@ class DatasetWriter:
                 "grouped train/test split (backend/ml/train.py) to mean anything "
                 "-- set writer.session_id before writing."
             )
-        label = (label or "").strip()
-        if not label:
-            raise DatasetWriterError("label must be a non-empty string.")
-        if label in REMOVED_LABELS:
-            raise DatasetWriterError(REMOVED_LABELS[label])
-        if label not in DEFAULT_LABELS:
-            casefolded = label.casefold()
-            match = next((known for known in DEFAULT_LABELS if known.casefold() == casefolded), None)
-            hint = f" Did you mean {match!r}? Labels are case-sensitive." if match else ""
-            raise DatasetWriterError(
-                f"{label!r} is not a recognized label -- DatasetWriter only accepts "
-                f"{DEFAULT_LABELS} (whitespace already stripped, case must match "
-                f"exactly).{hint} A genuinely new class needs a product decision to "
-                "add it to backend/dataset/writer.py:DEFAULT_LABELS first."
-            )
+        label = validate_label(label)
         if features.frame_index != motion.frame_index or features.timestamp != motion.timestamp:
             raise DatasetWriterError(
                 f"features (frame {features.frame_index} @ {features.timestamp}) and "

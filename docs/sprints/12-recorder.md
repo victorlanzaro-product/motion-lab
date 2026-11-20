@@ -50,7 +50,16 @@ continua aberta. Os toggles visuais seguem 100% client-side como hoje.
   "error": null }
 ```
 
-- `owner`: `true` só na aba que iniciou a gravação (calculado por subscriber).
+- `owner`: `true` só na aba que é dona da gravação **ativa** (calculado por
+  subscriber). Sem gravação ativa, `owner` é sempre `false` — inclusive numa
+  rejeição (rótulo inválido/`wave` com o servidor ocioso:
+  `{recording:false, label:null, session_id:null, owner:false, error:"..."}`).
+  `recording`/`label`/`session_id` numa rejeição sempre refletem o estado real
+  do servidor, nunca o pedido recusado.
+- Rejeições (regras 1, 2, 4) vão **só** para o solicitante; o frontend trata
+  `error != null` como mensagem para esta aba e **não** deve usar uma rejeição
+  para apagar/alterar o estado de gravação de outra aba (o estado vem dos
+  campos `recording`/`label`/`session_id`, que são verdadeiros).
 - `label`/`session_id`: `null` quando `recording=false`, **exceto** na mensagem
   de parada, que mantém os valores da sessão que acabou de fechar + contagens
   finais (o painel mostra o resumo).
