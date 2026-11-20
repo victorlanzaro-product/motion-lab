@@ -16,14 +16,16 @@ from typing import Any, Deque, Optional
 
 from backend.features.features import FrameFeatures
 
+DEFAULT_WINDOW_DEADBAND = 0.35
+
 
 @dataclass(frozen=True)
 class ArmWindowFeatures:
     """Summary for one wrist over a complete window.
 
-    Heights and 2D speeds are in shoulder widths and shoulder widths per
-    second, respectively. ``moving_fraction`` is a fraction of elapsed time
-    rather than frames.
+    Heights and speeds are in shoulder widths and shoulder widths per second,
+    respectively. ``moving_fraction`` is a fraction of elapsed time rather
+    than frames.
     """
 
     mean_wrist_height: float
@@ -31,17 +33,18 @@ class ArmWindowFeatures:
     range_wrist_height: float
     direction_reversals: int
     max_speed: float
+    max_vertical_speed: float
     moving_fraction: float
 
 
 @dataclass(frozen=True)
 class WindowState:
-    """Both arms' temporal features at the end of a valid window."""
+    """Per-arm temporal features; either side may be unavailable."""
 
     timestamp: float
     window_seconds: float
-    left: ArmWindowFeatures
-    right: ArmWindowFeatures
+    left: Optional[ArmWindowFeatures]
+    right: Optional[ArmWindowFeatures]
 
 
 @dataclass(frozen=True)
@@ -61,10 +64,12 @@ class WindowFeatures:
     mapping such as one returned by ``csv.DictReader``. It reads wrist height
     and horizontal offset for both arms, deriving 2D speed from their changes.
     It returns a :class:`WindowState` only after a complete time window and
-    ``min_samples`` observations are available. It returns ``None`` during
-    warm-up, after a gap larger than ``max_gap``, for out-of-order timestamps,
-    or when either arm's height or offset is missing. Missing joints clear
-    continuity; they are never interpreted as height zero.
+    ``min_samples`` observations are available for at least one arm. It
+    returns ``None`` during warm-up while neither arm has a complete window.
+    Each arm has independent continuity: a gap, out-of-order timestamp, or
+    missing height/offset clears only that arm's history, and its result is
+    ``None`` until coverage recovers. Missing joints are never interpreted as
+    zero.
 
     2D speeds are computed from height and horizontal-offset slopes between
     observations in shoulder widths per second. Direction reversals use the
@@ -79,7 +84,7 @@ class WindowFeatures:
         window_seconds: float = 1.0,
         max_gap: float = 0.30,
         min_samples: int = 4,
-        deadband: float = 0.35,
+        deadband: float = DEFAULT_WINDOW_DEADBAND,
     ) -> None:
         if not math.isfinite(window_seconds) or window_seconds <= 0:
             raise ValueError("window_seconds must be a finite positive number")
@@ -94,11 +99,15 @@ class WindowFeatures:
         self.max_gap = float(max_gap)
         self.min_samples = int(min_samples)
         self.deadband = float(deadband)
-        self._samples: Deque[tuple[float, float, float, float, float]] = deque()
+        self._samples: dict[str, Deque[tuple[float, float, float]]] = {
+            "left": deque(),
+            "right": deque(),
+        }
 
     def reset(self) -> None:
         """Forget history after a session boundary or unusable observation."""
-        self._samples.clear()
+        for samples in self._samples.values():
+            samples.clear()
 
     def push(
         self,
@@ -107,60 +116,25 @@ class WindowFeatures:
     ) -> Optional[WindowState]:
         """Add one observation and return its valid trailing window, if ready.
 
-        ``features`` must provide each arm's ``wrist_height`` and
-        ``wrist_offset_x``. A missing or non-finite value clears both arms'
-        history, so a result cannot imply that an occluded arm was still or at
-        height zero. A timestamp gap greater than ``max_gap`` also clears
-        history and starts a new warm-up at the current observation.
+        ``features`` provides each arm's ``wrist_height`` and ``wrist_offset_x``.
+        A missing or non-finite value clears only that arm's history. The other
+        arm continues independently, so a wrist outside the frame does not
+        invalidate a visible wrist. Missing joints are never treated as zero.
         """
         try:
             now = float(timestamp)
-            left_height = _read_height(features, "left_wrist_height")
-            left_offset = _read_height(features, "left_wrist_offset_x")
-            right_height = _read_height(features, "right_wrist_height")
-            right_offset = _read_height(features, "right_wrist_offset_x")
-        except (AttributeError, TypeError, ValueError, OverflowError):
+        except (TypeError, ValueError, OverflowError):
             self.reset()
             return None
 
-        if (
-            not math.isfinite(now)
-            or left_height is None
-            or left_offset is None
-            or right_height is None
-            or right_offset is None
-            or not math.isfinite(left_height)
-            or not math.isfinite(left_offset)
-            or not math.isfinite(right_height)
-            or not math.isfinite(right_offset)
-        ):
+        if not math.isfinite(now):
             self.reset()
             return None
-
-        if self._samples:
-            previous_timestamp = self._samples[-1][0]
-            elapsed = now - previous_timestamp
-            if elapsed <= 0 or elapsed > self.max_gap:
-                # Do not join data across a restart, duplicate timestamp, or
-                # blackout. The current observation begins a fresh history.
-                self.reset()
-
-        self._samples.append((now, left_height, left_offset, right_height, right_offset))
-        self._prune(now)
 
         cutoff = now - self.window_seconds
-        # Retain one point before the cutoff for interpolation. Requiring a
-        # real observation at or before the cutoff prevents partial windows
-        # from being reported as a full N-second summary.
-        if (
-            sum(sample[0] >= cutoff for sample in self._samples) < self.min_samples
-            or self._samples[0][0] > cutoff
-        ):
-            return None
-
-        left = self._summarize(cutoff, now, 1, 2)
-        right = self._summarize(cutoff, now, 3, 4)
-        if left is None or right is None:
+        left = self._push_arm("left", now, _read_pair(features, "left"), cutoff)
+        right = self._push_arm("right", now, _read_pair(features, "right"), cutoff)
+        if left is None and right is None:
             return None
         return WindowState(
             timestamp=now,
@@ -169,19 +143,51 @@ class WindowFeatures:
             right=right,
         )
 
-    def _prune(self, now: float) -> None:
+    def _push_arm(
+        self,
+        side: str,
+        now: float,
+        measurement: Optional[tuple[float, float]],
+        cutoff: float,
+    ) -> Optional[ArmWindowFeatures]:
+        samples = self._samples[side]
+        if measurement is None:
+            samples.clear()
+            return None
+
+        if samples:
+            elapsed = now - samples[-1][0]
+            if elapsed <= 0 or elapsed > self.max_gap:
+                # Do not bridge a clock restart, duplicate timestamp, or
+                # blackout. The unaffected arm keeps its own history.
+                samples.clear()
+
+        height, offset = measurement
+        samples.append((now, height, offset))
+        self._prune(samples, now)
+
+        # Retain one point before the cutoff for interpolation. Requiring a
+        # real observation at or before the cutoff prevents partial windows
+        # from being reported as a full N-second summary.
+        if (
+            sum(sample[0] >= cutoff for sample in samples) < self.min_samples
+            or samples[0][0] > cutoff
+        ):
+            return None
+        return self._summarize(samples, cutoff, now)
+
+    def _prune(self, samples: Deque[tuple[float, float, float]], now: float) -> None:
         cutoff = now - self.window_seconds
-        while len(self._samples) > 2 and self._samples[1][0] < cutoff:
-            self._samples.popleft()
+        while len(samples) > 2 and samples[1][0] < cutoff:
+            samples.popleft()
 
     def _summarize(
         self,
+        samples: Deque[tuple[float, float, float]],
         cutoff: float,
         end: float,
-        height_index: int,
-        offset_index: int,
     ) -> Optional[ArmWindowFeatures]:
-        points = list(self._samples)
+        points = list(samples)
         if len(points) < 2 or points[0][0] > cutoff or points[-1][0] < end:
             return None
 
@@ -191,15 +197,15 @@ class WindowFeatures:
         total = 0.0
         total_squared = 0.0
         max_speed = 0.0
+        max_vertical_speed = 0.0
         moving_seconds = 0.0
         reversals = 0
         previous_direction = 0
         values: list[float] = []
 
         for point0, point1 in zip(points, points[1:]):
-            t0, t1 = point0[0], point1[0]
-            y0, y1 = point0[height_index], point1[height_index]
-            x0, x1 = point0[offset_index], point1[offset_index]
+            t0, y0, x0 = point0
+            t1, y1, x1 = point1
             overlap_start = max(t0, cutoff)
             overlap_end = min(t1, end)
             if overlap_end <= overlap_start:
@@ -226,6 +232,7 @@ class WindowFeatures:
             values.extend((clipped_start, clipped_end))
 
             max_speed = max(max_speed, speed)
+            max_vertical_speed = max(max_vertical_speed, abs(vertical_speed))
             if speed > self.deadband:
                 moving_seconds += duration
             if abs(vertical_speed) > self.deadband:
@@ -246,6 +253,7 @@ class WindowFeatures:
             range_wrist_height=max(values) - min(values),
             direction_reversals=reversals,
             max_speed=max_speed,
+            max_vertical_speed=max_vertical_speed,
             moving_fraction=min(1.0, moving_seconds / duration),
         )
 
@@ -255,7 +263,7 @@ def rebuild_windows(
     window_seconds: float = 1.0,
     max_gap: float = 0.30,
     min_samples: int = 4,
-    deadband: float = 0.35,
+    deadband: float = DEFAULT_WINDOW_DEADBAND,
 ) -> list[WindowRow]:
     """Rebuild rolling windows from existing dataset CSV rows.
 
@@ -313,4 +321,19 @@ def _read_height(features: FrameFeatures | Mapping[str, Any], name: str) -> Opti
         value = getattr(features, name)
     if value is None or value == "":
         return None
-    return float(value)
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) else None
+
+
+def _read_pair(
+    features: FrameFeatures | Mapping[str, Any], side: str
+) -> Optional[tuple[float, float]]:
+    """Read one wrist's height and horizontal offset independently."""
+    try:
+        height = _read_height(features, f"{side}_wrist_height")
+        offset = _read_height(features, f"{side}_wrist_offset_x")
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    if height is None or offset is None:
+        return None
+    return height, offset

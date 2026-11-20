@@ -27,6 +27,7 @@ from backend.features.velocity import (
 )
 from backend.features.window import (
     ArmWindowFeatures,
+    DEFAULT_WINDOW_DEADBAND,
     WindowFeatures,
     WindowRow,
     WindowState,
@@ -39,6 +40,7 @@ __all__ = [
     "FEATURE_NAMES",
     "ArmMotion",
     "ArmWindowFeatures",
+    "DEFAULT_WINDOW_DEADBAND",
     "Direction",
     "FaceMotionState",
     "FaceMotionTracker",
