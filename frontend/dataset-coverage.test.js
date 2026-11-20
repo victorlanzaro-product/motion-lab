@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { buildCoverageView, DEFAULT_LABELS } = require("./dataset-coverage.js");
+const { buildCoverageView, DEFAULT_LABELS, coverageLabelOrder } = require("./dataset-coverage.js");
 
 const CONTRACT_SAMPLE = {
   path: "data/training/dataset.csv",
@@ -131,6 +131,44 @@ test("unknown_label in dropped keeps ready false and surfaces the maestro proble
   assert.equal(unknown.count, 5);
   assert.equal(unknown.title, "rótulo desconhecido");
   assert.ok(view.labels.every((row) => row.rows > 0));
+});
+
+const V2_STATS_EMPTY_WAVE = {
+  path: "data/training/dataset_v2.csv",
+  exists: true,
+  total_rows: 0,
+  usable_rows: 0,
+  dropped: {},
+  labels: {
+    arm_raised: { rows: 0, sessions: 0, seconds: 0.0 },
+    arms_crossed: { rows: 0, sessions: 0, seconds: 0.0 },
+    arms_open: { rows: 0, sessions: 0, seconds: 0.0 },
+    idle: { rows: 0, sessions: 0, seconds: 0.0 },
+    wave: { rows: 0, sessions: 0, seconds: 0.0 },
+  },
+  sessions: [],
+  min_sessions_per_label: 2,
+  ready: false,
+  problems: ["wave: 0 sessões (mínimo 2)"],
+};
+
+test("v2 stats include wave label bucket from the endpoint", () => {
+  const view = buildCoverageView(V2_STATS_EMPTY_WAVE);
+  assert.deepEqual(
+    view.labels.map((row) => row.key),
+    [...DEFAULT_LABELS, "wave"],
+  );
+  const wave = view.labels.find((row) => row.key === "wave");
+  assert.equal(wave.title, "aceno");
+  assert.equal(wave.sessions, 0);
+  assert.equal(wave.isEmpty, true);
+  assert.deepEqual(coverageLabelOrder(V2_STATS_EMPTY_WAVE), [...DEFAULT_LABELS, "wave"]);
+  assert.deepEqual(
+    coverageLabelOrder(V2_STATS_EMPTY_WAVE, {
+      coverageLabels: V2_STATS_EMPTY_WAVE.labels && Object.keys(V2_STATS_EMPTY_WAVE.labels),
+    }),
+    Object.keys(V2_STATS_EMPTY_WAVE.labels),
+  );
 });
 
 test("ready dataset uses ready badge", () => {
