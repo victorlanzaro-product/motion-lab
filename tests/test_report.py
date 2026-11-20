@@ -211,7 +211,7 @@ def test_report_compares_v1_and_v2_grouped_cv_side_by_side():
     assert "0.910 ± 0.030" in html
     assert "wave" in html and "1s · deadband 0.35" in html
     assert "Decisões S14 prontas para o README" in html
-    assert "Inferência ao vivo v2 pendente" in html
+    assert "Inferência ao vivo v2 implementada" in html
     assert "hello.model_schema" in html
 
 

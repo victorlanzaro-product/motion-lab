@@ -93,6 +93,7 @@ from backend.dataset.writer import (
     DEFAULT_LABELS,
     NUMERIC_MOTION_COLUMNS,
     REMOVED_LABELS,
+    V2_LABELS,
 )
 from backend.dataset.windows import WINDOW_TRAINING_COLUMNS, build_window_rows
 from backend.features.features import FEATURE_NAMES
@@ -100,10 +101,6 @@ from backend.features.window import DEFAULT_WINDOW_DEADBAND
 
 DEFAULT_MODEL_PATH = Path("backend/models/gesture_classifier.joblib")
 DEFAULT_V2_MODEL_PATH = Path("backend/models/gesture_classifier_v2.joblib")
-
-# `wave` is available only to schema 2, whose features include a temporal
-# window. Keep DatasetWriter/DEFAULT_LABELS/REMOVED_LABELS v1-compatible.
-V2_LABELS: tuple[str, ...] = DEFAULT_LABELS + ("wave",)
 
 #: Below this many examples of a class, a train/test split cannot say anything
 #: trustworthy about it.
@@ -169,7 +166,9 @@ def build_vector(row: dict, columns: tuple[str, ...] = TRAINING_COLUMNS) -> list
     return [_to_number(row.get(name)) for name in columns]
 
 
-def classify_dataset_row(row: dict) -> tuple[str | None, list[float] | None]:
+def classify_dataset_row(
+    row: dict, allowed_labels: tuple[str, ...] = DEFAULT_LABELS
+) -> tuple[str | None, list[float] | None]:
     """Apply the row-level rules shared by training and dataset inspection.
 
     Stats needs to count an unknown label without treating it as a trainable
@@ -179,7 +178,7 @@ def classify_dataset_row(row: dict) -> tuple[str | None, list[float] | None]:
     label = (row.get("label") or "").strip()
     if not label:
         return "missing_label", None
-    if label not in DEFAULT_LABELS:
+    if label not in allowed_labels:
         return "unknown_label", None
     try:
         vector = build_vector(row)

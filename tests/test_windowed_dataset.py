@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 from backend.dataset.windows import (
     WINDOW_FEATURE_COLUMNS,
     WINDOW_TRAINING_COLUMNS,
+    build_window_input_row,
     build_window_rows,
 )
-from backend.features.features import FEATURE_NAMES
+from backend.features.features import FEATURE_NAMES, FrameFeatures
+from backend.features.window import WindowFeatures
 
 
 def _row(session: str, index: int, timestamp: float, height: float, label: str) -> dict:
@@ -80,6 +83,30 @@ def test_warmup_and_incomplete_wrist_windows_are_omitted_without_zero_filling():
     assert build_window_rows(
         rows, window_seconds=0.3, max_gap=0.2, min_samples=4
     ) == []
+
+
+def test_training_and_live_input_use_the_same_complete_window_row_builder():
+    rows = [_row("one", index, index / 10, 0.2 + index / 10, "wave") for index in range(4)]
+    tracker = WindowFeatures(window_seconds=0.3, max_gap=0.2, min_samples=4)
+    window = None
+    for row in rows:
+        window = tracker.push(float(row["timestamp"]), row)
+
+    batch_row = build_window_rows(
+        rows, window_seconds=0.3, max_gap=0.2, min_samples=4
+    )[0]
+    live_frame = FrameFeatures(
+        frame_index=3,
+        timestamp=0.3,
+        **{name: rows[-1][name] for name in FEATURE_NAMES},
+    )
+    live_row = build_window_input_row(live_frame, window)
+
+    assert live_row is not None
+    assert {name: live_row[name] for name in WINDOW_TRAINING_COLUMNS} == {
+        name: batch_row[name] for name in WINDOW_TRAINING_COLUMNS
+    }
+    assert build_window_input_row(live_frame, replace(window, right=None)) is None
 
     # A complete left wrist must not make an incomplete right-arm window look
     # like a measured zero.
