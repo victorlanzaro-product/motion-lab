@@ -14,6 +14,35 @@
 
   const DEFAULT_WINDOW_SECONDS = 30;
   const DEFAULT_MAX_POINTS = 3600;
+  const DEFAULT_MAX_GAP_SECONDS = 1.0; // same rule as face-history.js buildSegments
+
+  /**
+   * Splits confidence samples into drawable runs. Breaks on missing ML
+   * (`mlProbability` null) and on time gaps wider than `maxGapSeconds`,
+   * so the chart never bridges across stalled frames or reconnect pauses.
+   */
+  function buildProbabilityRuns(points, maxGapSeconds) {
+    const gap = typeof maxGapSeconds === "number" ? maxGapSeconds : DEFAULT_MAX_GAP_SECONDS;
+    const runs = [];
+    let current = [];
+    let prevT = null;
+    for (const point of points) {
+      if (point.mlProbability === null || point.mlProbability === undefined) {
+        if (current.length) runs.push(current);
+        current = [];
+        prevT = null;
+        continue;
+      }
+      if (prevT !== null && point.t - prevT > gap) {
+        if (current.length) runs.push(current);
+        current = [];
+      }
+      current.push(point);
+      prevT = point.t;
+    }
+    if (current.length) runs.push(current);
+    return runs;
+  }
 
   function extractMl(frame) {
     const ml = frame && frame.ml;
@@ -57,6 +86,7 @@
     const opts = options || {};
     const windowSeconds = opts.windowSeconds || DEFAULT_WINDOW_SECONDS;
     const maxPoints = opts.maxPoints || DEFAULT_MAX_POINTS;
+    const maxGapSeconds = opts.maxGapSeconds || DEFAULT_MAX_GAP_SECONDS;
 
     /** @type {{ t: number, mlLabel: string|null, mlProbability: number|null, ruleLabel: string|null, agreement: boolean|null }[]} */
     const samples = [];
@@ -135,21 +165,29 @@
       return compared > 0 ? matches / compared : null;
     }
 
+    function probabilityRuns(now) {
+      return buildProbabilityRuns(series(now), maxGapSeconds);
+    }
+
     return {
       push,
       series,
       agreementRate,
+      probabilityRuns,
       clear,
       windowSeconds,
+      maxGapSeconds,
       now: () => lastT,
     };
   }
 
   const ConfidenceTimeline = {
     createTimeline,
+    buildProbabilityRuns,
     extractMl,
     extractRuleLabel,
     agreementBetween,
+    DEFAULT_MAX_GAP_SECONDS,
   };
 
   if (typeof module !== "undefined" && module.exports) {
