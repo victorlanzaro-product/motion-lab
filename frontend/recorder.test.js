@@ -39,14 +39,25 @@ const STOP_SUMMARY = {
   error: null,
 };
 
-const START_REJECTED = {
+const IDLE_REJECTION = {
   type: "record_status",
   recording: false,
   label: null,
   session_id: null,
   written: 0,
   skipped: 0,
-  owner: true,
+  owner: false,
+  error: "gravacao ja em andamento",
+};
+
+const LIVE_STATE_REJECTION = {
+  type: "record_status",
+  recording: true,
+  label: "arm_raised",
+  session_id: "web-20261119-153012-a1b2c3",
+  written: 42,
+  skipped: 3,
+  owner: false,
   error: "gravacao ja em andamento",
 };
 
@@ -100,9 +111,10 @@ test("error from record_status is exposed in snapshot", () => {
   recorder.setLabels(CONTRACT_LABELS);
   recorder.beginStart("idle", 0);
   recorder.tick(0);
-  recorder.applyStatus(START_REJECTED);
+  recorder.applyStatus(IDLE_REJECTION);
   const view = recorder.snapshot();
   assert.equal(view.status.error, "gravacao ja em andamento");
+  assert.equal(view.status.owner, false);
   assert.equal(view.showRecordingBanner, false);
 });
 
@@ -116,6 +128,60 @@ test("cancel countdown sends nothing on the wire", () => {
   assert.deepEqual(recorder.drainOutbound(), []);
   assert.equal(recorder.tick(t0 + DEFAULT_COUNTDOWN_SECONDS * 1000).length, 0);
   assert.equal(recorder.snapshot().phase, "idle");
+});
+
+test("hello then record_status on reconnect keeps GRAVANDO without a gap", () => {
+  const recorder = createRecorder();
+  recorder.setLabels(CONTRACT_LABELS);
+  recorder.applyStatus(REMOTE_RECORDING);
+  recorder.onWebSocketReconnect();
+  const afterHello = recorder.snapshot();
+  assert.equal(afterHello.showRecordingBanner, true);
+  assert.equal(afterHello.isRemoteRecording, true);
+  recorder.applyStatus(REMOTE_RECORDING);
+  const confirmed = recorder.snapshot();
+  assert.equal(confirmed.showRecordingBanner, true);
+  assert.equal(confirmed.status.written, 42);
+  assert.equal(confirmed.status.label, "arm_raised");
+});
+
+test("idle rejection does not clear another tab's live recording", () => {
+  const recorder = createRecorder();
+  recorder.setLabels(CONTRACT_LABELS);
+  recorder.applyStatus(REMOTE_RECORDING);
+  const result = recorder.applyStatus(IDLE_REJECTION);
+  assert.equal(result.ignored, true);
+  const view = recorder.snapshot();
+  assert.equal(view.showRecordingBanner, true);
+  assert.equal(view.isRemoteRecording, true);
+  assert.equal(view.status.label, "arm_raised");
+  assert.equal(view.status.session_id, "web-20261119-153012-a1b2c3");
+  assert.equal(view.status.error, null);
+});
+
+test("idle rejection applies on an idle requester tab with owner false", () => {
+  const recorder = createRecorder({ countdownSeconds: 0 });
+  recorder.setLabels(CONTRACT_LABELS);
+  recorder.beginStart("idle", 0);
+  recorder.tick(0);
+  recorder.applyStatus(IDLE_REJECTION);
+  const view = recorder.snapshot();
+  assert.equal(view.status.error, "gravacao ja em andamento");
+  assert.equal(view.status.owner, false);
+  assert.equal(view.showRecordingBanner, false);
+});
+
+test("rejection mirrors live server state when a session is already recording", () => {
+  const recorder = createRecorder({ countdownSeconds: 0 });
+  recorder.setLabels(CONTRACT_LABELS);
+  recorder.beginStart("idle", 0);
+  recorder.tick(0);
+  recorder.applyStatus(LIVE_STATE_REJECTION);
+  const view = recorder.snapshot();
+  assert.equal(view.status.error, "gravacao ja em andamento");
+  assert.equal(view.showRecordingBanner, true);
+  assert.equal(view.isRemoteRecording, true);
+  assert.equal(view.status.written, 42);
 });
 
 test("remote recording aborts an in-flight countdown without outbound", () => {
