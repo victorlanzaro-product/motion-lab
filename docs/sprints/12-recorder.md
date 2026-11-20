@@ -66,6 +66,10 @@ continua aberta. Os toggles visuais seguem 100% client-side como hoje.
 - `error`: `null`, ou texto legível quando a gravação foi recusada/abortada.
 - Enviado: na conexão (estado atual, logo após o `hello`), em toda mudança de
   estado, e no máximo a cada 0.25 s enquanto gravando (contagens).
+- A fila de controle tem limite de 64 mensagens por assinante. Contagens e
+  rejeições repetidas podem ser agrupadas. Transições, finais e erros fatais
+  têm prioridade. Se a fila estiver cheia apenas com mensagens prioritárias,
+  o servidor fecha o WebSocket com 1013. A reconexão recebe o estado atual.
 
 ### Regras
 
