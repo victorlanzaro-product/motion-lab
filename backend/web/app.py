@@ -27,7 +27,9 @@ from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
+from backend.dataset.stats import dataset_stats
 from backend.web.payload import hello_message
 from backend.web.pipeline import PipelineRunner, Subscriber, WebConfig
 
@@ -89,6 +91,15 @@ def create_app(
                 "relatório ainda não gerado — rode scripts/report.py", status_code=404
             )
         return HTMLResponse(html)
+
+    @app.get("/dataset/stats")
+    async def get_dataset_stats() -> dict:
+        """Read current local coverage without blocking the event loop.
+
+        The CSV is re-read on every request so coverage reflects the latest
+        recording; filesystem I/O runs in Starlette's worker thread pool.
+        """
+        return await run_in_threadpool(dataset_stats, pipeline.config.dataset_path)
 
     @app.websocket("/ws")
     async def stream(websocket: WebSocket) -> None:

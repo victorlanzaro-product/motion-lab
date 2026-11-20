@@ -114,8 +114,14 @@ def print_report(report) -> None:
     print(f"\ntrained   {report.trained_at}")
     counts = ", ".join(f"{k}={v}" for k, v in report.counts.items())
     print(f"samples   {report.n_samples}  {counts}")
+    cv = report.cv
+    print(
+        f"macro-F1  {cv['macro_f1_mean']:.3f} ± {cv['macro_f1_std']:.3f}  "
+        f"(grouped CV; {cv['folds_used']}/{cv['n_splits']} folds; "
+        f"{cv['folds_skipped']} skipped)"
+    )
     print(f"accuracy  {report.accuracy * 100:.1f}%  (held-out test split)")
-    print(f"macro-F1  {report.macro_f1:.3f}  (unweighted mean over classes)")
+    print(f"split F1  {report.macro_f1:.3f}  (held-out split detail)")
     print(f"balanced  {report.balanced_accuracy * 100:.1f}%  (balanced accuracy)")
     print(f"saved to  {report.model_path}")
     print("\ntop features:")
