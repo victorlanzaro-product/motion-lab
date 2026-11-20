@@ -20,6 +20,7 @@
     arms_crossed: "braços cruzados",
     arms_open: "braços abertos",
     idle: "parado",
+    wave: "aceno",
   });
 
   const DROPPED_REASON_TITLES = Object.freeze({
@@ -43,6 +44,17 @@
         count: Number(count),
         title: DROPPED_REASON_TITLES[reason] || reason.replaceAll("_", " "),
       }));
+  }
+
+  function coverageLabelOrder(stats, options) {
+    const opts = options || {};
+    if (Array.isArray(opts.coverageLabels) && opts.coverageLabels.length > 0) {
+      return opts.coverageLabels.slice();
+    }
+    const keys = stats && stats.labels && typeof stats.labels === "object" ? Object.keys(stats.labels) : [];
+    const ordered = DEFAULT_LABELS.filter((key) => keys.includes(key));
+    if (keys.includes("wave") && !ordered.includes("wave")) ordered.push("wave");
+    return ordered.length > 0 ? ordered : [...DEFAULT_LABELS];
   }
 
   function labelEntry(stats, key) {
@@ -85,7 +97,8 @@
     const ready = Boolean(stats.ready);
     const problems = Array.isArray(stats.problems) ? stats.problems.filter(Boolean) : [];
 
-    const labels = DEFAULT_LABELS.map((key) => {
+    const labelOrder = coverageLabelOrder(stats, opts);
+    const labels = labelOrder.map((key) => {
       const entry = labelEntry(stats, key);
       const belowMinimum = exists && minSessions > 0 && entry.sessions < minSessions;
       return {
@@ -139,6 +152,7 @@
     DEFAULT_LABELS,
     DEFAULT_LABEL_TITLES,
     DROPPED_REASON_TITLES,
+    coverageLabelOrder,
     buildCoverageView,
     formatSeconds,
   };
