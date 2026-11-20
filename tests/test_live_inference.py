@@ -166,7 +166,7 @@ def test_stream_clears_v2_window_history_after_pose_loss(tmp_path, monkeypatch):
                 detected=frame.detected,
                 frame_index=frame.frame_index,
                 timestamp=frame.timestamp,
-                    inference_ms=0.0,
+                inference_ms=0.0,
             )
 
     class Trail:
