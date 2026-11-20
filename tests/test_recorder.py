@@ -424,13 +424,211 @@ def test_stop_start_disconnect_race_keeps_new_session_disconnect_signal(tmp_path
         assert runner._owner_disconnected_session == second["session_id"]
 
         # This is the pipeline's post-record_frame cleanup for the older stop.
-        runner._clear_owner_disconnect_for(old_stop)
+        with runner._lock:
+            runner._clear_owner_disconnect_for_locked(old_stop["session_id"])
         assert runner._owner_disconnected_session == second["session_id"]
 
         # The zero-subscriber stream path must now close the newer reservation.
         runner._process_owner_disconnect()
         assert runner.recorder.status()["recording"] is False
         assert runner._owner_disconnected_session is None
+
+    asyncio.run(scenario())
+
+
+def test_stop_start_disconnect_publishes_sessions_in_linear_order(tmp_path: Path):
+    """A new reservation cannot overtake the prior session's final status."""
+
+    async def scenario():
+        runner = PipelineRunner(WebConfig(dataset_path=tmp_path / "ordered.csv"))
+        runner.state = "live"
+        runner._accept_record_starts = True
+        owner_a = Subscriber(asyncio.get_running_loop())
+        owner_b = Subscriber(asyncio.get_running_loop())
+        observer = Subscriber(asyncio.get_running_loop())
+        runner._subscribers.extend((owner_a, owner_b, observer))
+
+        start_a = runner.record_start("idle", owner_a)
+        assert start_a["error"] is None
+        observed_start_a = await asyncio.wait_for(observer.get(), timeout=1.0)
+        assert observed_start_a["session_id"] == start_a["session_id"]
+        assert observed_start_a["recording"] is True
+        owner_b_start_a = await asyncio.wait_for(owner_b.get(), timeout=1.0)
+        assert owner_b_start_a["session_id"] == start_a["session_id"]
+
+        assert runner.record_stop(owner_a) is None
+        frame_ready = threading.Event()
+        allow_frame = threading.Event()
+        final_a_ready = threading.Event()
+        allow_final_a_publish = threading.Event()
+        original_record_frame = runner.recorder.record_frame
+        original_status = runner.recorder.status
+
+        def pause_after_final_a(features, motion):
+            frame_ready.set()
+            if not allow_frame.wait(timeout=3.0):
+                raise TimeoutError("test did not release frame processing")
+            event = original_record_frame(features, motion)
+            if event is not None and event["session_id"] == start_a["session_id"]:
+                final_a_ready.set()
+                if not allow_final_a_publish.wait(timeout=3.0):
+                    raise TimeoutError("test did not release final A publication")
+            return event
+
+        runner.recorder.record_frame = pause_after_final_a
+        features, motion = frame(1)
+        frame_task = asyncio.create_task(
+            asyncio.to_thread(runner._record_and_publish_frame, features, motion)
+        )
+        try:
+            assert await asyncio.to_thread(frame_ready.wait, 3.0)
+
+            def active_snapshot_then_finish():
+                snapshot = original_status()
+                allow_frame.set()
+                if not final_a_ready.wait(timeout=3.0):
+                    raise TimeoutError("Recorder did not finalize A")
+                return snapshot
+
+            # The writer can finish while B validates an active snapshot.
+            # Even in that case, the closed gate must reject the reservation.
+            runner.recorder.status = active_snapshot_then_finish
+            try:
+                racing_b = runner.record_start("arms_open", owner_b)
+            finally:
+                runner.recorder.status = original_status
+            assert racing_b["recording"] is True
+            assert racing_b["session_id"] == start_a["session_id"]
+            assert racing_b["error"] == "A recording is already active."
+            assert await asyncio.wait_for(owner_b.get(), timeout=1.0) == racing_b | {
+                "type": "record_status",
+                "owner": False,
+            }
+            assert await asyncio.to_thread(final_a_ready.wait, 3.0)
+
+            # Recorder state has closed A, but the worker is paused before it
+            # can publish A-final. B must not be accepted into this gap.
+            early_b = runner.record_start("arms_open", owner_b)
+            assert early_b["recording"] is False
+            assert early_b["error"] is not None
+            assert runner._accept_record_starts is False
+            early_b_message = await asyncio.wait_for(owner_b.get(), timeout=1.0)
+            assert early_b_message["error"] is not None
+
+            allow_final_a_publish.set()
+            await frame_task
+            observed_final_a = await asyncio.wait_for(observer.get(), timeout=1.0)
+            assert observed_final_a["recording"] is False
+            assert observed_final_a["session_id"] == start_a["session_id"]
+
+            start_b = runner.record_start("arms_open", owner_b)
+            assert start_b["error"] is None
+            observed_start_b = await asyncio.wait_for(observer.get(), timeout=1.0)
+            assert observed_start_b["recording"] is True
+            assert observed_start_b["session_id"] == start_b["session_id"]
+
+            await asyncio.to_thread(
+                runner._record_and_publish_frame, features, motion
+            )  # open B's writer before the owner disconnects
+            runner.unsubscribe(owner_b)
+            assert runner._owner_disconnected_session == start_b["session_id"]
+            runner._process_owner_disconnect()
+            observed_final_b = await asyncio.wait_for(observer.get(), timeout=1.0)
+            assert observed_final_b["recording"] is False
+            assert observed_final_b["session_id"] == start_b["session_id"]
+
+            lifecycle = [
+                observed_start_a,
+                observed_final_a,
+                observed_start_b,
+                observed_final_b,
+            ]
+            assert [message["session_id"] for message in lifecycle] == [
+                start_a["session_id"],
+                start_a["session_id"],
+                start_b["session_id"],
+                start_b["session_id"],
+            ]
+            assert [message["recording"] for message in lifecycle] == [
+                True,
+                False,
+                True,
+                False,
+            ]
+        finally:
+            allow_frame.set()
+            allow_final_a_publish.set()
+            await asyncio.gather(frame_task, return_exceptions=True)
+            runner.stop()
+
+    asyncio.run(scenario())
+
+
+def test_idle_frame_defers_start_stop_commands_until_the_next_frame(tmp_path: Path):
+    """An idle check cannot consume a new session before its gate is closed."""
+
+    async def scenario():
+        runner = PipelineRunner(WebConfig(dataset_path=tmp_path / "idle-order.csv"))
+        runner.state = "live"
+        runner._accept_record_starts = True
+        owner_b = Subscriber(asyncio.get_running_loop())
+        owner_c = Subscriber(asyncio.get_running_loop())
+        observer = Subscriber(asyncio.get_running_loop())
+        runner._subscribers.extend((owner_b, owner_c, observer))
+
+        original_record_frame = runner.recorder.record_frame
+        record_frame_calls = []
+
+        def count_record_frames(features, motion):
+            record_frame_calls.append((features.frame_index, motion.frame_index))
+            return original_record_frame(features, motion)
+
+        runner.recorder.record_frame = count_record_frames
+        features, motion = frame(2)
+        try:
+            assert runner._record_and_publish_frame(features, motion) is None
+            assert record_frame_calls == []
+
+            start_b = runner.record_start("arms_open", owner_b)
+            assert start_b["error"] is None
+            observed_start_b = await asyncio.wait_for(observer.get(), timeout=1.0)
+            assert observed_start_b["recording"] is True
+            assert observed_start_b["session_id"] == start_b["session_id"]
+
+            assert runner.record_stop(owner_b) is None
+            early_c = runner.record_start("arms_crossed", owner_c)
+            assert early_c["error"] is not None
+            assert early_c["recording"] is True
+            assert early_c["session_id"] == start_b["session_id"]
+
+            await asyncio.to_thread(runner._record_and_publish_frame, features, motion)
+            assert len(record_frame_calls) == 1
+            observed_final_b = await asyncio.wait_for(observer.get(), timeout=1.0)
+            assert observed_final_b["recording"] is False
+            assert observed_final_b["session_id"] == start_b["session_id"]
+
+            start_c = runner.record_start("arms_crossed", owner_c)
+            assert start_c["error"] is None
+            observed_start_c = await asyncio.wait_for(observer.get(), timeout=1.0)
+            assert observed_start_c["recording"] is True
+            assert observed_start_c["session_id"] == start_c["session_id"]
+
+            lifecycle = [observed_start_b, observed_final_b, observed_start_c]
+            assert [message["session_id"] for message in lifecycle] == [
+                start_b["session_id"],
+                start_b["session_id"],
+                start_c["session_id"],
+            ]
+            assert [message["recording"] for message in lifecycle] == [
+                True,
+                False,
+                True,
+            ]
+
+            runner.unsubscribe(owner_c)
+            runner._process_owner_disconnect()
+        finally:
+            runner.stop()
 
     asyncio.run(scenario())
 
