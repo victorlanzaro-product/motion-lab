@@ -21,6 +21,7 @@ armazenado — apenas landmarks temporários, dados de treino e o modelo treinad
 | 10 | Motion Lab (métricas, explicabilidade) | ✅ pronto |
 | 11 | Reações Faciais (sinais observáveis, opt-in) | ✅ pronto |
 | 12 | Recorder (gravação de dataset pelo navegador) | ✅ pronto (checkpoint com câmera pendente) |
+| 13 | Cobertura do dataset e validação por sessão | Em validação com dataset real pendente |
 
 ## Setup
 
@@ -149,6 +150,25 @@ segundo MediaPipe (Face Landmarker), e nunca é dependência de pose/gestos/ML.
 Regra de acoplamento: cada camada recebe o **dado** da anterior, nunca o handle dela.
 `CameraEngine` entrega `Frame`, não um `cv2.VideoCapture` — por isso trocar webcam por
 arquivo de vídeo não toca em nada do lado da visão.
+
+### Decisões do Sprint 13 — Cobertura e validação por sessão
+
+- O Recorder e `GET /dataset/stats` usam o mesmo `WebConfig.dataset_path`.
+  O endpoint lê o CSV fora do event loop e o painel exibe a cobertura
+  recebida, atualizando após o fim de uma sessão.
+- A CLI, o endpoint e o relatório compartilham o cálculo da cobertura.
+  Rótulos desconhecidos contam em `dropped.unknown_label`, impedem
+  `ready=true` e continuam sendo recusados pelo treino.
+- As dobras preservam sessões inteiras. O relatório mostra as dobras
+  usadas e descartadas, a média e o desvio de macro-F1 e a matriz do
+  split de diagnóstico.
+- O aceite usa `uv run python scripts/train_model.py --cv loso`, com uma
+  sessão por dobra. A métrica principal reúne as predições fora da amostra
+  antes de calcular o macro-F1 dos quatro rótulos. O split de diagnóstico
+  reserva ao menos uma sessão de cada rótulo de cada lado quando cada
+  gravação tem um único rótulo.
+- O resultado em dado real será preenchido após as 12 gravações do
+  [roteiro da S13](docs/sprints/13-roteiro-gravacao.md).
 
 ### Decisões do Sprint 12: gravar é um comando ao servidor, nunca um arquivo do navegador
 

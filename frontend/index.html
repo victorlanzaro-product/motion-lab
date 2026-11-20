@@ -230,6 +230,25 @@
                 </dl>
               </section>
             </section>
+
+            <section class="live-section" id="dataset-coverage-panel" aria-label="Cobertura do dataset de treino">
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">Dataset</p>
+                  <h2>Cobertura</h2>
+                </div>
+                <span class="badge coverage-badge" id="coverage-status-badge">carregando</span>
+              </div>
+              <p class="coverage-fetch-warning hidden" id="coverage-fetch-warning" role="status"></p>
+              <p class="coverage-summary" id="coverage-summary">Consultando estatísticas…</p>
+              <p class="coverage-path hidden" id="coverage-path"></p>
+              <ul class="coverage-problems hidden" id="coverage-problems" aria-label="Problemas de cobertura"></ul>
+              <div class="coverage-label-grid" id="coverage-label-grid" role="list" aria-label="Sessões por rótulo"></div>
+              <dl class="summary-row coverage-dropped hidden" id="coverage-dropped">
+                <dt>linhas descartadas</dt>
+                <dd id="coverage-dropped-detail">—</dd>
+              </dl>
+            </section>
           </section>
 
           <section
@@ -394,6 +413,7 @@
     <script src="/static/face-overlay.js"></script>
     <script src="/static/studio-controls.js"></script>
     <script src="/static/recorder.js"></script>
+    <script src="/static/dataset-coverage.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>
