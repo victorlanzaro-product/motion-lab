@@ -88,8 +88,29 @@
       return drainOutbound();
     }
 
+    function isIdleRejection(message) {
+      return (
+        message.error != null &&
+        !message.recording &&
+        message.label == null &&
+        message.session_id == null
+      );
+    }
+
     function applyStatus(message) {
       if (!message || message.type !== "record_status") return { ok: false };
+
+      // error != null => private to this tab; idle rejections must never stomp
+      // another tab's live remote-recording snapshot (defensive misdelivery).
+      if (isIdleRejection(message) && remoteRecording()) {
+        return {
+          ok: true,
+          ignored: true,
+          status: { ...status },
+          lastSummary: lastSummary ? { ...lastSummary } : null,
+        };
+      }
+
       status = {
         recording: Boolean(message.recording),
         label: message.label ?? null,
@@ -115,6 +136,11 @@
       }
 
       return { ok: true, status: { ...status }, lastSummary: lastSummary ? { ...lastSummary } : null };
+    }
+
+    function onWebSocketReconnect() {
+      if (phase === "countdown") resetCountdown();
+      return { ok: true };
     }
 
     function drainOutbound() {
@@ -152,6 +178,7 @@
       beginStop,
       tick,
       applyStatus,
+      onWebSocketReconnect,
       drainOutbound,
       snapshot,
       canStart,

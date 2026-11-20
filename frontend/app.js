@@ -98,6 +98,9 @@ function connect() {
   socket.onclose = () => {
     state.streaming = false;
     setStatus("off", "reconectando…");
+    stopRecorderCountdownTimer();
+    recorder.onWebSocketReconnect();
+    renderRecorder();
     // Exponential backoff, capped: the usual reason for a close is the server
     // restarting, and hammering it while it boots helps nobody.
     const delay = Math.min(5000, 500 * 2 ** state.retries);
@@ -119,6 +122,7 @@ function handle(message) {
       recorder.setLabels(message.record_labels);
       buildRecorderButtons(message.record_labels);
     }
+    renderRecorder();
     return;
   }
   if (message.type === "record_status") {
