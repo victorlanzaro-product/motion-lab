@@ -11,6 +11,7 @@ from backend.web.payload import (
     frame_message,
     hello_message,
     landmarks_payload,
+    record_status_message,
     status_message,
     trail_payload,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "frame_message",
     "hello_message",
     "landmarks_payload",
+    "record_status_message",
     "status_message",
     "trail_payload",
 ]

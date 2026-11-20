@@ -28,6 +28,7 @@ from backend.features.face_features import FaceSignals
 from backend.features.face_motion import FaceMotionState
 from backend.features.features import FEATURE_NAMES, FrameFeatures
 from backend.features.velocity import MotionState, Trail
+from backend.dataset.writer import DEFAULT_LABELS
 from backend.gestures.engine import GestureEvent
 from backend.vision.face_landmarks import (
     FACE_CHAIN_GROUPS,
@@ -320,6 +321,9 @@ def hello_message(
         "chains": [[int(a), int(b)] for a, b in ARM_CHAINS],
         "feature_names": list(FEATURE_NAMES),
         "gesture_names": list(GESTURE_NAMES),
+        # One source of truth for browser recording controls; keeping the
+        # vocabulary here prevents a frontend copy from drifting from the CSV.
+        "record_labels": list(DEFAULT_LABELS),
         # Empty when no model is trained yet -- the client's cue to show
         # "sem modelo treinado" instead of waiting for an "ml" field that
         # will never arrive non-null.
@@ -343,6 +347,33 @@ def hello_message(
         # client tell "this server's face overlay contract is different from
         # what I was built against" apart from "no topology sent at all".
         "face_mesh_version": FACE_MESH_CONTRACT_VERSION,
+    }
+
+
+def record_status_message(
+    *,
+    recording: bool,
+    label: Optional[str],
+    session_id: Optional[str],
+    written: int,
+    skipped: int,
+    owner: bool,
+    error: Optional[str],
+) -> dict[str, Any]:
+    """Build the recorder's shared WebSocket shape for status and errors.
+
+    The caller computes `owner` for each subscriber because the active session
+    is global to the server while ownership is private to one browser tab.
+    """
+    return {
+        "type": "record_status",
+        "recording": recording,
+        "label": label,
+        "session_id": session_id,
+        "written": written,
+        "skipped": skipped,
+        "owner": owner,
+        "error": error,
     }
 
 
