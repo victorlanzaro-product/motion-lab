@@ -89,6 +89,13 @@ Não tocar: `frontend/`, `README.md`, `docs/`, `backend/web/recorder.py`,
      passa a ser `macro_f1_mean ± macro_f1_std`. O split único antigo segue
      no relatório como detalhe (matriz de confusão).
    - Determinístico: mesma entrada → mesmo `cv`.
+   - **Decisão de integração:** mantenha GroupKFold como padrão do Sprint 13 e
+     ofereça `--cv loso` no CLI de treino para o aceite do roadmap. Nesse
+     modo, cada dobra segura uma sessão inteira. Registre o macro-F1 das
+     predições reunidas fora da amostra no conjunto fixo de quatro rótulos,
+     além do resumo e da contagem de dobras. Uma sessão pode ter só um rótulo,
+     então a média de F1 das dobras responde a uma pergunta diferente do
+     macro-F1 calculado sobre todas as sessões previstas.
 3. `report.py`: seções "Dataset" (por rótulo, sessões, problemas) e
    "Validação cruzada" (média ± desvio, por dobra). Sem dependência nova.
 4. `GET /dataset/stats` usando `WebConfig.dataset_path` (já existe no S12).
@@ -121,6 +128,7 @@ Roteiro: `docs/sprints/13-roteiro-gravacao.md`.
 
 - `uv run pytest -q` e `node --test frontend/` verdes.
 - `uv run python scripts/dataset_stats.py` no dataset real → `ready=true`.
-- `uv run python scripts/train_model.py` → macro-F1 por CV agrupada,
+- `uv run python scripts/train_model.py --cv loso` → macro-F1 com uma sessão
+  inteira de teste por dobra,
   documentado no README (número real, bom ou ruim).
 - Diff de cada agente dentro do escopo.
