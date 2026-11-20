@@ -126,6 +126,112 @@ summary:focus-visible {
   gap: 18px;
 }
 
+.report-link {
+  padding: 7px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.report-link:hover {
+  border-color: rgba(116, 247, 180, 0.45);
+  color: var(--accent);
+}
+
+.report-link.pending {
+  color: var(--dim);
+  border-style: dashed;
+}
+
+.health-summary {
+  margin-bottom: 10px;
+}
+
+.health-dropped-label.alert + dd,
+#health-dropped-rate.alert {
+  color: var(--alert);
+  font-weight: 700;
+}
+
+.timing-bars {
+  display: grid;
+  gap: 7px;
+  margin: 10px 0 12px;
+}
+
+.timing-row {
+  display: grid;
+  grid-template-columns: 62px 1fr 52px;
+  gap: 8px;
+  align-items: center;
+  font-size: 10px;
+}
+
+.timing-label {
+  color: var(--dim);
+  text-transform: lowercase;
+}
+
+.timing-bar {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.timing-bar span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--bone), var(--accent));
+  transition: width 140ms linear;
+}
+
+.timing-value {
+  color: var(--text);
+  text-align: right;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.timeline-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin: 0 0 8px;
+  font-size: 9px;
+  color: var(--dim);
+}
+
+.timeline-swatch {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.timeline-swatch::before {
+  content: "";
+  width: 12px;
+  height: 6px;
+  border-radius: 2px;
+  background: rgba(141, 155, 173, 0.35);
+}
+
+.timeline-swatch.agree::before {
+  background: var(--accent);
+}
+
+.timeline-swatch.disagree::before {
+  background: var(--alert);
+}
+
 .privacy-pill,
 .status {
   display: flex;
