@@ -92,6 +92,10 @@ function connect() {
     // reads as a broken app.
     setStatus("off", "ligando câmera…");
     hide("banner");
+    const replay = recorder.prepareOutboundReplay();
+    flushRecorderOutbound();
+    if (replay.discardedStart) flashToast(Recorder.START_FAILED_ERROR);
+    renderRecorder();
   };
   socket.onmessage = (event) => handle(JSON.parse(event.data));
   socket.onerror = () => socket.close();
@@ -942,15 +946,31 @@ const recorder = Recorder.createRecorder();
 let recorderCountdownTimer = null;
 let recorderLabels = [];
 
+function recorderSocketOpen() {
+  return Boolean(state.socket) && state.socket.readyState === WebSocket.OPEN;
+}
+
 function sendRecorderOutbound(messages) {
-  if (!state.socket || state.socket.readyState !== WebSocket.OPEN) return;
+  if (!messages.length) return [];
+  if (!recorderSocketOpen()) return messages;
   for (const payload of messages) {
     state.socket.send(JSON.stringify(payload));
   }
+  return [];
+}
+
+function deliverRecorderOutbound(batch) {
+  if (!batch.length) return;
+  const payloads = recorder.outboundPayloads(batch);
+  const unsent = sendRecorderOutbound(payloads);
+  if (!unsent.length) return;
+  const unsentKeys = new Set(unsent.map((m) => JSON.stringify(m)));
+  const toRequeue = batch.filter((entry, index) => unsentKeys.has(JSON.stringify(payloads[index])));
+  recorder.requeueOutbound(toRequeue);
 }
 
 function flushRecorderOutbound() {
-  sendRecorderOutbound(recorder.drainOutbound());
+  deliverRecorderOutbound(recorder.drainOutbound());
 }
 
 function stopRecorderCountdownTimer() {
@@ -963,7 +983,7 @@ function ensureRecorderCountdownTimer() {
   if (recorderCountdownTimer !== null) return;
   recorderCountdownTimer = setInterval(() => {
     const outbound = recorder.tick();
-    if (outbound.length) sendRecorderOutbound(outbound);
+    if (outbound.length) deliverRecorderOutbound(outbound);
     renderRecorder();
     if (recorder.snapshot().phase !== "countdown") stopRecorderCountdownTimer();
   }, 100);
@@ -1079,16 +1099,17 @@ function renderRecorder() {
 
 el("recorder-stop").addEventListener("click", () => stopRecorder());
 
-function recorderTypingTarget(target) {
-  return ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName);
-}
-
 document.addEventListener("keydown", (event) => {
-  if (recorderTypingTarget(event.target)) return;
+  if (typingTarget(event.target)) return;
   const digit = event.key.length === 1 && event.key >= "1" && event.key <= "9"
     ? Number(event.key)
     : null;
   if (digit !== null && digit <= recorderLabels.length) {
+    const view = recorder.snapshot();
+    if (!view.startEnabled) {
+      flashToast("Gravação indisponível agora");
+      return;
+    }
     event.preventDefault();
     startRecorderLabel(recorderLabels[digit - 1]);
     return;
