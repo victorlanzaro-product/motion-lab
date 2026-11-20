@@ -6,7 +6,12 @@ import math
 
 import pytest
 
-from backend.features import FrameFeatures, WindowFeatures, rebuild_windows
+from backend.features import (
+    DEFAULT_WINDOW_DEADBAND,
+    FrameFeatures,
+    WindowFeatures,
+    rebuild_windows,
+)
 
 
 def frame(index: int, timestamp: float, left_height, right_height=0.25,
@@ -68,6 +73,11 @@ def test_min_samples_must_be_an_integer_count():
         WindowFeatures(min_samples=2.5)
 
 
+def test_deadband_has_a_named_default_and_can_be_overridden():
+    assert WindowFeatures().deadband == DEFAULT_WINDOW_DEADBAND == 0.35
+    assert WindowFeatures(deadband=0.2).deadband == pytest.approx(0.2)
+
+
 def test_a_gap_larger_than_max_gap_invalidates_then_requires_a_fresh_window():
     tracker = WindowFeatures(window_seconds=1.0, max_gap=0.3, min_samples=4)
     state = None
@@ -83,21 +93,58 @@ def test_a_gap_larger_than_max_gap_invalidates_then_requires_a_fresh_window():
     assert tracker.push(2.5, frame(25, 2.5, 0.5)) is not None
 
 
-def test_missing_wrist_is_none_not_zero_and_recovers_from_fresh_samples():
+def test_missing_one_wrist_keeps_the_other_arm_valid_and_recovers_independently():
     tracker = WindowFeatures(window_seconds=0.5, max_gap=0.3, min_samples=4)
     for index in range(6):
         timestamp = index / 10
-        tracker.push(timestamp, frame(index, timestamp, 0.7))
+        state = tracker.push(timestamp, frame(index, timestamp, 0.7))
+    assert state is not None
+    assert state.left is not None
+    assert state.right is not None
 
-    assert tracker.push(0.6, frame(6, 0.6, None)) is None
-    state = None
+    # The left joint is occluded, while the right arm still has a complete
+    # history. Its window remains usable; the left side is explicitly unknown.
+    state = tracker.push(0.6, frame(6, 0.6, None, left_offset=None))
+    assert state is not None
+    assert state.left is None
+    assert state.right is not None
+    assert state.right.mean_wrist_height == pytest.approx(0.25)
+
+    # The left side warms up from the first newly visible sample. It must not
+    # include the pre-occlusion history or treat the missing value as zero.
     for index in range(7, 13):
         timestamp = index / 10
         state = tracker.push(timestamp, frame(index, timestamp, 0.7))
 
     assert state is not None
+    assert state.left is not None
     assert state.left.mean_wrist_height == pytest.approx(0.7)
     assert state.left.range_wrist_height == pytest.approx(0.0)
+    assert state.right is not None
+
+
+def test_right_wave_is_valid_while_left_wrist_is_missing_throughout():
+    tracker = WindowFeatures(window_seconds=1.0, min_samples=4)
+    state = None
+    fps = 40.0
+    for index in range(int(fps) + 1):
+        timestamp = index / fps
+        right_height = 0.5 + 0.4 * math.sin(2 * math.pi * 3 * timestamp)
+        state = tracker.push(
+            timestamp,
+            frame(
+                index,
+                timestamp,
+                left_height=None,
+                right_height=right_height,
+                left_offset=None,
+            ),
+        )
+
+    assert state is not None
+    assert state.left is None
+    assert state.right is not None
+    assert state.right.direction_reversals >= 4
 
 
 def test_max_speed_is_two_dimensional_and_per_second_at_different_frame_rates():
@@ -119,6 +166,7 @@ def test_max_speed_is_two_dimensional_and_per_second_at_different_frame_rates():
             )
         assert state is not None
         outputs.append(state.left.max_speed)
+        assert state.left.max_vertical_speed == pytest.approx(0.9, abs=1e-6)
 
     assert outputs[0] == pytest.approx(1.5, abs=1e-6)
     assert outputs[1] == pytest.approx(outputs[0], abs=1e-6)
