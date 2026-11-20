@@ -2,7 +2,16 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { createRecorder, DEFAULT_COUNTDOWN_SECONDS } = require("./recorder.js");
+const {
+  createRecorder,
+  DEFAULT_COUNTDOWN_SECONDS,
+  START_REPLAY_WINDOW_MS,
+  START_FAILED_ERROR,
+} = require("./recorder.js");
+
+function wirePayloads(recorder, batch) {
+  return recorder.outboundPayloads(batch);
+}
 
 const CONTRACT_LABELS = ["arm_raised", "arms_crossed", "arms_open", "idle"];
 
@@ -67,7 +76,7 @@ test("owner recording reflects live counters from record_status", () => {
   const t0 = 1_000_000;
   recorder.beginStart("arm_raised", t0);
   const outbound = recorder.tick(t0);
-  assert.deepEqual(outbound, [{ type: "record_start", label: "arm_raised" }]);
+  assert.deepEqual(wirePayloads(recorder, outbound), [{ type: "record_start", label: "arm_raised" }]);
   recorder.applyStatus(OWNER_RECORDING);
   const view = recorder.snapshot();
   assert.equal(view.showRecordingBanner, true);
@@ -193,3 +202,124 @@ test("remote recording aborts an in-flight countdown without outbound", () => {
   assert.equal(recorder.snapshot().phase, "idle");
   assert.deepEqual(recorder.tick(t0 + DEFAULT_COUNTDOWN_SECONDS * 1000), []);
 });
+
+test("beginStop enqueues record_stop on the outbound queue", () => {
+  const recorder = createRecorder();
+  recorder.setLabels(CONTRACT_LABELS);
+  recorder.applyStatus(OWNER_RECORDING);
+  assert.equal(recorder.beginStop().ok, true);
+  assert.deepEqual(wirePayloads(recorder, recorder.drainOutbound()), [{ type: "record_stop" }]);
+});
+
+test("requeueOutbound preserves undelivered commands for a later drain", () => {
+  const recorder = createRecorder();
+  recorder.setLabels(CONTRACT_LABELS);
+  recorder.applyStatus(OWNER_RECORDING);
+  recorder.beginStop();
+  const first = recorder.drainOutbound();
+  recorder.requeueOutbound(first);
+  assert.deepEqual(recorder.drainOutbound(), first);
+});
+
+const WAVE_REJECTION = {
+  type: "record_status",
+  recording: false,
+  label: null,
+  session_id: null,
+  written: 0,
+  skipped: 0,
+  owner: false,
+  error: "label 'wave' was removed from training labels",
+};
+
+const UNKNOWN_LABEL_REJECTION = {
+  type: "record_status",
+  recording: false,
+  label: null,
+  session_id: null,
+  written: 0,
+  skipped: 0,
+  owner: false,
+  error: "unknown label: not_a_label",
+};
+
+test("wave rejection exposes server error on idle tab", () => {
+  const recorder = createRecorder({ countdownSeconds: 0 });
+  recorder.setLabels(CONTRACT_LABELS);
+  recorder.beginStart("arm_raised", 0);
+  recorder.tick(0);
+  recorder.applyStatus(WAVE_REJECTION);
+  const view = recorder.snapshot();
+  assert.equal(view.status.error, WAVE_REJECTION.error);
+  assert.equal(view.status.recording, false);
+  assert.equal(view.status.owner, false);
+});
+
+test("unknown label rejection exposes server error on idle tab", () => {
+  const recorder = createRecorder({ countdownSeconds: 0 });
+  recorder.setLabels(CONTRACT_LABELS);
+  recorder.beginStart("idle", 0);
+  recorder.tick(0);
+  recorder.applyStatus(UNKNOWN_LABEL_REJECTION);
+  assert.equal(recorder.snapshot().status.error, UNKNOWN_LABEL_REJECTION.error);
+});
+
+test("follow-up record_status with error null clears prior error", () => {
+  const recorder = createRecorder();
+  recorder.setLabels(CONTRACT_LABELS);
+  recorder.applyStatus(IDLE_REJECTION);
+  assert.equal(recorder.snapshot().status.error, "gravacao ja em andamento");
+  recorder.applyStatus({
+    type: "record_status",
+    recording: false,
+    label: null,
+    session_id: null,
+    written: 0,
+    skipped: 0,
+    owner: false,
+    error: null,
+  });
+  assert.equal(recorder.snapshot().status.error, null);
+});
+
+test("prepareOutboundReplay drops unsent record_stop without replay", () => {
+  const recorder = createRecorder();
+  recorder.setLabels(CONTRACT_LABELS);
+  recorder.applyStatus(OWNER_RECORDING);
+  recorder.beginStop(1_000);
+  assert.equal(recorder.drainOutbound().length, 1);
+  recorder.requeueOutbound([
+    { payload: { type: "record_stop" }, requestedAt: 1_000 },
+  ]);
+  const replay = recorder.prepareOutboundReplay(5_000);
+  assert.equal(replay.discardedStart, false);
+  assert.deepEqual(recorder.drainOutbound(), []);
+});
+
+test("prepareOutboundReplay keeps record_start within replay window", () => {
+  const recorder = createRecorder();
+  recorder.setLabels(CONTRACT_LABELS);
+  const requestedAt = 10_000;
+  recorder.requeueOutbound([
+    { payload: { type: "record_start", label: "idle" }, requestedAt },
+  ]);
+  recorder.prepareOutboundReplay(requestedAt + START_REPLAY_WINDOW_MS);
+  assert.deepEqual(wirePayloads(recorder, recorder.drainOutbound()), [
+    { type: "record_start", label: "idle" },
+  ]);
+});
+
+test("prepareOutboundReplay discards stale record_start and sets error", () => {
+  const recorder = createRecorder();
+  recorder.setLabels(CONTRACT_LABELS);
+  const requestedAt = 10_000;
+  recorder.requeueOutbound([
+    { payload: { type: "record_start", label: "arm_raised" }, requestedAt },
+  ]);
+  const replay = recorder.prepareOutboundReplay(requestedAt + START_REPLAY_WINDOW_MS + 1);
+  assert.equal(replay.discardedStart, true);
+  assert.equal(replay.error, START_FAILED_ERROR);
+  assert.equal(recorder.snapshot().status.error, START_FAILED_ERROR);
+  assert.deepEqual(recorder.drainOutbound(), []);
+});
+

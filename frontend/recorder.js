@@ -10,6 +10,8 @@
   "use strict";
 
   const DEFAULT_COUNTDOWN_SECONDS = 3;
+  const START_REPLAY_WINDOW_MS = 2000;
+  const START_FAILED_ERROR = "Gravação não iniciada: conexão caiu";
 
   function createRecorder(options) {
     const opts = options || {};
@@ -72,9 +74,18 @@
       return true;
     }
 
-    function beginStop() {
+    function enqueueOutbound(payload, now) {
+      const t = typeof now === "number" ? now : Date.now();
+      outbound.push({ payload, requestedAt: t });
+    }
+
+    function outboundPayloads(entries) {
+      return entries.map((entry) => entry.payload);
+    }
+
+    function beginStop(now) {
       if (!status.recording || !status.owner) return { ok: false, reason: "not_owner" };
-      outbound.push({ type: "record_stop" });
+      enqueueOutbound({ type: "record_stop" }, now);
       return { ok: true };
     }
 
@@ -84,7 +95,7 @@
       if (t < countdownDeadline) return [];
       const label = countdownLabel;
       resetCountdown();
-      outbound.push({ type: "record_start", label });
+      enqueueOutbound({ type: "record_start", label }, t);
       return drainOutbound();
     }
 
@@ -147,6 +158,36 @@
       return outbound.splice(0);
     }
 
+    function requeueOutbound(entries) {
+      if (!Array.isArray(entries) || entries.length === 0) return;
+      outbound.unshift(...entries);
+    }
+
+    function prepareOutboundReplay(now) {
+      const t = typeof now === "number" ? now : Date.now();
+      let discardedStart = false;
+      const kept = [];
+      for (const entry of outbound) {
+        if (!entry || !entry.payload) continue;
+        if (entry.payload.type === "record_stop") continue;
+        if (entry.payload.type === "record_start") {
+          if (t - entry.requestedAt <= START_REPLAY_WINDOW_MS) {
+            kept.push(entry);
+          } else {
+            discardedStart = true;
+          }
+          continue;
+        }
+        kept.push(entry);
+      }
+      outbound.length = 0;
+      outbound.push(...kept);
+      if (discardedStart) {
+        status = { ...emptyStatus(), error: START_FAILED_ERROR };
+      }
+      return { ok: true, discardedStart, error: discardedStart ? START_FAILED_ERROR : null };
+    }
+
     function countdownRemaining(now) {
       const t = typeof now === "number" ? now : Date.now();
       if (phase !== "countdown" || countdownDeadline === null) return null;
@@ -180,12 +221,20 @@
       applyStatus,
       onWebSocketReconnect,
       drainOutbound,
+      requeueOutbound,
+      outboundPayloads,
+      prepareOutboundReplay,
       snapshot,
       canStart,
     };
   }
 
-  const Recorder = { createRecorder, DEFAULT_COUNTDOWN_SECONDS };
+  const Recorder = {
+    createRecorder,
+    DEFAULT_COUNTDOWN_SECONDS,
+    START_REPLAY_WINDOW_MS,
+    START_FAILED_ERROR,
+  };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = Recorder;
