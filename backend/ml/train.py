@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import csv
 import math
+import statistics
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,8 +82,9 @@ from sklearn.metrics import (
     balanced_accuracy_score,
     classification_report,
     confusion_matrix,
+    f1_score,
 )
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 
 from backend.dataset.writer import (
     DATASET_COLUMNS,
@@ -158,6 +160,27 @@ def build_vector(row: dict, columns: tuple[str, ...] = TRAINING_COLUMNS) -> list
     return [_to_number(row.get(name)) for name in columns]
 
 
+def classify_dataset_row(row: dict) -> tuple[str | None, list[float] | None]:
+    """Apply the row-level rules shared by training and dataset inspection.
+
+    Stats needs to count an unknown label without treating it as a trainable
+    row; training still raises on that reason below because silently dropping
+    an unrecognized class would hide a vocabulary mistake.
+    """
+    label = (row.get("label") or "").strip()
+    if not label:
+        return "missing_label", None
+    if label not in DEFAULT_LABELS:
+        return "unknown_label", None
+    try:
+        vector = build_vector(row)
+    except MissingFeatureError:
+        return "missing_feature", None
+    if not all(math.isfinite(value) for value in vector):
+        return "non_finite", None
+    return None, vector
+
+
 @dataclass
 class Dataset:
     X: list[list[float]]
@@ -202,10 +225,11 @@ def load_dataset(path: Path = DEFAULT_DATASET_PATH) -> Dataset:
 
         for row in reader:
             label = (row.get("label") or "").strip()
-            if not label:
-                dropped["missing_label"] += 1
+            reason, vector = classify_dataset_row(row)
+            if reason == "missing_label":
+                dropped[reason] += 1
                 continue
-            if label in REMOVED_LABELS:
+            if reason == "unknown_label" and label in REMOVED_LABELS:
                 raise DatasetError(
                     f"{path} has row(s) labeled {label!r}, which is no longer a "
                     f"trainable class: {REMOVED_LABELS[label]} This CSV predates "
@@ -215,7 +239,7 @@ def load_dataset(path: Path = DEFAULT_DATASET_PATH) -> Dataset:
                     "file aside and record a fresh session with the current "
                     "hello_dataset.py, which no longer offers that label at all."
                 )
-            if label not in DEFAULT_LABELS:
+            if reason == "unknown_label":
                 raise DatasetError(
                     f"{path} has row(s) labeled {label!r}, which is not one of the "
                     f"current trainable classes {DEFAULT_LABELS} -- a typo, a stray "
@@ -225,19 +249,18 @@ def load_dataset(path: Path = DEFAULT_DATASET_PATH) -> Dataset:
                     "result, or move this file aside and record a fresh session "
                     "with the current hello_dataset.py."
                 )
-            try:
-                vector = build_vector(row)
-            except MissingFeatureError:
+            if reason == "missing_feature":
                 # An occluded joint, or a motion column with no history yet
                 # (the first few frames of a held key, before the tracker has
                 # enough samples) — a real "we don't know", not "value is 0".
                 # Training on a fabricated 0 here would teach the Forest that
                 # "unknown" and "not moving" are the same thing.
-                dropped["missing_feature"] += 1
+                dropped[reason] += 1
                 continue
-            if not all(math.isfinite(v) for v in vector):
-                dropped["non_finite"] += 1
+            if reason == "non_finite":
+                dropped[reason] += 1
                 continue
+            assert vector is not None
             X.append(vector)
             y.append(label)
             groups.append(row.get("session_id") or "")
@@ -311,6 +334,87 @@ def _grouped_split(
     )
 
 
+def _grouped_cv(
+    dataset: "Dataset", n_estimators: int, random_state: int
+) -> dict[str, Any]:
+    """Measure macro-F1 on deterministic held-out session folds.
+
+    A fold with a class missing from training cannot evaluate a model that
+    learned every supported class, so it is recorded and excluded. Missing
+    classes in the test fold remain part of the fixed macro-F1 label set and
+    therefore score zero rather than disappearing from the headline.
+    """
+    class_labels = sorted(set(dataset.y))
+    n_splits = min(5, len(set(dataset.groups)))
+    splitter = GroupKFold(n_splits=n_splits)
+    scores: list[float] = []
+    per_fold: list[dict[str, Any]] = []
+
+    for fold_number, (train_idx, test_idx) in enumerate(
+        splitter.split(dataset.X, dataset.y, groups=dataset.groups), start=1
+    ):
+        train_classes = {dataset.y[index] for index in train_idx}
+        missing_train = sorted(set(class_labels) - train_classes)
+        train_sessions = sorted({dataset.groups[index] for index in train_idx})
+        test_sessions = sorted({dataset.groups[index] for index in test_idx})
+        if missing_train:
+            per_fold.append(
+                {
+                    "fold": fold_number,
+                    "valid": False,
+                    "macro_f1": None,
+                    "reason": f"classes absent from training: {missing_train}",
+                    "train_sessions": train_sessions,
+                    "test_sessions": test_sessions,
+                }
+            )
+            continue
+
+        fold_model = RandomForestClassifier(
+            n_estimators=n_estimators, random_state=random_state
+        )
+        fold_model.fit(
+            [dataset.X[index] for index in train_idx],
+            [dataset.y[index] for index in train_idx],
+        )
+        predicted = fold_model.predict([dataset.X[index] for index in test_idx])
+        score = float(
+            f1_score(
+                [dataset.y[index] for index in test_idx],
+                predicted,
+                labels=class_labels,
+                average="macro",
+                zero_division=0,
+            )
+        )
+        scores.append(score)
+        per_fold.append(
+            {
+                "fold": fold_number,
+                "valid": True,
+                "macro_f1": score,
+                "train_sessions": train_sessions,
+                "test_sessions": test_sessions,
+            }
+        )
+
+    if not scores:
+        raise DatasetError(
+            f"Grouped cross-validation produced zero valid folds out of {n_splits}: "
+            "every training fold was missing at least one class. Record more "
+            "sessions across every label with hello_dataset.py."
+        )
+
+    return {
+        "n_splits": n_splits,
+        "folds_used": len(scores),
+        "folds_skipped": n_splits - len(scores),
+        "macro_f1_mean": statistics.mean(scores),
+        "macro_f1_std": statistics.pstdev(scores),
+        "per_fold": per_fold,
+    }
+
+
 @dataclass
 class TrainingReport:
     model_path: Path
@@ -340,6 +444,8 @@ class TrainingReport:
     #: plain `accuracy` on an imbalanced set can look good by mostly predicting
     #: the majority class, which balanced accuracy does not let it get away with.
     balanced_accuracy: float
+    #: Grouped cross-validation headline and fold-level evidence.
+    cv: dict[str, Any]
 
 
 def train(
@@ -396,6 +502,7 @@ def train(
             "that also covers that label."
         )
 
+    cv = _grouped_cv(dataset, n_estimators=n_estimators, random_state=random_state)
     train_idx, test_idx = _grouped_split(dataset, test_size, random_state)
     X_train = [dataset.X[i] for i in train_idx]
     X_test = [dataset.X[i] for i in test_idx]
@@ -442,6 +549,8 @@ def train(
             "accuracy": accuracy,
             "macro_f1": macro_f1,
             "balanced_accuracy": balanced_accuracy,
+            "cv": cv,
+            "dataset_path": str(Path(dataset_path)),
         },
         model_path,
     )
@@ -460,6 +569,7 @@ def train(
         dropped=dataset.dropped,
         macro_f1=macro_f1,
         balanced_accuracy=balanced_accuracy,
+        cv=cv,
     )
 
 
