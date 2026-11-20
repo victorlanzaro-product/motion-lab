@@ -7,6 +7,10 @@ const {
   DEFAULT_COUNTDOWN_SECONDS,
   START_REPLAY_WINDOW_MS,
   START_FAILED_ERROR,
+  recordLabelsForHello,
+  waveRecordingEnabled,
+  shortcutForLabel,
+  labelIndexForDigit,
 } = require("./recorder.js");
 
 function wirePayloads(recorder, batch) {
@@ -14,6 +18,16 @@ function wirePayloads(recorder, batch) {
 }
 
 const CONTRACT_LABELS = ["arm_raised", "arms_crossed", "arms_open", "idle"];
+
+const V2_HELLO = {
+  model_schema: 2,
+  record_labels: ["arm_raised", "arms_crossed", "arms_open", "idle", "wave"],
+};
+
+const V1_HELLO = {
+  model_schema: 1,
+  record_labels: ["arm_raised", "arms_crossed", "arms_open", "idle"],
+};
 
 const OWNER_RECORDING = {
   type: "record_status",
@@ -309,6 +323,41 @@ test("prepareOutboundReplay keeps record_start within replay window", () => {
   ]);
 });
 
+test("recordLabelsForHello keeps wave only for schema 2", () => {
+  assert.deepEqual(recordLabelsForHello(V2_HELLO), V2_HELLO.record_labels);
+  assert.deepEqual(recordLabelsForHello(V1_HELLO), V1_HELLO.record_labels);
+  assert.equal(
+    waveRecordingEnabled(2, ["arm_raised", "arms_crossed", "arms_open", "idle", "wave"]),
+    true,
+  );
+  assert.equal(waveRecordingEnabled(1, V2_HELLO.record_labels), false);
+  const stripped = recordLabelsForHello({
+    model_schema: 1,
+    record_labels: V2_HELLO.record_labels,
+  });
+  assert.deepEqual(stripped, V1_HELLO.record_labels);
+  const legacy = recordLabelsForHello({ record_labels: V2_HELLO.record_labels });
+  assert.deepEqual(legacy, V1_HELLO.record_labels);
+});
+
+test("shortcut key 5 maps to wave only in schema 2", () => {
+  const v2 = V2_HELLO.record_labels;
+  assert.equal(shortcutForLabel("wave", v2, 2), "5");
+  assert.equal(shortcutForLabel("idle", v2, 2), "4");
+  assert.equal(shortcutForLabel("wave", v2, 1), null);
+  assert.equal(labelIndexForDigit("5", v2, 2), 4);
+  assert.equal(labelIndexForDigit("5", V1_HELLO.record_labels, 1), -1);
+  assert.equal(labelIndexForDigit("4", v2, 2), 3);
+});
+
+test("schema 2 can start wave recording after countdown", () => {
+  const recorder = createRecorder({ countdownSeconds: 0 });
+  recorder.setLabels(V2_HELLO.record_labels);
+  assert.equal(recorder.beginStart("wave", 0).ok, true);
+  const outbound = recorder.tick(0);
+  assert.deepEqual(wirePayloads(recorder, outbound), [{ type: "record_start", label: "wave" }]);
+});
+
 test("prepareOutboundReplay discards stale record_start and sets error", () => {
   const recorder = createRecorder();
   recorder.setLabels(CONTRACT_LABELS);
@@ -322,4 +371,3 @@ test("prepareOutboundReplay discards stale record_start and sets error", () => {
   assert.equal(recorder.snapshot().status.error, START_FAILED_ERROR);
   assert.deepEqual(recorder.drainOutbound(), []);
 });
-
