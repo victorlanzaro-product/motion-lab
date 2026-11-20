@@ -241,3 +241,38 @@ def test_unknown_labels_are_counted_and_excluded_but_training_still_rejects_them
     # Coverage helps diagnose the row, but the training contract stays strict.
     with pytest.raises(DatasetError, match="not one of the current trainable classes"):
         load_dataset(path)
+
+def test_corrupt_header_returns_exists_true_without_raising(tmp_path):
+    path = tmp_path / "dataset.csv"
+    path.write_text("session_id,label,frame_index\ns0,idle,0\n", encoding="utf-8")
+
+    stats = dataset_stats(path)
+
+    assert stats["exists"] is True
+    assert stats["ready"] is False
+    assert stats["total_rows"] == 0
+    assert stats["usable_rows"] == 0
+    assert stats["sessions"] == []
+    assert any("Cabeçalho do CSV incompleto" in problem for problem in stats["problems"])
+    assert any("treino vai recusar" in problem for problem in stats["problems"])
+
+    with pytest.raises(DatasetError, match="missing column"):
+        load_dataset(path)
+
+
+def test_invalid_timestamp_returns_exists_true_without_raising(tmp_path):
+    path = tmp_path / "dataset.csv"
+    rows = [_row("idle", "s0", 0, 0.0), _row("idle", "s0", 1, 0.1)]
+    rows[1]["timestamp"] = "não-é-número"
+    _write(path, rows)
+
+    stats = dataset_stats(path)
+
+    assert stats["exists"] is True
+    assert stats["ready"] is False
+    assert stats["total_rows"] == 2
+    assert stats["usable_rows"] == 1
+    assert stats["sessions"] == []
+    assert any("timestamp inválido" in problem for problem in stats["problems"])
+    assert any("Linha 3" in problem for problem in stats["problems"])
+
