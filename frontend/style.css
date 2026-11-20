@@ -786,6 +786,11 @@ dd {
   font-size: 10px;
 }
 
+.recorder-label-button-wave {
+  border-color: rgba(200, 140, 255, 0.45);
+  background: rgba(200, 140, 255, 0.1);
+}
+
 .recorder-stop-row {
   display: flex;
   flex-wrap: wrap;

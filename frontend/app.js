@@ -74,6 +74,7 @@ const state = {
   lastFace: null,
   coverageView: null,
   coverageFetchWarning: null,
+  recordLabels: [],
 };
 
 const el = (id) => document.getElementById(id);
@@ -124,10 +125,7 @@ function handle(message) {
       message.face_enabled ? "pending" : "off",
       message.face_enabled ? "procurando rosto" : "rosto desligado",
     );
-    if (Array.isArray(message.record_labels)) {
-      recorder.setLabels(message.record_labels);
-      buildRecorderButtons(message.record_labels);
-    }
+    applyRecordLabelsFromHello(message);
     renderRecorder();
     return;
   }
@@ -994,25 +992,40 @@ function ensureRecorderCountdownTimer() {
   }, 100);
 }
 
-function buildRecorderButtons(labels) {
+function applyRecordLabelsFromHello(hello) {
+  const labels = Recorder.recordLabelsForHello(hello);
+  state.recordLabels = labels;
+  recorder.setLabels(labels);
+  buildRecorderButtons(labels, hello && hello.model_schema);
+}
+
+function recorderModelSchema() {
+  return state.config && state.config.model_schema;
+}
+
+function buildRecorderButtons(labels, modelSchema) {
   recorderLabels = labels.slice();
   const host = el("recorder-label-buttons");
   host.replaceChildren();
-  labels.forEach((label, index) => {
-    const shortcut = String(index + 1);
+  const schema = modelSchema ?? recorderModelSchema();
+  for (const label of labels) {
+    const shortcut = Recorder.shortcutForLabel(label, labels, schema);
     const human = ML_LABEL[label] || label;
     const button = document.createElement("button");
     button.type = "button";
     button.className = "recorder-label-button";
+    if (label === "wave") button.classList.add("recorder-label-button-wave");
     button.dataset.recordLabel = label;
-    button.dataset.shortcut = shortcut;
+    if (shortcut) button.dataset.shortcut = shortcut;
     button.textContent = human;
-    const key = document.createElement("kbd");
-    key.textContent = shortcut;
-    button.append(key);
+    if (shortcut) {
+      const key = document.createElement("kbd");
+      key.textContent = shortcut;
+      button.append(key);
+    }
     button.addEventListener("click", () => startRecorderLabel(label));
     host.append(button);
-  });
+  }
 }
 
 function startRecorderLabel(label) {
@@ -1114,7 +1127,10 @@ async function fetchDatasetStats() {
     const response = await fetch("/dataset/stats");
     if (!response.ok) throw new Error(String(response.status));
     const stats = await response.json();
-    state.coverageView = DatasetCoverage.buildCoverageView(stats, { labelTitles: ML_LABEL });
+    state.coverageView = DatasetCoverage.buildCoverageView(stats, {
+      labelTitles: ML_LABEL,
+      coverageLabels: state.recordLabels.length ? state.recordLabels : undefined,
+    });
     state.coverageFetchWarning = null;
   } catch (_error) {
     state.coverageFetchWarning = COVERAGE_FETCH_WARNING;
@@ -1217,18 +1233,19 @@ function renderDatasetCoverage() {
 
 document.addEventListener("keydown", (event) => {
   if (typingTarget(event.target)) return;
-  const digit = event.key.length === 1 && event.key >= "1" && event.key <= "9"
-    ? Number(event.key)
-    : null;
-  if (digit !== null && digit <= recorderLabels.length) {
-    const view = recorder.snapshot();
-    if (!view.startEnabled) {
-      flashToast("Gravação indisponível agora");
+  const digit = event.key.length === 1 && event.key >= "1" && event.key <= "9" ? event.key : null;
+  if (digit !== null) {
+    const labelIndex = Recorder.labelIndexForDigit(digit, recorderLabels, recorderModelSchema());
+    if (labelIndex >= 0 && labelIndex < recorderLabels.length) {
+      const view = recorder.snapshot();
+      if (!view.startEnabled) {
+        flashToast("Gravação indisponível agora");
+        return;
+      }
+      event.preventDefault();
+      startRecorderLabel(recorderLabels[labelIndex]);
       return;
     }
-    event.preventDefault();
-    startRecorderLabel(recorderLabels[digit - 1]);
-    return;
   }
   if (event.key === " " || event.code === "Space") {
     const view = recorder.snapshot();
