@@ -800,6 +800,21 @@ def test_camera_stays_closed_until_a_client_connects():
     runner.stop()
 
 
+
+
+def test_dataset_stats_route_never_500_on_corrupt_csv(tmp_path):
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("session_id,label\ns0,idle\n", encoding="utf-8")
+
+    with TestClient(create_app(WebConfig(dataset_path=dataset_path))) as client:
+        response = client.get("/dataset/stats")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == dataset_stats(dataset_path)
+    assert body["exists"] is True
+    assert body["ready"] is False
+    assert body["problems"]
 def test_dataset_stats_route_returns_the_shared_stats_for_its_configured_path(tmp_path):
     """The endpoint exposes the same on-disk snapshot as the CLI/report code."""
     dataset_path = tmp_path / "missing.csv"
