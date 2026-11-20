@@ -170,3 +170,25 @@ def test_report_renders_cv_summary_and_invalid_folds():
     assert "2</td><td>—</td><td>ignorada" in html
     assert "faltou arms_open no treino" in html
     assert "2 dobras incluídas e" in html and "1 ignoradas" in html
+
+
+def test_report_distinguishes_pooled_loso_from_fold_mean():
+    training = {
+        **TRAINING,
+        "cv": {
+            "mode": "loso",
+            "macro_f1_oof": 0.9,
+            "macro_f1_mean": 0.24,
+            "macro_f1_std": 0.01,
+            "n_splits": 12,
+            "folds_used": 12,
+            "folds_skipped": 0,
+        },
+    }
+
+    html = render_report(training)
+
+    assert "macro-F1 LOSO: <strong>0.900</strong>" in html
+    assert "uma sessão por dobra" in html
+    assert "macro-F1 médio: <strong>0.240 ± 0.010</strong>" in html
+    assert "12 dobras incluídas" in html
