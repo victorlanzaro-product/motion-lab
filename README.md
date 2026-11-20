@@ -20,6 +20,7 @@ armazenado — apenas landmarks temporários, dados de treino e o modelo treinad
 | 09 | Live ML (Sinal X em tempo real) | ✅ pronto |
 | 10 | Motion Lab (métricas, explicabilidade) | ✅ pronto |
 | 11 | Reações Faciais (sinais observáveis, opt-in) | ✅ pronto |
+| 12 | Recorder (gravação de dataset pelo navegador) | ✅ pronto (checkpoint com câmera pendente) |
 
 ## Setup
 
@@ -148,6 +149,41 @@ segundo MediaPipe (Face Landmarker), e nunca é dependência de pose/gestos/ML.
 Regra de acoplamento: cada camada recebe o **dado** da anterior, nunca o handle dela.
 `CameraEngine` entrega `Frame`, não um `cv2.VideoCapture` — por isso trocar webcam por
 arquivo de vídeo não toca em nada do lado da visão.
+
+### Decisões do Sprint 12: gravar é um comando ao servidor, nunca um arquivo do navegador
+
+Contrato completo em `docs/sprints/12-recorder.md`. O navegador manda
+`record_start {label}` / `record_stop` pelo mesmo `/ws`; o servidor responde
+com `record_status`. Nenhum pixel é gravado — só as linhas rotuladas do
+`DatasetWriter`, com o mesmo schema do `hello_dataset.py`.
+
+Backend (`backend/web/recorder.py`):
+
+1. O Recorder reserva sessões sob lock e mantém toda abertura, escrita e
+   fechamento do CSV na thread do pipeline — o event loop nunca faz I/O de arquivo.
+2. `DatasetWriter` continua sendo a fonte do schema e das mensagens de
+   validação; frame incompleto incrementa `skipped`.
+3. `session_id` = `web-YYYYMMDD-HHMMSS-<6 hex>`, único por processo; colisão
+   tem até 128 tentativas e falha como `record_status.error`.
+4. `owner` é `true` só enquanto a gravação está ativa; rejeições refletem o
+   estado real do servidor e vão só para quem pediu; a parada final preserva
+   `label`, `session_id` e contagens com `owner=false`.
+5. Erro do Recorder nunca derruba pose, gestos, ML, face ou frames; depois de
+   um retry da câmera, comandos voltam a ser aceitos.
+6. Cada assinante coalesce frames mas preserva mensagens de controle e finais.
+
+Frontend (`frontend/recorder.js`, máquina de estados pura):
+
+7. `idle → countdown (3 s) → recording → idle`; cancelar a contagem não envia nada.
+8. Indicador **GRAVANDO** vermelho e persistente em toda aba enquanto
+   `recording=true`; abas que não são donas veem "outra aba está gravando" e
+   botões desabilitados. Atalhos: `1..N` por rótulo, espaço para parar,
+   respeitando foco em campos e botões.
+9. Comando não entregue com o socket fechado: `record_stop` é descartado na
+   reconexão (o servidor já parou sozinho quando o dono caiu); `record_start`
+   só é reenviado se a reconexão vier em até 2 s, senão vira erro visível.
+10. `error != null` é mensagem desta aba; uma rejeição nunca altera o estado
+    de gravação mostrado por outra aba.
 
 ### Decisões do Sprint 11: sinal facial observável, nunca emoção
 
