@@ -77,6 +77,8 @@ const state = {
   coverageFetchWarning: null,
 };
 
+const degradationTracker = ProtocolHardening.createDegradationTracker();
+
 const el = (id) => document.getElementById(id);
 const canvas = el("view");
 const ctx = canvas.getContext("2d");
@@ -90,6 +92,8 @@ function connect() {
 
   socket.onopen = () => {
     state.retries = 0;
+    degradationTracker.clear();
+    clearDegradationBanner();
     confidenceTimeline.clear();
     // Not "ao vivo" yet: opening the webcam and loading the pose model takes a
     // few seconds on the first connection, and a green dot over a black canvas
@@ -137,14 +141,31 @@ function handle(message) {
   if (message.type === "record_status") {
     recorder.applyStatus(message);
     renderRecorder();
+    if (
+      ProtocolHardening.isRecorderRejection(message) &&
+      ProtocolHardening.shouldToastRecorderRejection(isRecorderErrorPanelVisible())
+    ) {
+      flashToast(message.error);
+    }
     if (!message.recording && message.session_id != null) {
       fetchDatasetStats();
     }
     return;
   }
   if (message.type === "error") {
-    setStatus("error", "parado");
-    show("banner", message.message);
+    if (ProtocolHardening.isFatalPipelineError(message)) {
+      degradationTracker.clear();
+      setStatus("error", "parado");
+      show("banner", message.message || "Pipeline interrompido.");
+      clearBannerDegradationClass();
+      return;
+    }
+    const { note } = degradationTracker.absorbError(message);
+    showDegradationBanner(
+      note || "Serviço parcialmente indisponível; o ao vivo continua.",
+    );
+    if (state.streaming) setStatus("live", "ao vivo (com aviso)");
+    else setStatus("off", "com aviso");
     return;
   }
   if (message.type === "status") {
@@ -158,7 +179,9 @@ function handle(message) {
     return;
   }
   if (message.type === "frame") {
-    hide("banner");
+    if (!degradationTracker.currentNote()) {
+      clearDegradationBanner();
+    }
     if (!state.streaming) {
       state.streaming = true;
       setStatus("live", "ao vivo");
@@ -912,6 +935,28 @@ function hide(id) {
   el(id).classList.add("hidden");
 }
 
+function clearBannerDegradationClass() {
+  const banner = el("banner");
+  if (banner) banner.classList.remove("degradation");
+}
+
+function clearDegradationBanner() {
+  hide("banner");
+  clearBannerDegradationClass();
+}
+
+function showDegradationBanner(text) {
+  const banner = el("banner");
+  banner.textContent = text;
+  banner.classList.remove("hidden");
+  banner.classList.add("degradation");
+}
+
+function isRecorderErrorPanelVisible() {
+  const box = el("recorder-error");
+  return Boolean(box && !box.classList.contains("hidden") && box.textContent);
+}
+
 function toggle(id, visible) {
   el(id).classList.toggle("hidden", !visible);
 }
@@ -1167,7 +1212,12 @@ function buildRecorderButtons(labels) {
 }
 
 function startRecorderLabel(label) {
-  if (!recorder.beginStart(label).ok) return;
+  const started = recorder.beginStart(label);
+  if (!started.ok) {
+    const hint = ProtocolHardening.clientRecorderReason(started.reason);
+    if (hint) flashToast(hint);
+    return;
+  }
   ensureRecorderCountdownTimer();
   flushRecorderOutbound();
   renderRecorder();
@@ -1190,7 +1240,7 @@ function renderRecorder() {
   const view = recorder.snapshot();
   const banner = el("recording-banner");
   const bannerDetail = el("recording-banner-detail");
-  toggle("recording-banner", view.showRecordingBanner);
+  ProtocolHardening.setRecordingBannerHidden(banner, view.showRecordingBanner);
   if (view.showRecordingBanner) {
     const human = ML_LABEL[view.status.label] || view.status.label || "—";
     bannerDetail.textContent = view.isRemoteRecording
