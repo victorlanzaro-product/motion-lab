@@ -190,6 +190,22 @@ Frontend (`frontend/recorder.js`, máquina de estados pura):
 10. `error != null` é mensagem desta aba; uma rejeição nunca altera o estado
     de gravação mostrado por outra aba.
 
+#### Correções pós-revisão
+
+1. Se o envio do `record_status` inicial falhar, o handler sempre remove o
+   assinante; a câmera não fica retida por uma conexão incompleta.
+2. O sinal de desconexão identifica a sessão do dono. O estado final da sessão
+   A é publicado antes de aceitar a sessão B, sem manter o lock do pipeline
+   durante I/O do CSV.
+3. A fila de controle de cada assinante tem limite de 64 mensagens aplicado
+   pelo produtor e mantém um único callback de aviso pendente. Rejeições e
+   contagens repetidas são agrupadas; transições e estados finais são
+   preservados. Se controles prioritários saturarem a fila, o WebSocket fecha
+   com código 1013 para que a reconexão receba um snapshot atualizado.
+4. Quando o único dono desconecta, o writer fecha e a câmera é liberada.
+5. Se ocorrer `CameraReadError` durante a gravação, o servidor envia o estado
+   final com erro, fecha o writer e retoma o stream após o retry da câmera.
+
 ### Decisões do Sprint 11: sinal facial observável, nunca emoção
 
 `backend/vision/face_detector.py` isola o MediaPipe Face Landmarker (só arquivo
