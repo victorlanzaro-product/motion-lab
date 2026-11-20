@@ -478,7 +478,8 @@ def test_grouped_cv_counts_folds_missing_a_training_class():
     assert all(fold["valid"] for fold in cv["per_fold"][1:])
 
 
-def test_grouped_cv_fails_when_every_training_fold_is_missing_a_class():
+@pytest.mark.parametrize("cv_mode", ["group-kfold", "loso"])
+def test_grouped_cv_fails_when_every_training_fold_is_missing_a_class(cv_mode):
     dataset = Dataset(
         X=[[0.0], [1.0]],
         y=["arm_raised", "arms_open"],
@@ -487,7 +488,41 @@ def test_grouped_cv_fails_when_every_training_fold_is_missing_a_class():
     )
 
     with pytest.raises(DatasetError, match="zero valid folds"):
-        _grouped_cv(dataset, n_estimators=5, random_state=23)
+        _grouped_cv(dataset, n_estimators=5, random_state=23, cv_mode=cv_mode)
+
+
+def test_loso_training_on_recorders_single_label_sessions(tmp_path):
+    path = tmp_path / "dataset.csv"
+    rng = random.Random(7)
+    frame = 0
+    with DatasetWriter(path) as writer:
+        for label in PROTOTYPES:
+            for session in range(3):
+                writer.session_id = f"{label}-{session}"
+                for _ in range(MIN_SAMPLES_PER_CLASS):
+                    features = _complete_features(rng, label, frame)
+                    writer.write(label, features, _complete_motion(rng, frame, features.timestamp))
+                    frame += 1
+
+    report = train(dataset_path=path, model_path=tmp_path / "loso.joblib",
+                   n_estimators=20, cv_mode="loso")
+
+    cv = report.cv
+    assert cv["mode"] == "loso"
+    assert cv["folds_used"] == cv["n_splits"] == 12
+    assert cv["folds_skipped"] == 0
+    assert all(len(fold["test_sessions"]) == 1 for fold in cv["per_fold"])
+    assert all(
+        set(fold["train_sessions"]).isdisjoint(fold["test_sessions"])
+        for fold in cv["per_fold"]
+    )
+    assert {fold["test_sessions"][0] for fold in cv["per_fold"]} == {
+        f"{label}-{session}" for label in PROTOTYPES for session in range(3)
+    }
+    assert cv["macro_f1_oof"] > 0.9
+    assert cv["macro_f1_mean"] <= 0.25  # Each fold contains one true class.
+    assert all(metrics["support"] == MIN_SAMPLES_PER_CLASS for metrics in report.per_class.values())
+    assert load_model(report.model_path)["cv"] == cv
 
 
 def test_training_reports_deterministic_grouped_cv_and_saves_it(tmp_path):
