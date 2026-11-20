@@ -672,6 +672,175 @@ dd {
   font-size: 12px;
 }
 
+.recording-banner {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 74, 90, 0.55);
+  background: rgba(120, 12, 24, 0.92);
+  color: #ffe8ec;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  box-shadow: 0 8px 28px rgba(255, 40, 60, 0.35);
+  pointer-events: none;
+}
+
+.recording-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #ff3d52;
+  box-shadow: 0 0 0 0 rgba(255, 61, 82, 0.7);
+  animation: recording-pulse 1.2s ease-out infinite;
+}
+
+.recording-detail {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  color: #ffc9d0;
+  font-size: 11px;
+}
+
+@keyframes recording-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 61, 82, 0.65);
+  }
+  70% {
+    box-shadow: 0 0 0 10px rgba(255, 61, 82, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 61, 82, 0);
+  }
+}
+
+.recorder-badge {
+  background: rgba(255, 61, 82, 0.16);
+  color: #ff8a98;
+  border-color: rgba(255, 61, 82, 0.35);
+}
+
+.recorder-note,
+.recorder-countdown {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--weak);
+}
+
+.recorder-countdown {
+  color: #ffc9d0;
+  font-weight: 650;
+}
+
+.recorder-error {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(255, 116, 123, 0.45);
+  background: rgba(255, 116, 123, 0.12);
+  color: #ffd4d7;
+  font-size: 12px;
+}
+
+.recorder-label-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.recorder-label-button {
+  min-height: 34px;
+  padding: 6px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.recorder-label-button:hover:not(:disabled) {
+  border-color: rgba(116, 247, 180, 0.45);
+  background: rgba(116, 247, 180, 0.08);
+}
+
+.recorder-label-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.recorder-label-button kbd {
+  margin-left: 6px;
+  opacity: 0.75;
+  font-size: 10px;
+}
+
+.recorder-stop-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.recorder-stop {
+  min-height: 36px;
+  padding: 7px 14px;
+  border: 1px solid rgba(255, 61, 82, 0.5);
+  border-radius: 10px;
+  background: rgba(255, 61, 82, 0.18);
+  color: #ffe8ec;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.recorder-stop:hover:not(:disabled) {
+  background: rgba(255, 61, 82, 0.28);
+}
+
+.recorder-stop:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+
+.recorder-cancel-hint {
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.recorder-counters {
+  margin-bottom: 8px;
+}
+
+.recorder-last {
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.recorder-last-title {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+
 .empty-state {
   padding: 18px;
   text-align: center;

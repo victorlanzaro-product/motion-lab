@@ -92,12 +92,19 @@ function connect() {
     // reads as a broken app.
     setStatus("off", "ligando câmera…");
     hide("banner");
+    const replay = recorder.prepareOutboundReplay();
+    flushRecorderOutbound();
+    if (replay.discardedStart) flashToast(Recorder.START_FAILED_ERROR);
+    renderRecorder();
   };
   socket.onmessage = (event) => handle(JSON.parse(event.data));
   socket.onerror = () => socket.close();
   socket.onclose = () => {
     state.streaming = false;
     setStatus("off", "reconectando…");
+    stopRecorderCountdownTimer();
+    recorder.onWebSocketReconnect();
+    renderRecorder();
     // Exponential backoff, capped: the usual reason for a close is the server
     // restarting, and hammering it while it boots helps nobody.
     const delay = Math.min(5000, 500 * 2 ** state.retries);
@@ -115,6 +122,16 @@ function handle(message) {
       message.face_enabled ? "pending" : "off",
       message.face_enabled ? "procurando rosto" : "rosto desligado",
     );
+    if (Array.isArray(message.record_labels)) {
+      recorder.setLabels(message.record_labels);
+      buildRecorderButtons(message.record_labels);
+    }
+    renderRecorder();
+    return;
+  }
+  if (message.type === "record_status") {
+    recorder.applyStatus(message);
+    renderRecorder();
     return;
   }
   if (message.type === "error") {
@@ -922,5 +939,194 @@ for (const button of presetButtons) {
 }
 
 syncPresetButtons();
+
+// --- Sprint 12 recorder ------------------------------------------------
+
+const recorder = Recorder.createRecorder();
+let recorderCountdownTimer = null;
+let recorderLabels = [];
+
+function recorderSocketOpen() {
+  return Boolean(state.socket) && state.socket.readyState === WebSocket.OPEN;
+}
+
+function sendRecorderOutbound(messages) {
+  if (!messages.length) return [];
+  if (!recorderSocketOpen()) return messages;
+  for (const payload of messages) {
+    state.socket.send(JSON.stringify(payload));
+  }
+  return [];
+}
+
+function deliverRecorderOutbound(batch) {
+  if (!batch.length) return;
+  const payloads = recorder.outboundPayloads(batch);
+  const unsent = sendRecorderOutbound(payloads);
+  if (!unsent.length) return;
+  const unsentKeys = new Set(unsent.map((m) => JSON.stringify(m)));
+  const toRequeue = batch.filter((entry, index) => unsentKeys.has(JSON.stringify(payloads[index])));
+  recorder.requeueOutbound(toRequeue);
+}
+
+function flushRecorderOutbound() {
+  deliverRecorderOutbound(recorder.drainOutbound());
+}
+
+function stopRecorderCountdownTimer() {
+  if (recorderCountdownTimer === null) return;
+  clearInterval(recorderCountdownTimer);
+  recorderCountdownTimer = null;
+}
+
+function ensureRecorderCountdownTimer() {
+  if (recorderCountdownTimer !== null) return;
+  recorderCountdownTimer = setInterval(() => {
+    const outbound = recorder.tick();
+    if (outbound.length) deliverRecorderOutbound(outbound);
+    renderRecorder();
+    if (recorder.snapshot().phase !== "countdown") stopRecorderCountdownTimer();
+  }, 100);
+}
+
+function buildRecorderButtons(labels) {
+  recorderLabels = labels.slice();
+  const host = el("recorder-label-buttons");
+  host.replaceChildren();
+  labels.forEach((label, index) => {
+    const shortcut = String(index + 1);
+    const human = ML_LABEL[label] || label;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "recorder-label-button";
+    button.dataset.recordLabel = label;
+    button.dataset.shortcut = shortcut;
+    button.textContent = human;
+    const key = document.createElement("kbd");
+    key.textContent = shortcut;
+    button.append(key);
+    button.addEventListener("click", () => startRecorderLabel(label));
+    host.append(button);
+  });
+}
+
+function startRecorderLabel(label) {
+  if (!recorder.beginStart(label).ok) return;
+  ensureRecorderCountdownTimer();
+  flushRecorderOutbound();
+  renderRecorder();
+}
+
+function stopRecorder() {
+  if (!recorder.beginStop().ok) return;
+  flushRecorderOutbound();
+  renderRecorder();
+}
+
+function cancelRecorderCountdown() {
+  if (!recorder.cancelCountdown()) return;
+  stopRecorderCountdownTimer();
+  flushRecorderOutbound();
+  renderRecorder();
+}
+
+function renderRecorder() {
+  const view = recorder.snapshot();
+  const banner = el("recording-banner");
+  const bannerDetail = el("recording-banner-detail");
+  toggle("recording-banner", view.showRecordingBanner);
+  if (view.showRecordingBanner) {
+    const human = ML_LABEL[view.status.label] || view.status.label || "—";
+    bannerDetail.textContent = view.isRemoteRecording
+      ? `outra aba · ${human}`
+      : human;
+  } else {
+    bannerDetail.textContent = "";
+  }
+
+  toggle("recorder-live-badge", view.showRecordingBanner);
+  toggle("recorder-remote-note", view.isRemoteRecording);
+  toggle("recorder-cancel-hint", view.cancelCountdownEnabled);
+
+  const countdown = el("recorder-countdown");
+  if (view.phase === "countdown" && view.countdownRemaining !== null) {
+    const human = ML_LABEL[view.countdownLabel] || view.countdownLabel;
+    countdown.textContent = `Iniciando “${human}” em ${view.countdownRemaining}s…`;
+    toggle("recorder-countdown", true);
+  } else {
+    countdown.textContent = "";
+    toggle("recorder-countdown", false);
+  }
+
+  const errorBox = el("recorder-error");
+  const errorText = view.status.error;
+  if (errorText) {
+    errorBox.textContent = errorText;
+    toggle("recorder-error", true);
+  } else {
+    errorBox.textContent = "";
+    toggle("recorder-error", false);
+  }
+
+  for (const button of el("recorder-label-buttons").querySelectorAll("[data-record-label]")) {
+    button.disabled = !view.startEnabled;
+  }
+  const stopButton = el("recorder-stop");
+  stopButton.disabled = !view.stopEnabled;
+
+  if (view.status.recording) {
+    el("recorder-written").textContent = String(view.status.written);
+    el("recorder-skipped").textContent = String(view.status.skipped);
+  } else if (view.lastSummary) {
+    el("recorder-written").textContent = String(view.lastSummary.written);
+    el("recorder-skipped").textContent = String(view.lastSummary.skipped);
+  } else {
+    el("recorder-written").textContent = "—";
+    el("recorder-skipped").textContent = "—";
+  }
+
+  const last = view.lastSummary;
+  if (last) {
+    toggle("recorder-last", true);
+    el("recorder-last-label").textContent = ML_LABEL[last.label] || last.label;
+    el("recorder-last-session").textContent = last.session_id;
+    el("recorder-last-written").textContent = String(last.written);
+    el("recorder-last-skipped").textContent = String(last.skipped);
+  } else {
+    toggle("recorder-last", false);
+  }
+}
+
+el("recorder-stop").addEventListener("click", () => stopRecorder());
+
+document.addEventListener("keydown", (event) => {
+  if (typingTarget(event.target)) return;
+  const digit = event.key.length === 1 && event.key >= "1" && event.key <= "9"
+    ? Number(event.key)
+    : null;
+  if (digit !== null && digit <= recorderLabels.length) {
+    const view = recorder.snapshot();
+    if (!view.startEnabled) {
+      flashToast("Gravação indisponível agora");
+      return;
+    }
+    event.preventDefault();
+    startRecorderLabel(recorderLabels[digit - 1]);
+    return;
+  }
+  if (event.key === " " || event.code === "Space") {
+    const view = recorder.snapshot();
+    if (!view.stopEnabled) return;
+    event.preventDefault();
+    stopRecorder();
+    return;
+  }
+  if (event.key === "Escape") {
+    const view = recorder.snapshot();
+    if (!view.cancelCountdownEnabled) return;
+    event.preventDefault();
+    cancelRecorderCountdown();
+  }
+});
 
 connect();
