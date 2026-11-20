@@ -112,7 +112,7 @@ def test_v2_prediction_returns_none_when_optional_bundle_is_missing():
     assert PipelineRunner._predict(None, features, None, window_state=ready) is None
 
 
-def test_stream_clears_v2_window_history_after_pose_loss(monkeypatch):
+def test_stream_clears_v2_window_history_after_pose_loss(tmp_path, monkeypatch):
     import backend.web.pipeline as pipeline_module
 
     predictions = []
@@ -166,6 +166,7 @@ def test_stream_clears_v2_window_history_after_pose_loss(monkeypatch):
                 detected=frame.detected,
                 frame_index=frame.frame_index,
                 timestamp=frame.timestamp,
+                    inference_ms=0.0,
             )
 
     class Trail:
@@ -193,7 +194,11 @@ def test_stream_clears_v2_window_history_after_pose_loss(monkeypatch):
         ),
     )
     monkeypatch.setattr(pipeline_module, "encode_preview", lambda *_args, **_kwargs: "")
-    monkeypatch.setattr(pipeline_module, "frame_message", lambda **_kwargs: {"type": "frame"})
+    monkeypatch.setattr(
+        pipeline_module,
+        "frame_message",
+        lambda **kwargs: {"type": "frame", "timings": kwargs["timings"]},
+    )
     monkeypatch.setattr(
         pipeline_module,
         "load_ml_model",
@@ -211,7 +216,9 @@ def test_stream_clears_v2_window_history_after_pose_loss(monkeypatch):
         lambda _bundle, row: predictions.append(row["timestamp"]) or ("wave", {}),
     )
 
-    runner = AlwaysSubscribedRunner(WebConfig(model_schema=2))
+    model_path = tmp_path / "v2-model.joblib"
+    model_path.touch()
+    runner = AlwaysSubscribedRunner(WebConfig(model_schema=2, model_path=model_path))
     try:
         runner._stream(Camera(), Detector())
     finally:
