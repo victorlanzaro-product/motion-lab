@@ -1,10 +1,10 @@
 # Regras de trabalho dos agentes Maestri
 
-Este repositório é público. Todo trabalho deve ser local e usar somente exemplos sintéticos e conteúdo já aprovado.
+Este repositório é público. Todo trabalho deve ser local e usar somente exemplos sintéticos e conteúdo já aprovado. No Maestri Box, use o checkout do projeto em `~/projetos/motion-lab` e execute os comandos a partir dele; não presuma que caminhos do host OpenBot estejam montados.
 
 ## Papéis
 
-- **Programador:** implementa uma tarefa aberta, uma por vez, em sua branch de tarefa. Mantém o escopo e os critérios definidos em `TAREFAS.md`.
+- **Programador:** implementa uma tarefa aberta, uma por vez, em sua branch. Mantém o escopo e os critérios definidos em `TAREFAS.md`.
 - **Revisor:** não altera arquivos. Confere o diff contra o objetivo, critérios, testes, privacidade e escopo; registra achados concretos.
 - **Testador:** verifica o comportamento sem alterar código, executa testes e checks do projeto e registra comandos, resultados e limitações.
 
@@ -12,7 +12,7 @@ Este repositório é público. Todo trabalho deve ser local e usar somente exemp
 
 1. Leia este arquivo, `README.md`, o código relacionado e `TAREFAS.md`.
 2. Pegue apenas uma tarefa com status **aberta**. Altere para **em andamento** e registre a branch.
-3. Crie uma branch no formato `tN-descricao`, por exemplo `t1-foto-folha`. Faça todo o trabalho e commits nessa branch; nunca faça commit na `main`.
+3. Crie uma branch no formato `tN-descricao`, por exemplo `t1-feature-right-wrist`. Faça todo o trabalho e commits nessa branch; nunca faça commit na `main`.
 4. Antes de marcar **pronta para revisão**, rode os testes e checks aplicáveis documentados no README e no projeto. Para a suíte principal, use `uv run pytest -q`. Rode também a demonstração relevante quando o critério da tarefa pedir. Registre os resultados em `TAREFAS.md` ou na descrição do PR.
 5. Solicite revisão por PR. Só marque **aprovada** após revisão da Helena (OpenBot) e aprovação do Victor.
 

@@ -7,7 +7,7 @@ Status permitidos: `aberta`, `em andamento`, `pronta para revisão`, `aprovada`.
 ## T1
 
 - **ID:** T1
-- **objetivo:** adicionar suporte local a fotografias de celular de folhas impressas com conteúdo inteiramente fictício, incluindo inclinação, perspectiva leve, iluminação desigual e sombras, sem regredir a leitura do lote sintético atual.
-- **critério de pronto:** criar um conjunto de 30 capturas de folhas impressas com identificadores e respostas fictícios, cobrindo ao menos três faixas de inclinação (0–10°, 11–20° e 21–30°) e condições de iluminação uniforme, desigual e com sombra. O fluxo deve identificar corretamente aluno demonstrativo e variante A/B/C em 30/30 capturas, preservar 30/30 no lote sintético atual, produzir uma linha CSV por captura e sinalizar marcações ambíguas sem adivinhar. Documentar aparelho/condições e limitações; nenhum dado real ou vídeo.
+- **objetivo:** cobrir com um teste determinístico o lado direito do extrator de features quando o punho direito está acima do ombro, usando uma pose sintética.
+- **critério de pronto:** em `tests/test_features.py`, criar uma pose sintética baseada no fixture `standing()` com `RIGHT_WRIST` acima do ombro direito e verificar por `extract()` que `right_wrist_above_shoulder` é `True`, `right_wrist_height > 0`, enquanto o braço esquerdo pendente continua `False` e com altura negativa. `uv run pytest -q tests/test_features.py` passa sem câmera, modelo ou vídeo.
 - **status:** aberta
-- **branch:** `t1-foto-folha`
+- **branch:** `t1-feature-right-wrist`
