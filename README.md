@@ -236,7 +236,6 @@ Frontend (`frontend/confidence-timeline.js`, `health-panel.js`, `app.js`):
 10. **Link “Relatório” sempre navegável.** `report_available` só muda o `title` e
     a classe `.pending`; 404 no servidor carrega a mensagem curta — o cliente não
     desabilita o link.
-
 ### Decisões do Sprint 12: gravar é um comando ao servidor, nunca um arquivo do navegador
 
 Contrato completo em `docs/sprints/12-recorder.md`. O navegador manda

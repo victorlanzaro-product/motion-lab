@@ -379,6 +379,11 @@ summary:focus-visible {
   backdrop-filter: blur(14px);
 }
 
+.banner.degradation {
+  border-color: rgba(255, 182, 110, 0.58);
+  color: #ffe2c4;
+}
+
 .banner {
   top: 58px;
   left: 14px;
@@ -1383,15 +1388,26 @@ code {
     display: none;
   }
 
+  /* Tabs above panel body; internal scroll avoids headings under tab bar at ~390px. */
   .panel-tabs {
-    position: sticky;
-    top: 61px;
-    z-index: 8;
+    position: static;
+    top: auto;
+    z-index: 1;
     background: rgba(11, 16, 24, 0.96);
+  }
+
+  .panel-scroll {
+    max-height: min(72vh, 760px);
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
   }
 
   .tab-panel {
     padding: 16px;
+  }
+
+  .tab-panel > .section-heading {
+    scroll-margin-top: 8px;
   }
 
   .signal-grid,
