@@ -1062,11 +1062,20 @@ def test_a_slow_client_gets_the_newest_frame_not_a_backlog():
     assert dropped == 2
 
 
-def test_control_flood_is_bounded_and_keeps_recording_transitions():
+def test_control_flood_is_bounded_and_keeps_recording_transitions(monkeypatch):
     """A rejected-command flood cannot hide the start or final stop status."""
 
     async def scenario():
-        subscriber = Subscriber(asyncio.get_running_loop())
+        loop = asyncio.get_running_loop()
+        subscriber = Subscriber(loop)
+        schedule = loop.call_soon_threadsafe
+        notifications = []
+
+        def track_notification(callback, *args):
+            notifications.append((callback, args))
+            return schedule(callback, *args)
+
+        monkeypatch.setattr(loop, "call_soon_threadsafe", track_notification)
         started = {
             "type": "record_status",
             "recording": True,
@@ -1108,6 +1117,10 @@ def test_control_flood_is_bounded_and_keeps_recording_transitions():
         }
         subscriber.offer(stopped)
         queued = len(subscriber._control)
+        # The loop has not run a wakeup yet. The messages must already be in
+        # the bounded buffer, with only one callback and no payload in it.
+        assert subscriber._control.maxlen == Subscriber.MAX_CONTROL_MESSAGES
+        assert notifications == [(subscriber._wake_reader, ())]
         messages = [await subscriber.get() for _ in range(queued)]
         return queued, messages, started, stopped, repeated_rejection
 
@@ -1161,6 +1174,17 @@ def test_final_only_control_overflow_closes_socket_for_fresh_snapshot(overflow_m
             )
         assert len(subscriber._control) == Subscriber.MAX_CONTROL_MESSAGES
         assert all(subscriber._is_final_record_status(item) for item in subscriber._control)
+
+        pending = list(subscriber._control)
+        subscriber.offer(
+            {
+                "type": "record_status",
+                "recording": False,
+                "session_id": None,
+                "error": "No recording is active.",
+            }
+        )
+        assert list(subscriber._control) == pending
 
         subscriber.offer(overflow_message)
 
