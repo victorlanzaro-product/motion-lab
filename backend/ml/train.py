@@ -1,6 +1,6 @@
 """Model Training — labeled CSV rows in, a Random Forest bundle out.
 
-Five decisions carry this file:
+Six decisions carry this file:
 
 1. **The input vector is one tuple, imported by both sides.** `TRAINING_COLUMNS`
    is the exact order the model is fit on. Sprint 09 builds the same vector
@@ -8,13 +8,13 @@ Five decisions carry this file:
    from `bundle["columns"]`, never from this module's own `TRAINING_COLUMNS`,
    so a model saved before a column change still predicts correctly against
    the vector it actually shipped with (see decision 4).
-2. **Motion is out of the training vector entirely (Sprint 11).**
+2. **The v1 frame vector excludes per-frame motion (Sprint 11).**
    `DEFAULT_LABELS` (`arm_raised`, `arms_crossed`, `arms_open`, `idle`) is
    purely postural -- every one of them is fully readable from one frame's
    static features -- so `TRAINING_COLUMNS` is exactly `FEATURE_NAMES`, no
    velocity, no direction. `MOTION_COLUMNS` still rides along in
    `dataset.csv` (`backend/dataset/writer.py`) for whatever future label
-   genuinely needs arm speed, but the model committed to disk never sees it;
+   genuinely needs arm speed, but a v1 model committed to disk never sees it;
    this also means inference works on the very first complete frame
    (`FrameFeatures.complete`), without waiting for `MotionTracker` to warm up
    (`MotionState.complete`). `shoulder_width` is excluded for the same reason
@@ -42,17 +42,18 @@ Five decisions carry this file:
    side -- `_grouped_split` retries a small, deterministic sequence of seeds
    until every class lands on both sides, and fails loudly with an
    actionable message if none of the attempts do.
-5. **"wave" cannot be trained here, so a legacy row for it is a hard error,
-   not a silent drop.** It is motion, not posture, and this vector cannot
-   reproduce the reversal window `GestureEngine`'s `_WaveDetector` actually
-   needs to recognize one for real. `backend/dataset/writer.py:REMOVED_LABELS`
-   blocks new recordings of it; `load_dataset` below raises `DatasetError`
-   with migration steps if it finds the label anyway, in a `dataset.csv`
-   written before that rule existed -- never silently trains on it or folds
-   it into `dropped`, where a real problem would go unnoticed. The same
-   `load_dataset` pass also rejects any label outside `DEFAULT_LABELS`
-   entirely (a typo, a stray capitalization, a class that never went through
-   that vocabulary) for the same reason.
+5. **`wave` belongs only to schema 2.** Schema 1 still rejects legacy wave
+   rows because its static per-frame vector cannot reproduce the reversals
+   `_WaveDetector` uses. `backend/dataset/writer.py:REMOVED_LABELS` and
+   `DEFAULT_LABELS` remain unchanged for v1 recording. Schema 2 rebuilds
+   temporal windows from the existing CSV and extends the training vocabulary
+   explicitly with `V2_LABELS`; `load_window_dataset` rejects every other
+   unknown label rather than silently dropping it.
+6. **A saved bundle names its schema and never falls back.** Old untagged
+   bundles are schema 1. A schema 2 bundle records `schema_version`,
+   `window_seconds`, and `deadband`; callers must request the matching schema
+   from `load_model`, so a frame-only consumer cannot accidentally load a
+   temporal model.
 
 A missing value is never a silent 0. `_to_number` used to treat an empty CSV
 cell (a joint MediaPipe couldn't see, or a motion column with no history yet)
@@ -93,10 +94,14 @@ from backend.dataset.writer import (
     DEFAULT_LABELS,
     NUMERIC_MOTION_COLUMNS,
     REMOVED_LABELS,
+    V2_LABELS,
 )
+from backend.dataset.windows import WINDOW_TRAINING_COLUMNS, build_window_rows
 from backend.features.features import FEATURE_NAMES
+from backend.features.window import DEFAULT_WINDOW_DEADBAND
 
 DEFAULT_MODEL_PATH = Path("backend/models/gesture_classifier.joblib")
+DEFAULT_V2_MODEL_PATH = Path("backend/models/gesture_classifier_v2.joblib")
 
 #: Below this many examples of a class, a train/test split cannot say anything
 #: trustworthy about it.
@@ -116,6 +121,7 @@ TRAINING_COLUMNS: tuple[str, ...] = FEATURE_NAMES
 #: may still carry, so an older model file stays loadable rather than being
 #: treated as corrupt just because the trainable vector shrank.
 KNOWN_TRAINING_COLUMNS: frozenset[str] = frozenset(FEATURE_NAMES) | frozenset(NUMERIC_MOTION_COLUMNS)
+KNOWN_V2_TRAINING_COLUMNS: frozenset[str] = frozenset(WINDOW_TRAINING_COLUMNS)
 
 
 class DatasetError(RuntimeError):
@@ -161,7 +167,9 @@ def build_vector(row: dict, columns: tuple[str, ...] = TRAINING_COLUMNS) -> list
     return [_to_number(row.get(name)) for name in columns]
 
 
-def classify_dataset_row(row: dict) -> tuple[str | None, list[float] | None]:
+def classify_dataset_row(
+    row: dict, allowed_labels: tuple[str, ...] = DEFAULT_LABELS
+) -> tuple[str | None, list[float] | None]:
     """Apply the row-level rules shared by training and dataset inspection.
 
     Stats needs to count an unknown label without treating it as a trainable
@@ -171,7 +179,7 @@ def classify_dataset_row(row: dict) -> tuple[str | None, list[float] | None]:
     label = (row.get("label") or "").strip()
     if not label:
         return "missing_label", None
-    if label not in DEFAULT_LABELS:
+    if label not in allowed_labels:
         return "unknown_label", None
     try:
         vector = build_vector(row)
@@ -283,6 +291,102 @@ def load_dataset(path: Path = DEFAULT_DATASET_PATH) -> Dataset:
     return Dataset(X=X, y=y, groups=groups, counts=counts, dropped=dropped)
 
 
+def load_window_dataset(
+    path: Path = DEFAULT_DATASET_PATH,
+    window_seconds: float = 1.0,
+    max_gap: float = 0.30,
+    min_samples: int = 4,
+    deadband: float = DEFAULT_WINDOW_DEADBAND,
+) -> Dataset:
+    """Read a frame CSV, rebuild complete windows, and vectorize schema 2.
+
+    Labels are checked against the v2-only vocabulary before window building.
+    The source CSV remains the v1 frame schema; no recording or migration is
+    required. Invalid warm-up/gap windows are omitted by the shared builder.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise DatasetError(
+            f"No dataset at {path}. Record samples first: "
+            "uv run python scripts/hello_dataset.py"
+        )
+
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        header = set(reader.fieldnames or ())
+        missing_columns = set(DATASET_COLUMNS) - header
+        if missing_columns:
+            raise DatasetError(
+                f"{path} is missing column(s) {sorted(missing_columns)} — its header "
+                "does not match backend/dataset/writer.py:DATASET_COLUMNS. Re-record "
+                "with the current hello_dataset.py rather than hand-editing the CSV."
+            )
+        rows = list(reader)
+
+    for row in rows:
+        label = (row.get("label") or "").strip()
+        if label and label not in V2_LABELS:
+            raise DatasetError(
+                f"{path} has row(s) labeled {label!r}, which is not one of the "
+                f"schema 2 trainable classes {V2_LABELS}."
+            )
+
+    try:
+        window_rows = build_window_rows(
+            rows,
+            window_seconds=window_seconds,
+            max_gap=max_gap,
+            min_samples=min_samples,
+            deadband=deadband,
+        )
+    except (TypeError, ValueError) as exc:
+        raise DatasetError(f"Could not rebuild schema 2 windows from {path}: {exc}") from exc
+
+    labeled_rows = sum(bool((row.get("label") or "").strip()) for row in rows)
+    labeled_windows = sum(bool((row.get("label") or "").strip()) for row in window_rows)
+    X: list[list[float]] = []
+    y: list[str] = []
+    groups: list[str] = []
+    counts: dict[str, int] = {}
+    dropped = {
+        "missing_label": sum(not bool((row.get("label") or "").strip()) for row in rows),
+        "missing_feature": 0,
+        "non_finite": 0,
+        "invalid_window": max(0, labeled_rows - labeled_windows),
+    }
+
+    for row in window_rows:
+        label = (row.get("label") or "").strip()
+        if not label:
+            continue
+        try:
+            vector = build_vector(row, WINDOW_TRAINING_COLUMNS)
+        except MissingFeatureError:
+            dropped["missing_feature"] += 1
+            continue
+        if not all(math.isfinite(value) for value in vector):
+            dropped["non_finite"] += 1
+            continue
+        X.append(vector)
+        y.append(label)
+        groups.append(row.get("session_id") or "")
+        counts[label] = counts.get(label, 0) + 1
+
+    if not counts:
+        raise DatasetError(
+            f"{path} has no usable schema 2 windows (dropped: {dropped}). "
+            "Record longer sessions with complete wrist visibility."
+        )
+    too_few = {label: count for label, count in counts.items() if count < MIN_SAMPLES_PER_CLASS}
+    if too_few:
+        shown = ", ".join(f"{label}={count}" for label, count in too_few.items())
+        raise DatasetError(
+            f"Not enough schema 2 windows per class (need >= {MIN_SAMPLES_PER_CLASS}): "
+            f"{shown}. Record longer sessions with complete wrist visibility."
+        )
+    return Dataset(X=X, y=y, groups=groups, counts=counts, dropped=dropped)
+
+
 #: Deterministic bound on how many alternate seeds `_grouped_split` tries
 #: before giving up on a split with every class on both sides. Fixed and
 #: small on purpose (decision 4b below) — a dataset that needs more than this
@@ -336,7 +440,8 @@ def _grouped_split(
 
 
 def _grouped_cv(
-    dataset: "Dataset", n_estimators: int, random_state: int, *, cv_mode: str = "group-kfold"
+    dataset: "Dataset", n_estimators: int, random_state: int, *,
+    cv_mode: str = "group-kfold", oof_labels: tuple[str, ...] = DEFAULT_LABELS,
 ) -> dict[str, Any]:
     """Measure macro-F1 on deterministic held-out session folds.
 
@@ -430,7 +535,7 @@ def _grouped_cv(
         result["mode"] = "loso"
         result["macro_f1_oof"] = float(
             f1_score(
-                oof_truth, oof_predicted, labels=DEFAULT_LABELS, average="macro", zero_division=0
+                oof_truth, oof_predicted, labels=oof_labels, average="macro", zero_division=0
             )
         )
     return result
@@ -505,21 +610,42 @@ class TrainingReport:
 
 def train(
     dataset_path: Path = DEFAULT_DATASET_PATH,
-    model_path: Path = DEFAULT_MODEL_PATH,
+    model_path: Path | None = None,
     test_size: float = 0.25,
     random_state: int = 42,
     n_estimators: int = 200,
+    schema: int = 1,
+    window_seconds: float = 1.0,
+    max_gap: float = 0.30,
+    min_samples: int = 4,
+    deadband: float = DEFAULT_WINDOW_DEADBAND,
     *,
     cv_mode: str = "group-kfold",
 ) -> TrainingReport:
     """Load, split, fit, evaluate, save. One call, one artifact.
 
-    The split is grouped by `session_id` (decision 4 above) — every frame of
-    a given recording session lands entirely on one side, so the reported
-    accuracy reflects generalising to an unseen session, not memorising this
-    one's near-duplicate frames.
+    Schema 1 preserves the frame-level Sprint 13 path. Schema 2 rebuilds
+    windows from the same session-labeled frame CSV and fits static last-frame
+    features plus temporal summaries. Both use grouped session CV and split.
     """
-    dataset = load_dataset(dataset_path)
+    if type(schema) is not int or schema not in (1, 2):
+        raise DatasetError(f"Unsupported model schema {schema!r}; choose schema 1 or 2.")
+    if schema == 1:
+        dataset = load_dataset(dataset_path)
+        columns = TRAINING_COLUMNS
+        resolved_model_path = Path(model_path) if model_path is not None else DEFAULT_MODEL_PATH
+    else:
+        dataset = load_window_dataset(
+            dataset_path,
+            window_seconds=window_seconds,
+            max_gap=max_gap,
+            min_samples=min_samples,
+            deadband=deadband,
+        )
+        columns = WINDOW_TRAINING_COLUMNS
+        resolved_model_path = (
+            Path(model_path) if model_path is not None else DEFAULT_V2_MODEL_PATH
+        )
     unique_sessions = sorted(set(dataset.groups))
     if len(unique_sessions) < 2:
         only = unique_sessions[0] if unique_sessions else "<empty>"
@@ -559,7 +685,10 @@ def train(
             "that also covers that label."
         )
 
-    cv = _grouped_cv(dataset, n_estimators=n_estimators, random_state=random_state, cv_mode=cv_mode)
+    cv = _grouped_cv(
+        dataset, n_estimators=n_estimators, random_state=random_state, cv_mode=cv_mode,
+        oof_labels=V2_LABELS if schema == 2 else DEFAULT_LABELS,
+    )
     split = _loso_diagnostic_split if cv_mode == "loso" else _grouped_split
     train_idx, test_idx = split(dataset, test_size, random_state)
     X_train = [dataset.X[i] for i in train_idx]
@@ -577,12 +706,12 @@ def train(
         y_test, predicted, labels=class_labels, zero_division=0, output_dict=True
     )
     per_class = {label: per_class_report[label] for label in class_labels}
-    feature_importances = dict(zip(TRAINING_COLUMNS, model.feature_importances_.tolist()))
+    feature_importances = dict(zip(columns, model.feature_importances_.tolist()))
     accuracy = accuracy_score(y_test, predicted)
     macro_f1 = per_class_report["macro avg"]["f1-score"]
     balanced_accuracy = balanced_accuracy_score(y_test, predicted)
 
-    model_path = Path(model_path)
+    model_path = resolved_model_path
     model_path.parent.mkdir(parents=True, exist_ok=True)
     trained_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     # Model, column order and class list travel together in one file — the
@@ -593,25 +722,33 @@ def train(
     # The evaluation numbers ride along too (Sprint 10): `scripts/report.py`
     # regenerates the HTML report from `load_model()` alone, without
     # re-running training.
-    joblib.dump(
-        {
-            "model": model,
-            "columns": TRAINING_COLUMNS,
-            "classes": class_labels,
-            "trained_at": trained_at,
-            "n_samples": len(dataset.y),
-            "counts": dataset.counts,
-            "confusion_matrix": matrix,
-            "per_class": per_class,
-            "feature_importances": feature_importances,
-            "accuracy": accuracy,
-            "macro_f1": macro_f1,
-            "balanced_accuracy": balanced_accuracy,
-            "cv": cv,
-            "dataset_path": str(Path(dataset_path)),
-        },
-        model_path,
-    )
+    bundle = {
+        "model": model,
+        "columns": columns,
+        "classes": class_labels,
+        "trained_at": trained_at,
+        "n_samples": len(dataset.y),
+        "counts": dataset.counts,
+        "confusion_matrix": matrix,
+        "per_class": per_class,
+        "feature_importances": feature_importances,
+        "accuracy": accuracy,
+        "macro_f1": macro_f1,
+        "balanced_accuracy": balanced_accuracy,
+        "cv": cv,
+        "dataset_path": str(Path(dataset_path)),
+    }
+    if schema == 2:
+        bundle.update(
+            {
+                "schema_version": 2,
+                "window_seconds": float(window_seconds),
+                "max_gap": float(max_gap),
+                "min_samples": int(min_samples),
+                "deadband": float(deadband),
+            }
+        )
+    joblib.dump(bundle, model_path)
 
     return TrainingReport(
         model_path=model_path,
@@ -631,7 +768,14 @@ def train(
     )
 
 
-def load_model(path: Path = DEFAULT_MODEL_PATH) -> dict[str, Any]:
+def load_model(path: Path = DEFAULT_MODEL_PATH, schema: int = 1) -> dict[str, Any]:
+    """Load a model only when its stored schema matches the requested one.
+
+    Bundles from before schema tagging are v1. The default remains schema 1
+    for every existing caller; v2 consumers must opt in explicitly.
+    """
+    if type(schema) is not int or schema not in (1, 2):
+        raise ModelError(f"Unsupported model schema {schema!r}; choose schema 1 or 2.")
     path = Path(path)
     if not path.exists():
         raise ModelError(
@@ -639,6 +783,56 @@ def load_model(path: Path = DEFAULT_MODEL_PATH) -> dict[str, Any]:
             "uv run python scripts/train_model.py"
         )
     bundle = joblib.load(path)
+    stored_schema = bundle.get("schema_version", 1) if isinstance(bundle, dict) else None
+    if type(stored_schema) is not int or stored_schema not in (1, 2):
+        raise ModelError(
+            f"{path} has invalid schema_version {stored_schema!r}; expected 1 or 2."
+        )
+    if stored_schema != schema:
+        raise ModelError(
+            f"model schema mismatch: requested schema {schema}, but {path} contains "
+            f"schema {stored_schema}. Pass the matching schema explicitly or train "
+            "a separate model; automatic v1/v2 fallback is disabled."
+        )
+    if schema == 2:
+        missing_v2 = [
+            key
+            for key in ("window_seconds", "max_gap", "min_samples", "deadband")
+            if key not in bundle
+        ]
+        if missing_v2:
+            raise ModelError(
+                f"{path} schema 2 bundle is missing {missing_v2}; retrain the v2 model."
+            )
+        raw_window_seconds = bundle["window_seconds"]
+        raw_max_gap = bundle["max_gap"]
+        raw_min_samples = bundle["min_samples"]
+        raw_deadband = bundle["deadband"]
+        if (
+            isinstance(raw_window_seconds, bool)
+            or not isinstance(raw_window_seconds, (int, float))
+            or isinstance(raw_max_gap, bool)
+            or not isinstance(raw_max_gap, (int, float))
+            or isinstance(raw_min_samples, bool)
+            or not isinstance(raw_min_samples, int)
+            or isinstance(raw_deadband, bool)
+            or not isinstance(raw_deadband, (int, float))
+        ):
+            raise ModelError(
+                f"{path} schema 2 bundle has invalid window metadata."
+            )
+        window_seconds = float(raw_window_seconds)
+        max_gap = float(raw_max_gap)
+        min_samples = raw_min_samples
+        deadband = float(raw_deadband)
+        if not math.isfinite(window_seconds) or window_seconds <= 0:
+            raise ModelError(f"{path} schema 2 bundle has invalid window_seconds.")
+        if not math.isfinite(max_gap) or max_gap <= 0:
+            raise ModelError(f"{path} schema 2 bundle has invalid max_gap.")
+        if min_samples < 2:
+            raise ModelError(f"{path} schema 2 bundle has invalid min_samples.")
+        if not math.isfinite(deadband) or deadband < 0:
+            raise ModelError(f"{path} schema 2 bundle has invalid deadband.")
     # `columns`/`classes`/`model` are the three `predict()` actually reads
     # (module docstring, decision 1) -- missing or empty any of them means
     # this file was saved by an incompatible or corrupt version of `train()`,
@@ -677,13 +871,18 @@ def load_model(path: Path = DEFAULT_MODEL_PATH) -> dict[str, Any]:
             "silently double-count that feature and shift every column after it "
             "out of alignment. Retrain with the current scripts/train_model.py."
         )
-    unknown_columns = [name for name in columns if name not in KNOWN_TRAINING_COLUMNS]
+    allowed_columns = KNOWN_V2_TRAINING_COLUMNS if schema == 2 else KNOWN_TRAINING_COLUMNS
+    unknown_columns = [name for name in columns if name not in allowed_columns]
     if unknown_columns:
         raise ModelError(
             f"{path}'s 'columns' has unrecognized name(s) {unknown_columns} — not in "
-            "backend/features/features.py:FEATURE_NAMES or "
-            "backend/dataset/writer.py:NUMERIC_MOTION_COLUMNS. Retrain with the "
+            "the feature columns allowed by its schema. Retrain with the "
             "current scripts/train_model.py."
+        )
+    if schema == 2 and columns != WINDOW_TRAINING_COLUMNS:
+        raise ModelError(
+            f"{path} schema 2 bundle columns do not match the current window feature "
+            "contract. Retrain with the current scripts/train_model.py."
         )
     model = bundle["model"]
     n_features_in = getattr(model, "n_features_in_", None)

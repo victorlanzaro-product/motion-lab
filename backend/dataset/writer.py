@@ -21,16 +21,11 @@ Four decisions carry this file:
    filename, so `data/training/dataset.csv` accumulates across every
    recording session and Sprint 08 never has to glob and concatenate files to
    see the whole dataset.
-4. **"wave" is not a trainable label.** It is a class of *motion* (a
-   direction reversal repeated a few times), not a posture, and this
-   per-frame vector only ever carries one instant's velocity/direction — not
-   the reversal window `GestureEngine`'s `_WaveDetector`
-   (`backend/gestures/engine.py`) actually needs to tell a real wave from an
-   arm rising without repeating. Recording "wave" here would silently train
-   the Forest on a signal it cannot separate, and report a confident label
-   for something it never really learned. `write()` refuses the label
-   outright (`REMOVED_LABELS`); recognizing a wave stays `GestureEngine`'s
-   job alone until the ML vector gets a real temporal window.
+4. **"wave" is opt-in for temporal data only.** It is motion, not posture,
+   and the default per-frame vocabulary cannot recognize its repeated
+   reversals. `REMOVED_LABELS` and `DEFAULT_LABELS` keep the v1 behavior;
+   callers that explicitly use `V2_LABELS` can record it for the temporal
+   model without changing the CSV columns.
 """
 
 from __future__ import annotations
@@ -45,6 +40,7 @@ from backend.features.velocity import MotionState
 
 #: Default recording path: features + motion, labeled, never pixels.
 DEFAULT_DATASET_PATH = Path("data/training/dataset.csv")
+DEFAULT_V2_DATASET_PATH = Path("data/training/dataset_v2.csv")
 
 #: The four classes Sprint 07 collects by default. "idle" is not a gesture at
 #: all — it is the negative example. Without it a classifier only ever sees
@@ -52,11 +48,12 @@ DEFAULT_DATASET_PATH = Path("data/training/dataset.csv")
 #: deliberately absent — see module docstring, decision 4, and `REMOVED_LABELS`.
 DEFAULT_LABELS: tuple[str, ...] = ("arm_raised", "arms_crossed", "arms_open", "idle")
 
-#: Labels this dataset used to collect and no longer does, mapped to why —
-#: `write()` refuses them so a session cannot silently start re-accumulating
-#: rows for a label the trainable vocabulary dropped. Keyed by label so a
-#: second removed label in the future has one place to add to, not a second
-#: bespoke check.
+#: Temporal schema 2 explicitly opts into the motion label while all v1
+#: callers and DatasetWriter defaults keep the posture-only vocabulary.
+V2_LABELS: tuple[str, ...] = DEFAULT_LABELS + ("wave",)
+
+#: Labels rejected by the default v1 writer, mapped to why. An explicit v2
+#: `allowed_labels` can opt into a label here when its model schema supports it.
 REMOVED_LABELS: dict[str, str] = {
     "wave": (
         "'wave' is out of the trainable ML vocabulary (module docstring, "
@@ -109,7 +106,9 @@ class DatasetWriterError(RuntimeError):
     `skipped`/`FrameFeatures.complete` already models (an occluded joint)."""
 
 
-def validate_label(label: str) -> str:
+def validate_label(
+    label: str, allowed_labels: tuple[str, ...] = DEFAULT_LABELS
+) -> str:
     """Return the canonical label or raise the writer's own explanation.
 
     The browser must reject a bad label before opening the shared CSV. Keeping
@@ -119,15 +118,18 @@ def validate_label(label: str) -> str:
     label = (label or "").strip()
     if not label:
         raise DatasetWriterError("label must be a non-empty string.")
+    allowed_labels = tuple(allowed_labels)
+    if label in allowed_labels:
+        return label
     if label in REMOVED_LABELS:
         raise DatasetWriterError(REMOVED_LABELS[label])
-    if label not in DEFAULT_LABELS:
+    if label not in allowed_labels:
         casefolded = label.casefold()
-        match = next((known for known in DEFAULT_LABELS if known.casefold() == casefolded), None)
+        match = next((known for known in allowed_labels if known.casefold() == casefolded), None)
         hint = f" Did you mean {match!r}? Labels are case-sensitive." if match else ""
         raise DatasetWriterError(
             f"{label!r} is not a recognized label -- DatasetWriter only accepts "
-            f"{DEFAULT_LABELS} (whitespace already stripped, case must match "
+            f"{allowed_labels} (whitespace already stripped, case must match "
             f"exactly).{hint} A genuinely new class needs a product decision to "
             "add it to backend/dataset/writer.py:DEFAULT_LABELS first."
         )
@@ -159,9 +161,15 @@ class DatasetWriter:
     Ctrl+C must not lose the samples already written.
     """
 
-    def __init__(self, path: Path = DEFAULT_DATASET_PATH, session_id: str = "") -> None:
+    def __init__(
+        self,
+        path: Path = DEFAULT_DATASET_PATH,
+        session_id: str = "",
+        allowed_labels: tuple[str, ...] = DEFAULT_LABELS,
+    ) -> None:
         self.path = Path(path)
         self.session_id = session_id
+        self.allowed_labels = tuple(allowed_labels)
         self.counts: dict[str, int] = {}
         self.skipped = 0
         self._file = None
@@ -222,6 +230,9 @@ class DatasetWriter:
         from two different frames (a bug upstream, not an occlusion), or a
         non-finite value that slipped past `FrameFeatures`/`MotionState`.
         """
+        # Validate before opening the CSV so a rejected v1 `wave` request
+        # cannot create even an empty dataset file.
+        label = validate_label(label, self.allowed_labels)
         if self._writer is None:
             self.open()
         if not self.session_id:
@@ -230,7 +241,6 @@ class DatasetWriter:
                 "grouped train/test split (backend/ml/train.py) to mean anything "
                 "-- set writer.session_id before writing."
             )
-        label = validate_label(label)
         if features.frame_index != motion.frame_index or features.timestamp != motion.timestamp:
             raise DatasetWriterError(
                 f"features (frame {features.frame_index} @ {features.timestamp}) and "

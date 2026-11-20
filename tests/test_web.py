@@ -23,7 +23,7 @@ pytest.importorskip("httpx", reason="fastapi's TestClient needs httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from backend.camera import CameraConfig, CameraEngine  # noqa: E402
-from backend.dataset import DATASET_COLUMNS, DEFAULT_LABELS, DatasetWriter  # noqa: E402
+from backend.dataset import DATASET_COLUMNS, DEFAULT_LABELS, V2_LABELS, DatasetWriter  # noqa: E402
 from backend.dataset.stats import dataset_stats  # noqa: E402
 from backend.features import (  # noqa: E402
     FEATURE_NAMES,
@@ -261,6 +261,7 @@ def test_hello_arrives_before_any_frame():
     assert hello["feature_names"] == list(FEATURE_NAMES)
     assert hello["arm_landmarks"] == [int(lm) for lm in ARM_LANDMARKS]
     assert "arm_raised" in hello["gesture_names"]
+    assert hello["model_schema"] == 1
     assert hello["record_labels"] == list(DEFAULT_LABELS)
     assert record_status == {
         "type": "record_status",
@@ -272,6 +273,24 @@ def test_hello_arrives_before_any_frame():
         "owner": False,
         "error": None,
     }
+
+
+def test_v2_hello_advertises_wave_without_a_trained_bundle(tmp_path):
+    runner, _ = build(
+        model_schema=2,
+        model_path=tmp_path / "missing-v2.joblib",
+        dataset_path=tmp_path / "dataset_v2.csv",
+    )
+    with client_for(runner) as client, client.websocket_connect("/ws") as socket:
+        hello = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
+    runner.stop()
+
+    assert hello["model_schema"] == 2
+    assert hello["record_labels"] == list(V2_LABELS)
+    assert hello["ml_classes"] == []
+    assert frame["ml"] is None
 
 
 def test_hello_carries_the_face_overlay_topology_regardless_of_face_enabled():
@@ -453,6 +472,52 @@ def test_websocket_rejects_removed_and_unknown_labels_before_creating_dataset(tm
     runner.stop()
 
     assert not dataset_path.exists()
+
+
+def test_v2_can_record_wave_before_any_model_is_trained(tmp_path, monkeypatch):
+    stub_preview_encoding(monkeypatch)
+    dataset_path = tmp_path / "dataset_v2.csv"
+    runner, _ = build(
+        model_schema=2,
+        model_path=tmp_path / "missing-v2.joblib",
+        dataset_path=dataset_path,
+        preview_width=320,
+    )
+    with client_for(runner) as client, client.websocket_connect("/ws") as socket:
+        hello = socket.receive_json()
+        receive_initial_record_status(socket)
+        receive_frame(socket)
+
+        socket.send_json({"type": "record_start", "label": "wave"})
+        started = receive_until(
+            socket,
+            lambda item: item.get("type") == "record_status" and item["recording"],
+        )
+        assert started["label"] == "wave"
+        assert started["owner"] is True
+        written = receive_until(
+            socket,
+            lambda item: item.get("type") == "record_status"
+            and item["recording"]
+            and item["written"] >= 2,
+        )
+        socket.send_json({"type": "record_stop"})
+        stopped = receive_until(
+            socket,
+            lambda item: item.get("type") == "record_status"
+            and not item["recording"]
+            and item["session_id"] == started["session_id"],
+        )
+    runner.stop()
+
+    assert hello["model_schema"] == 2
+    assert hello["ml_classes"] == []
+    assert stopped["written"] >= written["written"]
+    with dataset_path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows and tuple(rows[0]) == DATASET_COLUMNS
+    assert {row["label"] for row in rows} == {"wave"}
+    assert {row["session_id"] for row in rows} == {started["session_id"]}
 
 
 def test_second_tab_conflict_error_is_private_and_active_owner_keeps_recording(tmp_path, monkeypatch):
@@ -826,6 +891,26 @@ def test_dataset_stats_route_returns_the_shared_stats_for_its_configured_path(tm
     assert response.headers["content-type"].startswith("application/json")
     assert response.json() == dataset_stats(dataset_path)
     assert response.json()["exists"] is False
+
+
+def test_v2_dataset_stats_uses_v2_path_and_includes_wave_coverage(tmp_path):
+    dataset_path = tmp_path / "missing-v2.csv"
+    config = WebConfig(
+        model_schema=2,
+        model_path=tmp_path / "missing-v2.joblib",
+        dataset_path=dataset_path,
+    )
+
+    with TestClient(create_app(config)) as client:
+        response = client.get("/dataset/stats")
+
+    assert response.status_code == 200
+    assert response.json() == dataset_stats(dataset_path, V2_LABELS)
+    assert response.json()["labels"]["wave"] == {
+        "rows": 0,
+        "sessions": 0,
+        "seconds": 0.0,
+    }
 
 
 def test_camera_is_released_after_the_last_client_leaves():
