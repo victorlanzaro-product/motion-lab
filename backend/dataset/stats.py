@@ -13,13 +13,19 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from backend.dataset.writer import DATASET_COLUMNS, DEFAULT_DATASET_PATH, DEFAULT_LABELS
+from backend.dataset.writer import (
+    DATASET_COLUMNS,
+    DEFAULT_DATASET_PATH,
+    DEFAULT_LABELS,
+)
 from backend.ml.train import DatasetError, classify_dataset_row
 
 MIN_SESSIONS_PER_LABEL = 2
 
 
-def _empty_stats(path: Path) -> dict[str, Any]:
+def _empty_stats(
+    path: Path, allowed_labels: tuple[str, ...] = DEFAULT_LABELS
+) -> dict[str, Any]:
     """Return the exact empty-dataset response without asking training to load it."""
     return {
         "path": str(path),
@@ -29,7 +35,7 @@ def _empty_stats(path: Path) -> dict[str, Any]:
         "dropped": {},
         "labels": {
             label: {"rows": 0, "sessions": 0, "seconds": 0.0}
-            for label in DEFAULT_LABELS
+            for label in allowed_labels
         },
         "sessions": [],
         "min_sessions_per_label": MIN_SESSIONS_PER_LABEL,
@@ -60,7 +66,10 @@ def _timestamp(row: dict[str, Any], row_number: int, path: Path) -> float:
     return value
 
 
-def dataset_stats(path: Path = DEFAULT_DATASET_PATH) -> dict[str, Any]:
+def dataset_stats(
+    path: Path = DEFAULT_DATASET_PATH,
+    allowed_labels: tuple[str, ...] = DEFAULT_LABELS,
+) -> dict[str, Any]:
     """Return row, label, session, and readiness statistics for ``path``.
 
     ``load_dataset`` intentionally refuses unknown labels so they can never
@@ -69,12 +78,13 @@ def dataset_stats(path: Path = DEFAULT_DATASET_PATH) -> dict[str, Any]:
     a training attempt. Other drop reasons remain exactly the loader's reasons.
     """
     path = Path(path)
+    allowed_labels = tuple(allowed_labels)
     if not path.exists():
-        return _empty_stats(path)
+        return _empty_stats(path, allowed_labels)
 
     labels = {
         label: {"rows": 0, "sessions": 0, "seconds": 0.0}
-        for label in DEFAULT_LABELS
+        for label in allowed_labels
     }
     dropped: Counter[str] = Counter()
     # Keep one interval per recording session and label. The duration of each
@@ -96,7 +106,7 @@ def dataset_stats(path: Path = DEFAULT_DATASET_PATH) -> dict[str, Any]:
 
         for row_number, row in enumerate(reader, start=2):
             total_rows += 1
-            reason, _vector = classify_dataset_row(row)
+            reason, _vector = classify_dataset_row(row, allowed_labels=allowed_labels)
             if reason is not None:
                 dropped[reason] += 1
                 continue
@@ -132,7 +142,7 @@ def dataset_stats(path: Path = DEFAULT_DATASET_PATH) -> dict[str, Any]:
                 "seconds": seconds,
             }
         )
-    for label in DEFAULT_LABELS:
+    for label in allowed_labels:
         labels[label]["seconds"] = round(float(labels[label]["seconds"]), 1)
 
     problems = [
@@ -142,7 +152,7 @@ def dataset_stats(path: Path = DEFAULT_DATASET_PATH) -> dict[str, Any]:
             if labels[label]["sessions"] == 1
             else f"{label}: {labels[label]['sessions']} sessões (mínimo {MIN_SESSIONS_PER_LABEL})"
         )
-        for label in DEFAULT_LABELS
+        for label in allowed_labels
         if labels[label]["sessions"] < MIN_SESSIONS_PER_LABEL
     ]
     unknown_count = dropped.get("unknown_label", 0)
