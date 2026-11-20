@@ -24,7 +24,7 @@ armazenado — apenas landmarks temporários, dados de treino e o modelo treinad
 | 13 | Cobertura do dataset e validação por sessão | Em validação com dataset real pendente |
 | 14 | ML temporal v2, gravação de wave e inferência ao vivo | Implementado; gravações reais de wave e LOSO pendentes |
 | 15 | Dashboard ao vivo | ✅ pronto (checkpoint com câmera pendente) |
-| 16 | Hardening do protocolo e avaliação v1 × v2 × regra | Implementado; gates sem câmera verdes; revisão independente de segurança e sessões reais pendentes |
+| 16 | Hardening do protocolo e avaliação v1 × v2 × regra | Implementado; gates sem câmera verdes; revisão de segurança aprovada; sessões reais pendentes |
 
 ## Setup
 
