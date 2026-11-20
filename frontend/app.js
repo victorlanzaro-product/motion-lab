@@ -72,6 +72,8 @@ const state = {
   smoothedFaceLandmarks: null,
   activeTab: "now",
   lastFace: null,
+  coverageView: null,
+  coverageFetchWarning: null,
 };
 
 const el = (id) => document.getElementById(id);
@@ -132,6 +134,9 @@ function handle(message) {
   if (message.type === "record_status") {
     recorder.applyStatus(message);
     renderRecorder();
+    if (!message.recording && message.session_id != null) {
+      fetchDatasetStats();
+    }
     return;
   }
   if (message.type === "error") {
@@ -1099,6 +1104,117 @@ function renderRecorder() {
 
 el("recorder-stop").addEventListener("click", () => stopRecorder());
 
+// --- Sprint 13 dataset coverage ----------------------------------------
+
+const COVERAGE_FETCH_WARNING =
+  "Não foi possível atualizar a cobertura do dataset. A gravação e o ao vivo seguem normais.";
+
+async function fetchDatasetStats() {
+  try {
+    const response = await fetch("/dataset/stats");
+    if (!response.ok) throw new Error(String(response.status));
+    const stats = await response.json();
+    state.coverageView = DatasetCoverage.buildCoverageView(stats, { labelTitles: ML_LABEL });
+    state.coverageFetchWarning = null;
+  } catch (_error) {
+    state.coverageFetchWarning = COVERAGE_FETCH_WARNING;
+  }
+  renderDatasetCoverage();
+}
+
+function renderDatasetCoverage() {
+  const warning = el("coverage-fetch-warning");
+  if (state.coverageFetchWarning) {
+    warning.textContent = state.coverageFetchWarning;
+    toggle("coverage-fetch-warning", true);
+  } else {
+    warning.textContent = "";
+    toggle("coverage-fetch-warning", false);
+  }
+
+  const view = state.coverageView;
+  if (!view || !view.valid) {
+    el("coverage-summary").textContent = state.coverageFetchWarning
+      ? "Cobertura desatualizada — última leitura indisponível."
+      : "Consultando estatísticas…";
+    el("coverage-status-badge").textContent = state.coverageFetchWarning ? "indisponível" : "carregando";
+    el("coverage-status-badge").className = "badge coverage-badge";
+    toggle("coverage-path", false);
+    toggle("coverage-problems", false);
+    el("coverage-label-grid").replaceChildren();
+    toggle("coverage-dropped", false);
+    return;
+  }
+
+  const badge = el("coverage-status-badge");
+  badge.textContent = view.statusText;
+  badge.className = `badge coverage-badge coverage-${view.statusKind}`;
+
+  el("coverage-summary").textContent = view.summaryLine;
+
+  const pathNode = el("coverage-path");
+  if (view.path) {
+    pathNode.textContent = `Arquivo: ${view.path}`;
+    toggle("coverage-path", true);
+  } else {
+    pathNode.textContent = "";
+    toggle("coverage-path", false);
+  }
+
+  const problems = el("coverage-problems");
+  problems.replaceChildren();
+  if (view.problems.length) {
+    for (const text of view.problems) {
+      const item = document.createElement("li");
+      item.textContent = text;
+      problems.appendChild(item);
+    }
+    toggle("coverage-problems", true);
+  } else {
+    toggle("coverage-problems", false);
+  }
+
+  const grid = el("coverage-label-grid");
+  grid.replaceChildren();
+  for (const row of view.labels) {
+    const card = document.createElement("article");
+    card.className = "coverage-label-card";
+    if (row.belowMinimum) card.classList.add("coverage-label-below");
+    card.setAttribute("role", "listitem");
+
+    const title = document.createElement("h3");
+    title.className = "coverage-label-name";
+    title.textContent = row.title;
+
+    const meta = document.createElement("dl");
+    meta.className = "coverage-label-meta";
+
+    const sessionsDt = document.createElement("dt");
+    sessionsDt.textContent = "sessões (mín.)";
+    const sessionsDd = document.createElement("dd");
+    sessionsDd.textContent = row.sessionsText;
+
+    const secondsDt = document.createElement("dt");
+    secondsDt.textContent = "segundos no CSV";
+    const secondsDd = document.createElement("dd");
+    secondsDd.textContent = row.secondsText;
+
+    meta.append(sessionsDt, sessionsDd, secondsDt, secondsDd);
+    card.append(title, meta);
+    grid.appendChild(card);
+  }
+
+  const droppedRows = view.dropped;
+  if (droppedRows.length) {
+    el("coverage-dropped-detail").textContent = droppedRows
+      .map((row) => `${row.title}: ${row.count}`)
+      .join(" · ");
+    toggle("coverage-dropped", true);
+  } else {
+    toggle("coverage-dropped", false);
+  }
+}
+
 document.addEventListener("keydown", (event) => {
   if (typingTarget(event.target)) return;
   const digit = event.key.length === 1 && event.key >= "1" && event.key <= "9"
@@ -1130,3 +1246,4 @@ document.addEventListener("keydown", (event) => {
 });
 
 connect();
+fetchDatasetStats();
