@@ -230,4 +230,3 @@ def test_batch_rebuild_sorts_and_never_mixes_session_windows():
     assert final_by_session["session-a"] is not None
     assert final_by_session["session-a"].left.mean_wrist_height == pytest.approx(0.2)
     assert final_by_session["session-b"] is None
-
