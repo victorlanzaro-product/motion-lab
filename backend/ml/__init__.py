@@ -3,8 +3,10 @@
 from backend.ml.report import compute_agreement, render_report, rule_label
 from backend.ml.train import (
     DEFAULT_MODEL_PATH,
+    DEFAULT_V2_MODEL_PATH,
     MIN_SAMPLES_PER_CLASS,
     TRAINING_COLUMNS,
+    V2_LABELS,
     Dataset,
     DatasetError,
     MissingFeatureError,
@@ -19,8 +21,10 @@ from backend.ml.train import (
 
 __all__ = [
     "DEFAULT_MODEL_PATH",
+    "DEFAULT_V2_MODEL_PATH",
     "MIN_SAMPLES_PER_CLASS",
     "TRAINING_COLUMNS",
+    "V2_LABELS",
     "Dataset",
     "DatasetError",
     "MissingFeatureError",
