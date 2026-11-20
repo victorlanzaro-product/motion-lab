@@ -2,7 +2,13 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { createTimeline, extractMl, agreementBetween } = require("./confidence-timeline.js");
+const {
+  createTimeline,
+  buildProbabilityRuns,
+  extractMl,
+  agreementBetween,
+  DEFAULT_MAX_GAP_SECONDS,
+} = require("./confidence-timeline.js");
 
 function frame(t, overrides) {
   return {
@@ -117,4 +123,34 @@ test("agreementBetween is strict label equality", () => {
   assert.equal(agreementBetween("idle", "idle"), true);
   assert.equal(agreementBetween("arm_raised", "idle"), false);
   assert.equal(agreementBetween(null, "idle"), null);
+});
+
+test("buildProbabilityRuns breaks on time gaps like face-history (default 1 s)", () => {
+  const points = [
+    { t: 0, mlProbability: 0.9 },
+    { t: 0.1, mlProbability: 0.85 },
+    { t: 5.0, mlProbability: 0.7 },
+  ];
+  const runs = buildProbabilityRuns(points, DEFAULT_MAX_GAP_SECONDS);
+  assert.equal(runs.length, 2);
+  assert.deepEqual(
+    runs[0].map((p) => p.t),
+    [0, 0.1],
+  );
+  assert.deepEqual(
+    runs[1].map((p) => p.t),
+    [5.0],
+  );
+});
+
+test("timeline.probabilityRuns splits a stalled reconnect without bridging", () => {
+  const tl = createTimeline({ windowSeconds: 30, maxGapSeconds: 1.0 });
+  tl.push(frame(0, { ml: { label: "idle", confidence: 0.9 }, rule_label: "idle" }));
+  tl.push(frame(0.05, { ml: { label: "idle", confidence: 0.88 }, rule_label: "idle" }));
+  tl.push(frame(8, { ml: { label: "idle", confidence: 0.6 }, rule_label: "idle" }));
+  const runs = tl.probabilityRuns(8);
+  assert.equal(runs.length, 2);
+  assert.equal(runs[0].length, 2);
+  assert.equal(runs[1].length, 1);
+  assert.equal(runs[1][0].t, 8);
 });

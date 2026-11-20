@@ -475,24 +475,6 @@ function updateHealthPanel(message) {
 const mlConfidenceCanvas = el("ml-confidence-chart");
 const mlConfidenceCtx = mlConfidenceCanvas ? mlConfidenceCanvas.getContext("2d") : null;
 
-function probabilityRuns(points) {
-  const runs = [];
-  let current = null;
-  for (const point of points) {
-    if (point.mlProbability === null) {
-      if (current) {
-        runs.push(current);
-        current = null;
-      }
-      continue;
-    }
-    if (!current) current = [];
-    current.push(point);
-  }
-  if (current) runs.push(current);
-  return runs;
-}
-
 function renderConfidenceTimeline() {
   const rateNode = el("ml-agreement-rate");
   if (!mlConfidenceCanvas || !mlConfidenceCtx) return;
@@ -527,7 +509,7 @@ function renderConfidenceTimeline() {
   mlConfidenceCtx.strokeStyle = COLORS.bone;
   mlConfidenceCtx.lineWidth = 1.5;
   mlConfidenceCtx.lineJoin = "round";
-  for (const run of probabilityRuns(points)) {
+  for (const run of confidenceTimeline.probabilityRuns(now)) {
     mlConfidenceCtx.beginPath();
     run.forEach((point, index) => {
       const x = point.x * (width - 1);
