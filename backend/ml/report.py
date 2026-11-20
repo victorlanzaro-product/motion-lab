@@ -237,7 +237,7 @@ def _cross_validation_section(cv: Optional[dict[str, Any]]) -> str:
     if oof is not None:
         pooled = (
             f"<p>macro-F1 LOSO: <strong>{float(oof):.3f}</strong> "
-            "(predições fora da amostra reunidas nos quatro rótulos, uma sessão por dobra).</p>"
+            "(predições fora da amostra reunidas nos rótulos do schema, uma sessão por dobra).</p>"
         )
 
     rows = []
@@ -316,10 +316,91 @@ def _live_section(live: Optional[dict[str, Any]]) -> str:
     """
 
 
+def _schema_comparison_section(
+    comparison: Optional[dict[str, Optional[dict[str, Any]]]],
+) -> str:
+    """Render the available v1/v2 bundle summaries and S14 handoff notes.
+
+    The comparison is descriptive: scores are grouped-CV measurements from
+    separate schemas and must not be read as evidence of a live advantage.
+    Missing bundles stay visible so a one-model report cannot imply a complete
+    side-by-side evaluation.
+    """
+    if comparison is None:
+        return ""
+
+    rows = []
+    for key, title in (("v1", "v1 · por frame"), ("v2", "v2 · janela")):
+        model = comparison.get(key)
+        if not model:
+            rows.append(
+                f"<tr><td>{title}</td><td>indisponível</td><td>—</td>"
+                "<td>—</td><td>—</td><td>—</td></tr>"
+            )
+            continue
+
+        cv = model.get("cv") or {}
+        mean, std = cv.get("macro_f1_mean"), cv.get("macro_f1_std")
+        score = "indisponível" if mean is None or std is None else f"{float(mean):.3f} ± {float(std):.3f}"
+        folds = (
+            f"{int(cv.get('folds_used', 0))}/{int(cv.get('n_splits', 0))}"
+            f" ({int(cv.get('folds_skipped', 0))} ignoradas)"
+        )
+        classes = ", ".join(escape(str(label)) for label in model.get("classes", [])) or "—"
+        window = "—"
+        if int(model.get("schema_version", 1)) == 2:
+            seconds = model.get("window_seconds")
+            max_gap = model.get("max_gap")
+            min_samples = model.get("min_samples")
+            deadband = model.get("deadband")
+            if seconds is not None:
+                window = f"{float(seconds):g}s"
+            if deadband is not None:
+                window += f" · deadband {float(deadband):g}"
+            if max_gap is not None:
+                window += f" · lacuna {float(max_gap):g}s"
+            if min_samples is not None:
+                window += f" · mínimo {int(min_samples)} amostras"
+        rows.append(
+            f"<tr><td>{title}</td><td>{int(model.get('n_samples', 0))}</td>"
+            f"<td>{classes}</td><td>{score}</td><td>{folds}</td>"
+            f"<td>{escape(window)}</td></tr>"
+        )
+
+    decisions = """<ol>
+      <li>O schema v1 mantém o treino por frame e continua como caminho padrão.</li>
+      <li>O schema v2 combina features estáticas do último frame com estatísticas de uma janela temporal.</li>
+      <li><code>wave</code> pertence ao vocabulário v2; gravação e rótulos padrão do DatasetWriter continuam v1.</li>
+      <li>A comparação usa macro-F1 médio ± desvio em validação agrupada por sessão; dados sintéticos não medem qualidade no mundo real.</li>
+    </ol>"""
+    live_note = """<p class="muted"><strong>Inferência ao vivo v2 implementada:</strong>
+      <code>WebConfig</code> e <code>hello_web.py --model-schema</code> selecionam o schema anunciado
+      em <code>hello.model_schema</code>. O PipelineRunner mantém um tracker por stream, usa os
+      parâmetros temporais do bundle e combina a janela completa dos dois braços com as features
+      estáticas do último quadro. Aquecimento, lacuna inválida, perda de pose ou modelo incompatível
+      mantêm <code>ml: null</code>; pose, gestos, face e gravação continuam. No modo v2 o Recorder
+      aceita <code>wave</code> e <code>/dataset/stats</code> inclui sua cobertura. Os números desta
+      comparação continuam sendo métricas offline do bundle, não uma avaliação de câmera ao vivo.</p>"""
+
+    return f"""
+    <section>
+      <h2>Comparação S14 · v1 × v2</h2>
+      <p class="muted">Macro-F1 agrupado por sessão. Uma linha ausente significa que o bundle correspondente não foi encontrado.</p>
+      <table class="schema-comparison"><thead><tr>
+        <th>schema</th><th>janelas/amostras</th><th>classes</th><th>macro-F1 médio ± desvio</th><th>dobras CV</th><th>janela</th>
+      </tr></thead><tbody>{''.join(rows)}</tbody></table>
+      <h3>Decisões S14 prontas para o README</h3>
+      {decisions}
+      {live_note}
+    </section>
+    """
+
+
 def render_report(
     training: dict[str, Any],
     live: Optional[dict[str, Any]] = None,
     dataset: Optional[dict[str, Any]] = None,
+    schema_comparison: Optional[dict[str, Optional[dict[str, Any]]]] = None,
 ) -> str:
     """Render training, dataset coverage, grouped CV, and optional live data."""
     importances = sorted(
@@ -392,6 +473,7 @@ def render_report(
 
   {_dataset_section(dataset)}
   {_cross_validation_section(training.get('cv'))}
+  {_schema_comparison_section(schema_comparison)}
 
   <section>
     <h2>importância de feature</h2>
