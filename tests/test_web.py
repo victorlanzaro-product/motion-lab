@@ -31,7 +31,7 @@ from backend.features import (  # noqa: E402
     FrameFeatures,
     MotionState,
 )
-from backend.ml import MIN_SAMPLES_PER_CLASS, train  # noqa: E402
+from backend.ml import MIN_SAMPLES_PER_CLASS, rule_label, train  # noqa: E402
 from backend.vision import (  # noqa: E402
     ARM_CHAINS,
     ARM_LANDMARKS,
@@ -118,7 +118,7 @@ class FakeLandmarker:
 
 
 def build(
-    opened: bool = True, face_detector_factory=None, **overrides
+    opened: bool = True, face_detector_factory=None, landmarker_factory=None, **overrides
 ) -> tuple[PipelineRunner, list[FakeCapture]]:
     """A runner wired to fakes, plus the list of capture devices it opened.
 
@@ -134,7 +134,8 @@ def build(
         return CameraEngine(config=config.camera, capture_factory=lambda _cfg: capture)
 
     def detector_factory(_config: WebConfig) -> PoseDetector:
-        return PoseDetector(landmarker_factory=lambda _cfg: FakeLandmarker())
+        factory = landmarker_factory or (lambda _cfg: FakeLandmarker())
+        return PoseDetector(landmarker_factory=factory)
 
     config_values = {
         "camera": CameraConfig(width=320, height=240),
@@ -246,9 +247,9 @@ def stub_preview_encoding(monkeypatch) -> None:
 # --- handshake ---------------------------------------------------------
 
 
-def test_hello_arrives_before_any_frame():
+def test_hello_arrives_before_any_frame(tmp_path):
     """The client cannot draw a bone before it knows the bone table."""
-    runner, _ = build()
+    runner, _ = build(report_path=tmp_path / "not-generated.report.html")
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         hello = socket.receive_json()
         record_status = receive_initial_record_status(socket)
@@ -260,6 +261,7 @@ def test_hello_arrives_before_any_frame():
     assert hello["arm_landmarks"] == [int(lm) for lm in ARM_LANDMARKS]
     assert "arm_raised" in hello["gesture_names"]
     assert hello["record_labels"] == list(DEFAULT_LABELS)
+    assert hello["report_available"] is False
     assert record_status == {
         "type": "record_status",
         "recording": False,
@@ -506,8 +508,8 @@ def test_writer_error_stops_only_recording_and_pipeline_keeps_streaming(tmp_path
 # --- payload -----------------------------------------------------------
 
 
-def test_frame_carries_pixels_joints_and_numbers_together():
-    runner, _ = build()
+def test_frame_carries_pixels_joints_and_numbers_together(tmp_path):
+    runner, _ = build(model_path=tmp_path / "missing-model.joblib")
     with client_for(runner) as client, client.websocket_connect("/ws") as socket:
         socket.receive_json()  # hello
         receive_initial_record_status(socket)
@@ -520,6 +522,78 @@ def test_frame_carries_pixels_joints_and_numbers_together():
     assert frame["motion"]["left_direction"] in ("up", "down", "still", "unknown")
     assert set(FEATURE_NAMES) <= set(frame["features"])
     assert frame["gestures"] == []  # a single frame is never enough to hold a gesture
+    assert frame["rule_label"] == rule_label(
+        frame["features"], open_threshold=runner.config.gesture.open_threshold
+    )
+    assert set(frame["timings"]) == {
+        "capture_ms", "pose_ms", "features_ms", "ml_ms", "face_ms", "total_ms"
+    }
+    assert frame["timings"]["pose_ms"] == frame["inference_ms"]
+    assert frame["timings"]["ml_ms"] is None  # no trained model in this fixture
+    assert frame["timings"]["face_ms"] is None  # face is disabled in this fixture
+    measured = [value for value in frame["timings"].values() if value is not None]
+    assert all(isinstance(value, (int, float)) for value in measured)
+    assert all(value >= 0 for value in measured)
+    assert all(round(value, 1) == value for value in measured)
+    assert frame["timings"]["capture_ms"] > 0
+    assert frame["timings"]["total_ms"] >= sum(
+        frame["timings"][key] or 0.0
+        for key in ("capture_ms", "pose_ms", "features_ms", "ml_ms", "face_ms")
+    )
+    assert frame["health"]["fps"] == frame["fps"]
+
+
+class FakeNoPoseLandmarker:
+    def detect_for_video(self, _image, _timestamp_ms: int):
+        return SimpleNamespace(pose_landmarks=[], pose_world_landmarks=[])
+
+    def close(self) -> None:
+        pass
+
+
+def test_rule_label_is_null_when_the_frame_has_no_detected_pose():
+    runner, _ = build(landmarker_factory=lambda _cfg: FakeNoPoseLandmarker())
+    with client_for(runner) as client, client.websocket_connect("/ws") as socket:
+        socket.receive_json()  # hello
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
+    runner.stop()
+
+    assert frame["detected"] is False
+    assert frame["rule_label"] is None
+
+
+def test_report_availability_is_a_hello_snapshot(tmp_path):
+    report_path = tmp_path / "latest.report.html"
+    report_path.write_text("<html>report</html>", encoding="utf-8")
+    runner, _ = build(report_path=report_path)
+    with client_for(runner) as client, client.websocket_connect("/ws") as socket:
+        hello = socket.receive_json()
+        assert hello["report_available"] is True
+        report_path.unlink()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
+    runner.stop()
+
+    assert "report_available" not in frame
+
+
+def test_report_endpoint_serves_html_and_returns_the_documented_404(tmp_path):
+    report_path = tmp_path / "latest.report.html"
+    runner, _ = build(report_path=report_path)
+    with client_for(runner) as client:
+        missing = client.get("/report")
+        assert missing.status_code == 404
+        assert missing.text == "relatório ainda não gerado — rode scripts/report.py"
+        assert not report_path.exists()  # the request never creates a report
+
+        report_path.write_text("<html><body>latest report</body></html>", encoding="utf-8")
+        served = client.get("/report")
+    runner.stop()
+
+    assert served.status_code == 200
+    assert served.headers["content-type"].startswith("text/html")
+    assert served.text == "<html><body>latest report</body></html>"
 
 
 def test_only_arm_landmarks_travel():

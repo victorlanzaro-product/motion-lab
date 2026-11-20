@@ -29,18 +29,7 @@ from __future__ import annotations
 import time
 from typing import Any, Optional
 
-
-def rule_label(features: dict[str, Any], open_threshold: float) -> str:
-    """The same three static predicates `rules.py` exposes, read off one
-    frame's wire `features` dict instead of a `FrameFeatures` object."""
-    if features.get("wrists_crossed"):
-        return "arms_crossed"
-    wrist_distance = features.get("wrist_distance")
-    if wrist_distance is not None and wrist_distance > open_threshold:
-        return "arms_open"
-    if features.get("left_wrist_above_shoulder") or features.get("right_wrist_above_shoulder"):
-        return "arm_raised"
-    return "idle"
+from backend.ml.rule_label import rule_label
 
 
 def compute_agreement(frames: list[dict[str, Any]], open_threshold: float) -> dict[str, Any]:
@@ -63,8 +52,11 @@ def compute_agreement(frames: list[dict[str, Any]], open_threshold: float) -> di
             # compare it against either way.
             excluded_wave += 1
             continue
+        label = rule_label(frame["features"], open_threshold)
+        if label is None:
+            continue
         compared += 1
-        if rule_label(frame["features"], open_threshold) == ml["label"]:
+        if label == ml["label"]:
             matches += 1
 
     return {

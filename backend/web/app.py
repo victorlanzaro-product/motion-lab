@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from backend.web.payload import hello_message
@@ -79,9 +79,21 @@ def create_app(
             "recording": pipeline.recording_health(),
         }
 
+    @app.get("/report")
+    async def report() -> Response:
+        """Serve the last Sprint 10 report without generating it in a request."""
+        try:
+            html = await asyncio.to_thread(pipeline.report_path.read_text, encoding="utf-8")
+        except (FileNotFoundError, IsADirectoryError):
+            return PlainTextResponse(
+                "relatório ainda não gerado — rode scripts/report.py", status_code=404
+            )
+        return HTMLResponse(html)
+
     @app.websocket("/ws")
     async def stream(websocket: WebSocket) -> None:
         await websocket.accept()
+        report_available = await asyncio.to_thread(pipeline.report_available)
         await websocket.send_json(
             hello_message(
                 visibility_threshold=pipeline.config.visibility_threshold,
@@ -90,6 +102,7 @@ def create_app(
                 jpeg_quality=pipeline.config.jpeg_quality,
                 ml_classes=pipeline.ml_classes(),
                 face_enabled=pipeline.config.face_enabled,
+                report_available=report_available,
             )
         )
 
