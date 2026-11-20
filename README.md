@@ -24,6 +24,7 @@ armazenado — apenas landmarks temporários, dados de treino e o modelo treinad
 | 13 | Cobertura do dataset e validação por sessão | Em validação com dataset real pendente |
 | 14 | ML temporal v2, gravação de wave e inferência ao vivo | Implementado; gravações reais de wave e LOSO pendentes |
 | 15 | Dashboard ao vivo | ✅ pronto (checkpoint com câmera pendente) |
+| 16 | Hardening do protocolo e avaliação v1 × v2 × regra | Implementado; gates sem câmera verdes; revisão independente de segurança e sessões reais pendentes |
 
 ## Setup
 
@@ -236,6 +237,30 @@ Frontend (`frontend/confidence-timeline.js`, `health-panel.js`, `app.js`):
 10. **Link “Relatório” sempre navegável.** `report_available` só muda o `title` e
     a classe `.pending`; 404 no servidor carrega a mensagem curta — o cliente não
     desabilita o link.
+### Decisões do Sprint 16 — hardening e avaliação local
+
+Contrato em `docs/sprints/16-hardening-avaliacao.md`.
+
+1. O servidor valida `record_start` antes de reservar uma gravação. Erros
+   apresentados à pessoa que opera ficam em português; detalhes técnicos vão
+   apenas para o log local. Falhas degradáveis mantêm o WebSocket ativo.
+2. `scripts/evaluate_live.py --model-v1 ... --model-v2 ...` valida os dois
+   bundles antes de iniciar câmera ou detector de pose e então conduz a captura
+   interativa. `--frames` e `--segments` selecionam o modo offline determinístico.
+3. v1, v2 e regra avaliam os mesmos frames da mesma sessão, usando
+   `LiveEvaluationSession`, `WindowFeatures`, `MotionTracker`, `GestureEngine`
+   e `PipelineRunner._predict`. O roteiro aceita `idle`, `arm_raised`,
+   `arms_open`, `arms_crossed`, `wave`, `wave_left`, `wave_right` e
+   `arm_raised_no_reversal`.
+4. O relatório é JSON agregado por trecho: disponibilidade, pares comparáveis,
+   concordância, confronto com o rótulo esperado e cobertura temporal de `wave`.
+   Aquecimento e transição são contados separadamente. Imagens, vídeo e dados
+   faciais não são persistidos.
+5. **Pendência humana:** Victor fará as sessões reais em câmera nova, avaliará
+   latência e cobertura e decidirá sobre manter ou aposentar `_WaveDetector`.
+   A revisão independente da superfície de segurança S16 também deve aprovar o
+   HEAD integrado antes da abertura do PR.
+
 ### Decisões do Sprint 12: gravar é um comando ao servidor, nunca um arquivo do navegador
 
 Contrato completo em `docs/sprints/12-recorder.md`. O navegador manda
