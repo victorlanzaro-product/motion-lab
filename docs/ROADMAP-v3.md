@@ -83,5 +83,5 @@ Seleção para o trabalho desta noite: (1) `scripts/doctor.py`, diagnóstico off
 
 - Repositório `victorlanzaro-product/motion-lab`: README, `docs/ROADMAP-v2.md`, `docs/sprints/15-dashboard.md` no head da PR #5 e `docs/sprints/16-hardening-avaliacao.md` no head da PR #8.
 - `Shared/FATOS-E-REGRAS.md` e `Shared/produto/CONTEXTO.md`, lidos em 24/11/2026.
-- Estados PR #5 (`cdcbc445`), #8 (`44f837f`), #9 (`4352121`), #10 (`79008bb`), #11 (`6cc0233`), #12 (`eb84cef`) e #13 (`f1c7f85`) consultados em 24/11/2026; revalidar antes de integração.
+- Estados e heads das PRs #5, #8–#13 consultados em 24/11/2026; revalidar antes de implementação ou integração.
 \n\n---\n\nCo-authored-by: OpenBot <335604065+openbotgit[bot]@users.noreply.github.com>\n
