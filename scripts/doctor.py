@@ -22,7 +22,7 @@ PACKAGES = {
     "ml": ("sklearn", "joblib"),
 }
 MODELS = (
-    ("Pose model", Path("models/pose_landmarker_lite.task"), "First pose use downloads it. To prepare it, run `uv run python scripts/check_pose.py --frames 1` with network access."),
+    ("Pose model", Path("models/pose_landmarker_lite.task"), "To download it without opening a camera (requires network and writes `models/pose_landmarker_lite.task`), run `uv run python -c \"from backend.vision.pose_detector import ensure_model; ensure_model()\" `. The doctor itself never downloads files or opens the camera."),
     ("Face model (optional)", Path("models/face_landmarker.task"), "Only needed with `--face`. The first facial-analysis run downloads it."),
     ("Gesture classifier (optional)", Path("backend/models/gesture_classifier.joblib"), "Train one with `uv run python scripts/train_model.py` after collecting labeled data."),
     ("Temporal classifier (optional)", Path("backend/models/gesture_classifier_v2.joblib"), "Train one with `uv run python scripts/train_model.py --schema v2` after collecting session data."),
