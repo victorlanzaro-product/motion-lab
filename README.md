@@ -41,6 +41,15 @@ O modelo facial (`models/face_landmarker.task`, ~3.6 MB, Sprint 11) só é baixa
 
 ## Rodar
 
+Diagnóstico local de primeira execução, sem abrir câmera nem baixar arquivos:
+
+```bash
+uv run python scripts/doctor.py
+```
+
+O comando lista dependências e modelos ausentes com instruções de correção.
+
+
 ```bash
 # Sprint 01 — janela com a webcam ao vivo (q ou ESC para sair)
 uv run python scripts/hello_camera.py
@@ -376,143 +385,7 @@ motion por frame (velocidade e direção instantâneas), sem a janela de
 reversões que `GestureEngine` (`_WaveDetector` em `gestures/engine.py`) usa
 pra reconhecer um aceno de verdade — um frame no meio de um aceno pode ser
 geometricamente idêntico a um frame de braço subindo sem repetir, e o
-classificador não tem como saber a diferença sem uma janela temporal própria,
-que este sprint não construiu para o vetor de ML (só para os sinais faciais,
-via `FaceMotionTracker`).
-
-Decisão do orquestrador: tirar `wave` do vocabulário treinável do Random
-Forest por frame de vez, e deixar só a regra (`GestureEngine`) reconhecer
-aceno, até o vetor de ML ganhar uma janela temporal de verdade. Aplicado em
-toda a cadeia, não só no baseline sintético:
-
-- `backend/dataset/writer.py:DEFAULT_LABELS` não inclui mais `wave` —
-  `hello_dataset.py` não oferece mais a tecla pra ele (agora só
-  `1 arm_raised  2 arms_crossed  3 arms_open  4 idle`).
-- `DatasetWriter.write()` recusa a gravação de uma linha rotulada `wave`
-  (`REMOVED_LABELS`), então nenhuma sessão nova consegue reintroduzir o
-  rótulo mesmo chamando a API diretamente.
-- `backend/ml/train.py:load_dataset` recusa carregar um `dataset.csv` que
-  ainda tenha linhas `wave` de antes dessa decisão — erro explícito, com os
-  passos de migração (filtrar as linhas `wave` do CSV, ou mover o arquivo de
-  lado e regravar do zero), nunca um drop silencioso em `Dataset.dropped` nem
-  um treino em cima de um sinal que o Forest não consegue separar de verdade.
-- `scripts/train_model.py --simulate` já não incluía `wave` no baseline
-  sintético (correção anterior); o comentário ali agora deixa claro que a
-  decisão é definitiva, não uma omissão só do simulador.
-- `backend/ml/report.py`'s `compute_agreement` mantém a exclusão de um
-  `ml.label == "wave"` da concordância regra × ML, mas só como salvaguarda
-  pra um `gesture_classifier.joblib` treinado antes desta decisão — o modelo
-  atual nunca emite essa classe, porque ela não está mais no vocabulário que
-  ele treina.
-
-`ml_classes` (mandado ao cliente no `hello` do WebSocket) é, a partir de
-agora, sempre só postura — o ML nunca reconhece aceno; reconhecer aceno
-continua sendo só `GestureEngine`, ao vivo, via regra, não modelo.
-
-### Correções pós-revisão (bloqueadores encontrados antes de fechar o Sprint 11)
-
-Uma revisão de arquitetura sobre o próprio diff do Sprint 11 encontrou seis
-bloqueadores adicionais, corrigidos nesta mesma leva:
-
-1. **Corrida de subscriber depois de uma falha fatal.** Um cliente que
-   conectava exatamente enquanto a thread do pipeline morria com
-   `CameraOpenError`/`PoseModelError` (já tinha transmitido o erro pros
-   inscritos anteriores) ficava esperando um frame que nunca viria —
-   `_ensure_running()` corretamente recusa abrir uma segunda thread enquanto a
-   antiga ainda está viva/terminando, mas ninguém reenviava o erro pro
-   recém-chegado. `PipelineRunner.subscribe` agora reenvia o último erro
-   fatal quando `_ensure_running()` não reiniciou nada.
-2. **Erro obsoleto entre uma falha e a nova tentativa.** Entre
-   `self._thread.start()` e a primeira linha da nova `_run()` (que zerava
-   `self.error`), `/health` podia mostrar `state: "starting"` ao lado do erro
-   da tentativa *anterior*. `_ensure_running()` agora zera `self.error` no
-   mesmo lock que decide reiniciar.
-3. **Retry infinito por flapping.** Uma câmera que falha logo acima de
-   `healthy_camera_frames` a cada tentativa nunca acumulava `attempt`
-   (resetado a cada "recuperação"), retentando pra sempre. `flap_window_seconds`/
-   `max_flaps_per_window` (`WebConfig`) contam tentativas de reabertura numa
-   janela deslizante, independente do streak saudável, e desistem
-   (`state = "failed"`) se um dispositivo flapar demais.
-4. **Tasks do WebSocket canceladas nunca eram aguardadas.** `stream()`
-   cancelava `writer`/`reader` mas nunca dava `await` neles antes de retornar
-   — corrigido com `asyncio.gather(*pending, return_exceptions=True)`. Isso
-   abriu um segundo problema: o teardown do próprio ASGI (ou do `TestClient`)
-   podia cancelar o `stream()` bem no meio desse `await`, vazando
-   `CancelledError` pra fora do handler. `except (WebSocketDisconnect,
-   asyncio.CancelledError)` mais um `finally` que cancela qualquer task ainda
-   viva protege o fechamento sem esconder a causa raiz.
-5. **`_disable_face` prefixava o nome da exceção até em erros já explicáveis.**
-   `FaceModelError("modelo não encontrado")` virava
-   `"FaceModelError: modelo não encontrado"` no payload — o prefixo agora só
-   aparece para exceções inesperadas (mesma regra que `_run` já aplicava a
-   `PoseModelError`/`CameraError` vs. exceção genérica).
-6. **Toggle facial mentia sobre o que controlava, e a UI misturava fechamento
-   de olho com evento de piscada.** `toggle-face` vinha marcado por padrão
-   independentemente de `WebConfig.face_enabled` — agora `hello.face_enabled`
-   desabilita e desmarca o checkbox quando o servidor nunca ligou o sinal
-   facial (rótulo "mostrar painel facial", não "reações faciais", já que é
-   só isso que ele faz). O painel mostrava só `eyeBlink*` (o valor do
-   blendshape neste frame, 0-1) rotulado "piscada" — agora "fechamento olho"
-   e "piscadas/min" (`blink_rate_left/right`, já calculado por
-   `FaceMotionTracker` mas nunca exibido) aparecem como campos separados.
-
-Dataset e treino também endureceram nesta leva: `DatasetWriter` agora rejeita
-(`DatasetWriterError`) um header de CSV incompatível ao reabrir um arquivo
-existente, `session_id`/`label` vazios, `features`/`motion` de frames
-diferentes, e qualquer valor não-finito — em vez de escrever uma linha que só
-seria pega (ou não) rio abaixo. `train()` passou a exigir que toda classe
-apareça em pelo menos duas sessões distintas (não só o dataset como um todo):
-sem isso, o split agrupado por `session_id` pode jogar 100% de uma classe pra
-um lado só, e a precision/recall/f1 dela no relatório não mede nada.
-`load_model`/`predict` validam o bundle (`model`/`columns`/`classes`
-presentes, não vazios, `predict_proba` disponível, contagem de classes batendo
-com a saída do modelo) em vez de deixar um bundle corrompido falhar em algum
-ponto silencioso mais adiante. O relatório e o `.joblib` agora carregam
-macro-F1 e acurácia balanceada ao lado da acurácia simples — importante porque
-`idle` tende a dominar uma sessão real (é a classe negativa, Sprint 07), e
-acurácia simples sozinha pode esconder um modelo que só acerta a maioria.
-
-### Decisões do Sprint 10: explicação é o que o modelo já sabe dizer, não um método novo
-
-`scripts/report.py` fecha o roadmap: lê o `.joblib` do Sprint 08, amostra uma
-sessão ao vivo (opcional) e funde os dois num HTML autocontido. Tensão real
-nas respostas do briefing: métricas pedidas eram todas *ao vivo* (saúde do
-pipeline, concordância regra × ML), mas a interface pedida foi HTML *estático,
-gerado no treino*. Resolução: o HTML nasce no treino (matriz de confusão,
-precision/recall, importância de feature — tudo já calculado, nunca precisa
-de câmera pra existir), e o script soma uma amostragem ao vivo por cima
-quando a câmera está disponível.
-
-1. **Explicabilidade é o que o Random Forest já expõe, não SHAP nem LIME.**
-   `feature_importances_` do próprio modelo já diz "decido principalmente por
-   `wrist_distance` e `left_wrist_height`" — inventar um método de explicação
-   por cima seria uma segunda fonte de verdade competindo com a primeira, sem
-   necessidade real neste tamanho de modelo.
-2. **Concordância regra × ML reusa o mesmo threshold da regra, não um novo.**
-   `rule_label()` em `backend/ml/report.py` decide "braço levantado" com a
-   mesma lógica de três booleanos que `GestureEngine` já usa — lido direto do
-   payload do frame, não recalculado. Um `ml.label == "wave"` é excluído da
-   comparação, não contado como discordância — não porque o modelo atual
-   reconheça aceno (`wave` está fora do vocabulário treinável, ver
-   "Limitação conhecida" acima), mas como salvaguarda pra um modelo salvo
-   antes dessa decisão.
-3. **Sem câmera, o relatório ainda existe.** `run_live_session` captura
-   `CameraError`/timeout e degrada pra "só treino" em vez de falhar —
-   consistente com o Sprint 09: ML e suas métricas são camada opcional, nunca
-   dependência do resto funcionar.
-
-`backend/models/*.html` fica fora do git, mesma regra do `.joblib`.
-
-### Decisões do Sprint 09: o sinal de ML é opcional, nunca dependência
-
-`PipelineRunner` carrega o `.joblib` (se existir) uma vez por sessão de câmera
-e manda `ml: {label, confidence, probabilities}` no payload — `null` quando
-não há modelo ou quando o frame tem junta oculta. Três escolhas:
-
-1. **Sem modelo, o app inteiro continua de pé.** Pose, motion, gestos por
-   regra (Sprint 01-06) não sabem que ML existe. `load_model` falha com
-   `ModelError`, capturado só ali, nunca propaga — ao contrário de câmera ou
-   modelo de pose ausentes, que são erro fatal, um `.joblib` ausente é
+classificador não tem como sab…2440 tokens truncated…ão erro fatal, um `.joblib` ausente é
    silêncio numa coluna do payload.
 2. **Frame incompleto nunca chega ao classificador.** Mesma regra do Sprint
    07/08: uma junta oculta virando `0` pareceria um valor real e confiante pro
