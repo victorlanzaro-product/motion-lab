@@ -43,6 +43,12 @@ def main() -> int:
         "--allow-lan", action="store_true", help="autoriza expor a câmera fora do loopback"
     )
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        dest="allowed_origins",
+        help="origem HTTP exata permitida no WebSocket (pode ser repetida)",
+    )
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
@@ -91,12 +97,16 @@ def main() -> int:
     if not is_loopback:
         if not args.allow_lan:
             parser.error("Um endereço fora do loopback exige --allow-lan.")
+        if not args.allowed_origins:
+            parser.error("--allow-lan exige ao menos um --allowed-origin explícito.")
         print(
             "Aviso. A câmera e os comandos de gravação ficarão acessíveis sem autenticação "
             "a quem puder se conectar. Use uma rede de confiança.",
             file=sys.stderr,
         )
 
+    url_host = f"[{host}]" if ":" in host else host
+    url = f"http://{url_host}:{args.port}"
     config = WebConfig(
         camera=CameraConfig(args.camera, args.width, args.height),
         preview_width=args.preview_width,
@@ -106,6 +116,7 @@ def main() -> int:
         dataset_path=args.dataset,
         face_enabled=args.face,
         face_model_path=args.face_model,
+        allowed_origins=tuple(args.allowed_origins or [url]),
     )
 
     try:
@@ -125,8 +136,6 @@ def main() -> int:
             # going with pose/gestures/ML/web fully working.
             print(f"WARN: face model unavailable, Sprint 11 signals stay off: {exc}")
 
-    url_host = f"[{host}]" if ":" in host else host
-    url = f"http://{url_host}:{args.port}"
     print(f"Motion Lab web app on {url} — the camera starts when a page connects.")
     print("Ctrl+C to stop. No video is written to disk.")
     if args.open:
