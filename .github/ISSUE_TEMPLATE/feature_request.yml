@@ -17,4 +17,4 @@ body:
     id: privacy
     attributes:
       label: Privacy, storage, or network impact
-      description: Please do not include personal or employer data.
+      description: Please do not include personal data or private recordings.
