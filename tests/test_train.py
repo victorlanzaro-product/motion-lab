@@ -6,21 +6,31 @@ from __future__ import annotations
 
 import csv
 import random
+from collections import Counter
 
 import joblib
 import pytest
 
 from backend.dataset import DatasetWriter
+from backend.dataset.writer import DATASET_COLUMNS
+from backend.dataset.windows import WINDOW_TRAINING_COLUMNS, build_window_rows
 from backend.features import ArmMotion, Direction, FEATURE_NAMES, FrameFeatures, MotionState
 from backend.ml import (
     MIN_SAMPLES_PER_CLASS,
     TRAINING_COLUMNS,
+    Dataset,
     DatasetError,
     ModelError,
     load_dataset,
     load_model,
     predict,
     train,
+)
+from backend.ml.train import (
+    V2_LABELS,
+    _grouped_cv,
+    build_vector,
+    classify_dataset_row,
 )
 
 #: Trivially separable prototypes, one per label, jittered per sample so the
@@ -89,6 +99,47 @@ def build_synthetic_dataset(tmp_path, per_class: int = 40, seed: int = 7, sessio
                 motion = _complete_motion(rng, index, features.timestamp)
                 writer.write(label, features, motion)
                 index += 1
+    return path
+
+
+def build_temporal_wave_dataset(tmp_path, sessions: int = 5):
+    """Make equal static-frame distributions with different temporal order.
+
+    Each wave and arm-raised session has its own session id and the same
+    wrist-height multiset. Wave repeats a triangle; arm-raise sees those same
+    values sorted into one slow rise. Only ordering differs.
+    """
+    levels = [index / 20 for index in range(21)]
+    wave_cycle = levels + list(reversed(levels[1:-1]))
+    wave_values = wave_cycle * 8
+    raised_values = sorted(wave_values)
+    assert Counter(wave_values) == Counter(raised_values)
+
+    path = tmp_path / "temporal-dataset.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=DATASET_COLUMNS)
+        writer.writeheader()
+        for session_index in range(sessions):
+            for label, heights in (("wave", wave_values), ("arm_raised", raised_values)):
+                session_id = f"{label}-{session_index}"
+                for frame_index, height in enumerate(heights):
+                    row = {name: "0" for name in DATASET_COLUMNS}
+                    row.update(
+                        {
+                            "session_id": session_id,
+                            "frame_index": str(frame_index),
+                            "timestamp": f"{frame_index / 30:.6f}",
+                            "label": label,
+                            "left_wrist_height": f"{height:.6f}",
+                            "right_wrist_height": "0.75",
+                            "left_wrist_offset_x": "0",
+                            "right_wrist_offset_x": "0",
+                            "left_wrist_above_shoulder": "True",
+                            "right_wrist_above_shoulder": "True",
+                            "wrists_crossed": "False",
+                        }
+                    )
+                    writer.writerow(row)
     return path
 
 
@@ -413,6 +464,209 @@ def test_load_dataset_rejects_a_row_with_an_unknown_label(tmp_path):
 
     with pytest.raises(DatasetError, match="not one of the current trainable classes"):
         load_dataset(path)
+
+
+def test_shared_row_classifier_reports_loader_reasons_for_stats():
+    valid = {"label": "idle", **{name: "0" for name in TRAINING_COLUMNS}}
+    reason, vector = classify_dataset_row(valid)
+    assert reason is None
+    assert vector == [0.0] * len(TRAINING_COLUMNS)
+
+    missing_label, _ = classify_dataset_row({**valid, "label": "  "})
+    unknown_label, _ = classify_dataset_row({**valid, "label": "sitting"})
+    missing_feature, _ = classify_dataset_row({**valid, TRAINING_COLUMNS[0]: ""})
+    non_finite, _ = classify_dataset_row({**valid, TRAINING_COLUMNS[0]: "nan"})
+
+    assert (missing_label, unknown_label, missing_feature, non_finite) == (
+        "missing_label",
+        "unknown_label",
+        "missing_feature",
+        "non_finite",
+    )
+
+
+# --- grouped cross-validation (Sprint 13) --------------------------------
+
+
+def _six_session_cv_dataset() -> Dataset:
+    """Six equal-size groups make GroupKFold's paired first fold explicit."""
+    labels = []
+    groups = []
+    X = []
+    for session_index in range(6):
+        session = f"s{session_index}"
+        # This class only appears in s0 and s5. GroupKFold(5) holds those two
+        # sessions together in its first fold, so exactly one fold is invalid.
+        session_labels = ["arm_raised", "arms_crossed", "idle"] * 3
+        if session in {"s0", "s5"}:
+            session_labels += ["arms_open"] * 11
+        else:
+            session_labels += ["arm_raised"] * 11
+        for row_index, label in enumerate(session_labels):
+            labels.append(label)
+            groups.append(session)
+            X.append([float(session_index), float(row_index)])
+    return Dataset(
+        X=X,
+        y=labels,
+        groups=groups,
+        counts={label: labels.count(label) for label in set(labels)},
+    )
+
+
+def test_grouped_cv_counts_folds_missing_a_training_class():
+    cv = _grouped_cv(_six_session_cv_dataset(), n_estimators=5, random_state=23)
+
+    assert cv["n_splits"] == 5
+    assert cv["folds_used"] == 4
+    assert cv["folds_skipped"] == 1
+    assert len(cv["per_fold"]) == 5
+    assert cv["per_fold"][0]["valid"] is False
+    assert cv["per_fold"][0]["macro_f1"] is None
+    assert "arms_open" in cv["per_fold"][0]["reason"]
+    assert all(fold["valid"] for fold in cv["per_fold"][1:])
+
+
+@pytest.mark.parametrize("cv_mode", ["group-kfold", "loso"])
+def test_grouped_cv_fails_when_every_training_fold_is_missing_a_class(cv_mode):
+    dataset = Dataset(
+        X=[[0.0], [1.0]],
+        y=["arm_raised", "arms_open"],
+        groups=["only-raised", "only-open"],
+        counts={"arm_raised": 1, "arms_open": 1},
+    )
+
+    with pytest.raises(DatasetError, match="zero valid folds"):
+        _grouped_cv(dataset, n_estimators=5, random_state=23, cv_mode=cv_mode)
+
+
+def test_loso_training_on_recorders_single_label_sessions(tmp_path):
+    path = tmp_path / "dataset.csv"
+    rng = random.Random(7)
+    frame = 0
+    with DatasetWriter(path) as writer:
+        for label in PROTOTYPES:
+            for session in range(3):
+                writer.session_id = f"{label}-{session}"
+                for _ in range(MIN_SAMPLES_PER_CLASS):
+                    features = _complete_features(rng, label, frame)
+                    writer.write(label, features, _complete_motion(rng, frame, features.timestamp))
+                    frame += 1
+
+    report = train(dataset_path=path, model_path=tmp_path / "loso.joblib",
+                   n_estimators=20, cv_mode="loso")
+
+    cv = report.cv
+    assert cv["mode"] == "loso"
+    assert cv["folds_used"] == cv["n_splits"] == 12
+    assert cv["folds_skipped"] == 0
+    assert all(len(fold["test_sessions"]) == 1 for fold in cv["per_fold"])
+    assert all(
+        set(fold["train_sessions"]).isdisjoint(fold["test_sessions"])
+        for fold in cv["per_fold"]
+    )
+    assert {fold["test_sessions"][0] for fold in cv["per_fold"]} == {
+        f"{label}-{session}" for label in PROTOTYPES for session in range(3)
+    }
+    assert cv["macro_f1_oof"] > 0.9
+    assert cv["macro_f1_mean"] <= 0.25  # Each fold contains one true class.
+    assert all(metrics["support"] == MIN_SAMPLES_PER_CLASS for metrics in report.per_class.values())
+    assert load_model(report.model_path)["cv"] == cv
+
+
+def test_training_reports_deterministic_grouped_cv_and_saves_it(tmp_path):
+    dataset_path = build_synthetic_dataset(tmp_path, per_class=40)
+    first = train(
+        dataset_path=dataset_path,
+        model_path=tmp_path / "first.joblib",
+        random_state=19,
+    )
+    second = train(
+        dataset_path=dataset_path,
+        model_path=tmp_path / "second.joblib",
+        random_state=19,
+    )
+
+    assert first.cv == second.cv
+    assert first.cv["n_splits"] == 4
+    assert first.cv["folds_used"] == 4
+    assert first.cv["folds_skipped"] == 0
+    assert len(first.cv["per_fold"]) == 4
+    assert load_model(first.model_path)["cv"] == first.cv
+    assert load_model(first.model_path)["dataset_path"] == str(dataset_path)
+
+
+def test_v2_temporal_grouped_cv_separates_wave_from_static_twins_and_bundles_schema(tmp_path):
+    path = build_temporal_wave_dataset(tmp_path)
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert V2_LABELS == ("arm_raised", "arms_crossed", "arms_open", "idle", "wave")
+    static_by_label = {
+        label: Counter(
+            tuple(build_vector(row, TRAINING_COLUMNS))
+            for row in rows
+            if row["label"] == label
+        )
+        for label in ("wave", "arm_raised")
+    }
+    # The full per-frame feature-vector histograms are exactly equal, so a
+    # frame-only classifier has no label signal. Session groups remain intact.
+    assert static_by_label["wave"] == static_by_label["arm_raised"]
+    static_dataset = Dataset(
+        X=[build_vector(row, TRAINING_COLUMNS) for row in rows],
+        y=[row["label"] for row in rows],
+        groups=[row["session_id"] for row in rows],
+        counts=dict(Counter(row["label"] for row in rows)),
+    )
+    static_cv = _grouped_cv(static_dataset, n_estimators=20, random_state=17)
+    assert static_cv["macro_f1_mean"] <= 0.6
+
+    # v1 continues to reject wave; it must not silently treat a v2 dataset as
+    # a v1-compatible per-frame model.
+    with pytest.raises(DatasetError, match="no longer a trainable class"):
+        train(dataset_path=path, model_path=tmp_path / "wrong-v1.joblib", schema=1)
+
+    v2_path = tmp_path / "v2.joblib"
+    report = train(
+        dataset_path=path,
+        model_path=v2_path,
+        schema=2,
+        n_estimators=20,
+        random_state=17,
+    )
+    assert report.cv["folds_used"] == 5
+    assert report.cv["macro_f1_mean"] >= 0.9
+    assert set(report.feature_importances) == set(WINDOW_TRAINING_COLUMNS)
+
+    bundle = load_model(v2_path, schema=2)
+    assert bundle["schema_version"] == 2
+    assert bundle["window_seconds"] == pytest.approx(1.0)
+    assert bundle["max_gap"] == pytest.approx(0.30)
+    assert bundle["min_samples"] == 4
+    assert bundle["deadband"] == pytest.approx(0.35)
+    assert tuple(bundle["columns"]) == WINDOW_TRAINING_COLUMNS
+    with pytest.raises(ModelError, match="schema mismatch"):
+        load_model(v2_path)  # default remains v1; no silent fallback
+
+    wave_window = next(
+        row for row in build_window_rows(rows) if row["label"] == "wave"
+    )
+    label, probabilities = predict(bundle, wave_window)
+    assert label == "wave"
+    assert probabilities["wave"] > probabilities["arm_raised"]
+
+    # The inverse direction is rejected too: selecting schema 2 cannot load
+    # an old untagged v1 bundle.
+    v1_path = tmp_path / "v1.joblib"
+    v1_dir = tmp_path / "v1-data"
+    v1_dir.mkdir()
+    v1_data = build_synthetic_dataset(v1_dir, per_class=20)
+    train(dataset_path=v1_data, model_path=v1_path, n_estimators=10)
+    v1_bundle = load_model(v1_path, schema=1)
+    assert "schema_version" not in v1_bundle
+    with pytest.raises(ModelError, match="schema mismatch"):
+        load_model(v1_path, schema=2)
 
 
 # --- grouped split retries seeds until every class covers both sides ------

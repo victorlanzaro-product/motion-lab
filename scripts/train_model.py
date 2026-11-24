@@ -16,29 +16,29 @@ recorded a real session with `hello_dataset.py`.
 from __future__ import annotations
 
 import argparse
+import csv
 import random
 import sys
 import tempfile
 from pathlib import Path
 
 from backend.dataset import DatasetWriter
+from backend.dataset.writer import DATASET_COLUMNS, MOTION_COLUMNS
 from backend.features import FEATURE_NAMES, ArmMotion, Direction, FrameFeatures, MotionState
-from backend.ml import DEFAULT_MODEL_PATH, DatasetError, train
+from backend.ml import (
+    DEFAULT_MODEL_PATH,
+    DEFAULT_V2_MODEL_PATH,
+    V2_LABELS,
+    DatasetError,
+    train,
+)
 
 #: Trivially separable prototypes, one per label. Not meant to resemble a real
 #: recording session — only to prove load -> split -> fit -> save works.
 #:
-#: "wave" is absent because it is not a trainable label at all (product
-#: decision, README "Limitação conhecida" / `backend/dataset/writer.py:
-#: REMOVED_LABELS`): it is motion, not posture, and this baseline would only
-#: ever be able to fake it with a single frame's instantaneous
-#: velocity/direction, never the reversal window a real wave needs
-#: (`GestureEngine`'s `_WaveDetector`) -- a synthetic "wave" row here would
-#: prove nothing about the ML vocabulary's ability to tell a wave from an arm
-#: rising without repeating. `DatasetWriter`/`load_dataset` now enforce this
-#: for real recordings too, not just this synthetic baseline. Every other
-#: label here is a static posture, which a single frame's features genuinely
-#: can separate.
+#: The v1 simulator uses the four default static postures. The v2 simulator
+#: writes its temporal rows directly so it can include the v2-only `wave`
+#: label without changing DatasetWriter's v1 recording contract.
 PROTOTYPES = {
     "arm_raised": dict(left_wrist_above_shoulder=True, left_wrist_height=1.2, wrist_distance=1.0),
     "arms_crossed": dict(wrists_crossed=True, wrist_distance=0.3),
@@ -56,6 +56,7 @@ def _jitter(rng: random.Random, value: float, spread: float = 0.05) -> float:
 #: train.py decision 4) has more than one session_id to split on -- a single
 #: session, however large, cannot demonstrate what a real held-out split does.
 SIMULATED_SESSIONS = 4
+SIMULATED_WINDOW_SESSIONS = 5
 
 
 def _synthetic_row(
@@ -110,12 +111,87 @@ def build_synthetic_dataset(
     )
 
 
-def print_report(report) -> None:
+def build_synthetic_window_dataset(
+    path: Path, seed: int = 42, sessions: int = SIMULATED_WINDOW_SESSIONS
+) -> None:
+    """Write a tiny synthetic CSV that exercises schema-v2 window training.
+
+    `wave` and `arm_raised` share the arm-raised posture prototype while their
+    synthetic wrist trajectories differ. This exercises the temporal training
+    path; it is not evidence about real-world recognition quality.
+    """
+    rng = random.Random(seed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=DATASET_COLUMNS)
+        writer.writeheader()
+        for label in V2_LABELS:
+            for session_index in range(sessions):
+                # A recording session has one label, matching the actual
+                # dataset contract. Its own tracker starts with local time 0.
+                session_id = f"simulated-{label}-{session_index}"
+                prototype_label = "arm_raised" if label == "wave" else label
+                for segment_frame in range(60):
+                    frame_index = segment_frame
+                    timestamp = segment_frame / 10.0
+                    values = {name: 0.0 for name in FEATURE_NAMES}
+                    for name in (
+                        "wrists_crossed",
+                        "left_wrist_above_shoulder",
+                        "right_wrist_above_shoulder",
+                    ):
+                        values[name] = False
+                    for name, value in PROTOTYPES[prototype_label].items():
+                        # These two classes must have exactly the same frame
+                        # feature distribution. The temporal ordering below is
+                        # their only synthetic distinction.
+                        if label in {"arm_raised", "wave"}:
+                            values[name] = value
+                        else:
+                            values[name] = value if isinstance(value, bool) else _jitter(rng, value)
+
+                    if label == "arm_raised":
+                        # One rise followed by a hold: 30 low and 30 high rows.
+                        values["left_wrist_height"] = 0.0 if segment_frame < 30 else 1.2
+                    elif label == "wave":
+                        # Reorder the exact same 30 low / 30 high observations
+                        # into repeated reversals, preserving the v1 feature
+                        # histogram while making the v2 window signal distinct.
+                        values["left_wrist_height"] = 0.0 if segment_frame % 2 == 0 else 1.2
+                    values["left_wrist_above_shoulder"] = values["left_wrist_height"] > 0.5
+
+                    row = {
+                        "session_id": session_id,
+                        "frame_index": frame_index,
+                        "timestamp": timestamp,
+                        "label": label,
+                        **values,
+                        "shoulder_width": 1.0,
+                        **{name: None for name in MOTION_COLUMNS},
+                    }
+                    writer.writerow(row)
+    print(
+        f"Simulated {len(V2_LABELS)} v2 labels across {sessions} grouped sessions "
+        f"-> {path}"
+    )
+
+
+def print_report(report, schema: int = 1) -> None:
+    print(f"schema    v{schema}")
     print(f"\ntrained   {report.trained_at}")
     counts = ", ".join(f"{k}={v}" for k, v in report.counts.items())
     print(f"samples   {report.n_samples}  {counts}")
+    cv = report.cv
+    if cv.get("macro_f1_oof") is not None:
+        print(f"macro-F1  {cv['macro_f1_oof']:.3f}  (LOSO, pooled out-of-fold predictions)")
+    cv_name = "LOSO fold mean" if cv.get("mode") == "loso" else "grouped CV"
+    print(
+        f"macro-F1  {cv['macro_f1_mean']:.3f} ± {cv['macro_f1_std']:.3f}  "
+        f"({cv_name}; {cv['folds_used']}/{cv['n_splits']} folds; "
+        f"{cv['folds_skipped']} skipped)"
+    )
     print(f"accuracy  {report.accuracy * 100:.1f}%  (held-out test split)")
-    print(f"macro-F1  {report.macro_f1:.3f}  (unweighted mean over classes)")
+    print(f"split F1  {report.macro_f1:.3f}  (held-out split detail)")
     print(f"balanced  {report.balanced_accuracy * 100:.1f}%  (balanced accuracy)")
     print(f"saved to  {report.model_path}")
     print("\ntop features:")
@@ -129,8 +205,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Train the gesture Random Forest.")
     parser.add_argument("--simulate", action="store_true", help="synthetic dataset, no recording")
     parser.add_argument("--dataset", type=Path, default=None, help="override the dataset CSV path")
-    parser.add_argument("--model-out", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--model-out", type=Path, default=None)
+    parser.add_argument(
+        "--schema",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="training schema (1: per-frame default, 2: temporal windows)",
+    )
+    parser.add_argument(
+        "--cv", choices=("group-kfold", "loso"), default="group-kfold",
+        help="cross-validation method; loso holds out one session per fold",
+    )
     args = parser.parse_args()
+    model_path = args.model_out or (
+        DEFAULT_V2_MODEL_PATH if args.schema == 2 else DEFAULT_MODEL_PATH
+    )
 
     try:
         if args.simulate:
@@ -143,10 +233,18 @@ def main() -> int:
             )
             with tempfile.TemporaryDirectory() as tmp:
                 dataset_path = Path(tmp) / "dataset.csv"
-                build_synthetic_dataset(dataset_path)
-                report = train(dataset_path=dataset_path, model_path=args.model_out)
+                if args.schema == 2:
+                    build_synthetic_window_dataset(dataset_path)
+                else:
+                    build_synthetic_dataset(dataset_path)
+                report = train(
+                    dataset_path=dataset_path,
+                    model_path=model_path,
+                    schema=args.schema,
+                    cv_mode=args.cv,
+                )
         else:
-            kwargs = {"model_path": args.model_out}
+            kwargs = {"model_path": model_path, "schema": args.schema, "cv_mode": args.cv}
             if args.dataset:
                 kwargs["dataset_path"] = args.dataset
             report = train(**kwargs)
@@ -154,7 +252,7 @@ def main() -> int:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
 
-    print_report(report)
+    print_report(report, schema=args.schema)
     if args.simulate:
         print(
             "\nOK: the PIPELINE works (plumbing only -- synthetic data, not a real "
