@@ -73,6 +73,9 @@ const state = {
   activeTab: "now",
   lastFace: null,
   reportAvailable: false,
+  coverageView: null,
+  coverageFetchWarning: null,
+  recordLabels: [],
 };
 
 const el = (id) => document.getElementById(id);
@@ -125,16 +128,16 @@ function handle(message) {
       message.face_enabled ? "pending" : "off",
       message.face_enabled ? "procurando rosto" : "rosto desligado",
     );
-    if (Array.isArray(message.record_labels)) {
-      recorder.setLabels(message.record_labels);
-      buildRecorderButtons(message.record_labels);
-    }
+    applyRecordLabelsFromHello(message);
     renderRecorder();
     return;
   }
   if (message.type === "record_status") {
     recorder.applyStatus(message);
     renderRecorder();
+    if (!message.recording && message.session_id != null) {
+      fetchDatasetStats();
+    }
     return;
   }
   if (message.type === "error") {
@@ -1122,25 +1125,40 @@ function ensureRecorderCountdownTimer() {
   }, 100);
 }
 
-function buildRecorderButtons(labels) {
+function applyRecordLabelsFromHello(hello) {
+  const labels = Recorder.recordLabelsForHello(hello);
+  state.recordLabels = labels;
+  recorder.setLabels(labels);
+  buildRecorderButtons(labels, hello && hello.model_schema);
+}
+
+function recorderModelSchema() {
+  return state.config && state.config.model_schema;
+}
+
+function buildRecorderButtons(labels, modelSchema) {
   recorderLabels = labels.slice();
   const host = el("recorder-label-buttons");
   host.replaceChildren();
-  labels.forEach((label, index) => {
-    const shortcut = String(index + 1);
+  const schema = modelSchema ?? recorderModelSchema();
+  for (const label of labels) {
+    const shortcut = Recorder.shortcutForLabel(label, labels, schema);
     const human = ML_LABEL[label] || label;
     const button = document.createElement("button");
     button.type = "button";
     button.className = "recorder-label-button";
+    if (label === "wave") button.classList.add("recorder-label-button-wave");
     button.dataset.recordLabel = label;
-    button.dataset.shortcut = shortcut;
+    if (shortcut) button.dataset.shortcut = shortcut;
     button.textContent = human;
-    const key = document.createElement("kbd");
-    key.textContent = shortcut;
-    button.append(key);
+    if (shortcut) {
+      const key = document.createElement("kbd");
+      key.textContent = shortcut;
+      button.append(key);
+    }
     button.addEventListener("click", () => startRecorderLabel(label));
     host.append(button);
-  });
+  }
 }
 
 function startRecorderLabel(label) {
@@ -1232,20 +1250,135 @@ function renderRecorder() {
 
 el("recorder-stop").addEventListener("click", () => stopRecorder());
 
+// --- Sprint 13 dataset coverage ----------------------------------------
+
+const COVERAGE_FETCH_WARNING =
+  "Não foi possível atualizar a cobertura do dataset. A gravação e o ao vivo seguem normais.";
+
+async function fetchDatasetStats() {
+  try {
+    const response = await fetch("/dataset/stats");
+    if (!response.ok) throw new Error(String(response.status));
+    const stats = await response.json();
+    state.coverageView = DatasetCoverage.buildCoverageView(stats, {
+      labelTitles: ML_LABEL,
+      coverageLabels: state.recordLabels.length ? state.recordLabels : undefined,
+    });
+    state.coverageFetchWarning = null;
+  } catch (_error) {
+    state.coverageFetchWarning = COVERAGE_FETCH_WARNING;
+  }
+  renderDatasetCoverage();
+}
+
+function renderDatasetCoverage() {
+  const warning = el("coverage-fetch-warning");
+  if (state.coverageFetchWarning) {
+    warning.textContent = state.coverageFetchWarning;
+    toggle("coverage-fetch-warning", true);
+  } else {
+    warning.textContent = "";
+    toggle("coverage-fetch-warning", false);
+  }
+
+  const view = state.coverageView;
+  if (!view || !view.valid) {
+    el("coverage-summary").textContent = state.coverageFetchWarning
+      ? "Cobertura desatualizada — última leitura indisponível."
+      : "Consultando estatísticas…";
+    el("coverage-status-badge").textContent = state.coverageFetchWarning ? "indisponível" : "carregando";
+    el("coverage-status-badge").className = "badge coverage-badge";
+    toggle("coverage-path", false);
+    toggle("coverage-problems", false);
+    el("coverage-label-grid").replaceChildren();
+    toggle("coverage-dropped", false);
+    return;
+  }
+
+  const badge = el("coverage-status-badge");
+  badge.textContent = view.statusText;
+  badge.className = `badge coverage-badge coverage-${view.statusKind}`;
+
+  el("coverage-summary").textContent = view.summaryLine;
+
+  const pathNode = el("coverage-path");
+  if (view.path) {
+    pathNode.textContent = `Arquivo: ${view.path}`;
+    toggle("coverage-path", true);
+  } else {
+    pathNode.textContent = "";
+    toggle("coverage-path", false);
+  }
+
+  const problems = el("coverage-problems");
+  problems.replaceChildren();
+  if (view.problems.length) {
+    for (const text of view.problems) {
+      const item = document.createElement("li");
+      item.textContent = text;
+      problems.appendChild(item);
+    }
+    toggle("coverage-problems", true);
+  } else {
+    toggle("coverage-problems", false);
+  }
+
+  const grid = el("coverage-label-grid");
+  grid.replaceChildren();
+  for (const row of view.labels) {
+    const card = document.createElement("article");
+    card.className = "coverage-label-card";
+    if (row.belowMinimum) card.classList.add("coverage-label-below");
+    card.setAttribute("role", "listitem");
+
+    const title = document.createElement("h3");
+    title.className = "coverage-label-name";
+    title.textContent = row.title;
+
+    const meta = document.createElement("dl");
+    meta.className = "coverage-label-meta";
+
+    const sessionsDt = document.createElement("dt");
+    sessionsDt.textContent = "sessões (mín.)";
+    const sessionsDd = document.createElement("dd");
+    sessionsDd.textContent = row.sessionsText;
+
+    const secondsDt = document.createElement("dt");
+    secondsDt.textContent = "segundos no CSV";
+    const secondsDd = document.createElement("dd");
+    secondsDd.textContent = row.secondsText;
+
+    meta.append(sessionsDt, sessionsDd, secondsDt, secondsDd);
+    card.append(title, meta);
+    grid.appendChild(card);
+  }
+
+  const droppedRows = view.dropped;
+  if (droppedRows.length) {
+    el("coverage-dropped-detail").textContent = droppedRows
+      .map((row) => `${row.title}: ${row.count}`)
+      .join(" · ");
+    toggle("coverage-dropped", true);
+  } else {
+    toggle("coverage-dropped", false);
+  }
+}
+
 document.addEventListener("keydown", (event) => {
   if (typingTarget(event.target)) return;
-  const digit = event.key.length === 1 && event.key >= "1" && event.key <= "9"
-    ? Number(event.key)
-    : null;
-  if (digit !== null && digit <= recorderLabels.length) {
-    const view = recorder.snapshot();
-    if (!view.startEnabled) {
-      flashToast("Gravação indisponível agora");
+  const digit = event.key.length === 1 && event.key >= "1" && event.key <= "9" ? event.key : null;
+  if (digit !== null) {
+    const labelIndex = Recorder.labelIndexForDigit(digit, recorderLabels, recorderModelSchema());
+    if (labelIndex >= 0 && labelIndex < recorderLabels.length) {
+      const view = recorder.snapshot();
+      if (!view.startEnabled) {
+        flashToast("Gravação indisponível agora");
+        return;
+      }
+      event.preventDefault();
+      startRecorderLabel(recorderLabels[labelIndex]);
       return;
     }
-    event.preventDefault();
-    startRecorderLabel(recorderLabels[digit - 1]);
-    return;
   }
   if (event.key === " " || event.code === "Space") {
     const view = recorder.snapshot();
@@ -1263,3 +1396,4 @@ document.addEventListener("keydown", (event) => {
 });
 
 connect();
+fetchDatasetStats();
