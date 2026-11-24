@@ -34,6 +34,9 @@ the explicit `--face` flag. See [Privacy](#privacy) and the setup guide below.
   saved as video or sent to a cloud service.
 - The browser preview receives frame images over WebSocket. The default bind is
   localhost; binding to `0.0.0.0` exposes the unauthenticated stream to the LAN.
+- Until WebSocket Origin hardening is integrated into `main`, do not run the app
+  while visiting untrusted websites: a malicious site may try to open a WebSocket
+  to the localhost service. Keep the server on localhost and do not expose it to the LAN.
 - The pose model downloads once when first needed. The face model downloads only
   when facial analysis is explicitly enabled.
 - Training datasets store landmarks and derived features with labels, never
