@@ -822,6 +822,9 @@ tests/
   do processo é o download do modelo, uma vez, explícito via `ensure_model`/
   `ensure_face_model` (nunca automático a cada frame).
 - Frames vivem em memória e são descartados; `.gitignore` bloqueia `*.mp4/*.mov/*.png/*.jpg`.
+- O WebSocket aceita apenas as origens exatas configuradas em `WebConfig.allowed_origins`.
+  `hello_web.py` libera por padrão somente o URL local que imprime; o uso de
+  `--allow-lan` exige informar cada `--allowed-origin` explicitamente.
 - O dataset de treino guarda landmarks + features + label — nunca pixels.
 - **Sprint 11 (reações faciais):** nenhum frame, recorte de rosto ou malha de
   478 pontos é persistido em disco ou em `data/` — o `FaceSnapshot` vive só na
