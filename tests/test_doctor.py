@@ -17,6 +17,10 @@ def test_diagnose_reports_missing_modules_and_models_without_downloading(tmp_pat
     assert "uv sync --group dev --extra vision" in checks[1].fix
     assert checks[-4].available is False
     assert "downloads" in checks[-4].fix
+    assert "ensure_model()" in checks[-4].fix
+    assert "requires network" in checks[-4].fix
+    assert "scripts/check_pose.py" not in checks[-4].fix
+    assert "doctor itself never downloads" in checks[-4].fix
     assert not (tmp_path / "models").exists()
     assert lookups == ["cv2", "numpy", "mediapipe", "fastapi", "uvicorn", "sklearn", "joblib"]
 
