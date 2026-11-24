@@ -49,6 +49,13 @@ descartados) e o relatório do Sprint 10 servido pelo próprio servidor.
    como dica/estilo pendente, sem desabilitar a navegação, para manter o endpoint
    acessível e permitir que o servidor explique como gerar o relatório.
 
+### Resolução do contrato do link
+
+Quando o arquivo ainda não existe, `report_available=false` só apresenta a dica
+e o estilo pendente. O link permanece ativo; `GET /report` responde 404 com a
+instrução para gerar o HTML. Assim, a interface não esconde a explicação que o
+próprio endpoint fornece.
+
 ### `hello` ganha `"report_available": true|false`
 
 ### `GET /report`
