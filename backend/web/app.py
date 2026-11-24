@@ -124,8 +124,8 @@ def create_app(
     async def stream(websocket: WebSocket) -> None:
         headers = getattr(websocket, "headers", {})
         origin = headers.get("origin")
-        if origin is not None and not _origin_matches_host(
-            origin, headers.get("host", ""), websocket.url.scheme
+        if origin is not None and not _origin_is_allowed(
+            origin, pipeline.config.allowed_origins
         ):
             await websocket.close(code=1008, reason="Origin not allowed")
             return
@@ -200,32 +200,36 @@ def create_app(
     return app
 
 
-def _origin_matches_host(origin: str, host: str, websocket_scheme: str) -> bool:
-    """Allow browser WebSocket handshakes only from this server's own origin."""
-    try:
-        parsed_origin = urlsplit(origin)
-        parsed_host = urlsplit(f"//{host}")
-        if (
-            parsed_origin.scheme not in {"http", "https"}
-            or not parsed_origin.hostname
-            or parsed_origin.username is not None
-            or parsed_origin.password is not None
-            or parsed_origin.path not in {"", "/"}
-            or parsed_origin.query
-            or parsed_origin.fragment
-            or not parsed_host.hostname
-        ):
-            return False
-        expected_scheme = "https" if websocket_scheme == "wss" else "http"
-        origin_port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
-        host_port = parsed_host.port or (443 if expected_scheme == "https" else 80)
-        return (
-            parsed_origin.scheme == expected_scheme
-            and parsed_origin.hostname.casefold() == parsed_host.hostname.casefold()
-            and origin_port == host_port
-        )
-    except ValueError:
+def _origin_is_allowed(origin: str, allowed_origins: tuple[str, ...]) -> bool:
+    """Match Origin against configured trusted origins, never the request Host."""
+    candidate = _normalize_origin(origin)
+    if candidate is None:
         return False
+    return candidate in {
+        normalized
+        for allowed in allowed_origins
+        if (normalized := _normalize_origin(allowed)) is not None
+    }
+
+
+def _normalize_origin(value: str) -> Optional[tuple[str, str, int]]:
+    """Normalize a bare HTTP(S) origin for exact allow-list comparison."""
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            return None
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return parsed.scheme, parsed.hostname.casefold(), port
+    except ValueError:
+        return None
 
 
 def _read_saved_report(pipeline: PipelineRunner) -> str:
