@@ -1,10 +1,10 @@
 # Motion Lab — Roadmap v3 (proposta, Sprints 17–20)
 
-**24/11/2026 · Proposta de produto para revisão via PR.** A proposta não está aprovada para merge/execução. O repositório tem PRs abertas #5, #8, #9 e #10; PRs #5/#8 estão em ajustes conforme revisão de Helena. Nenhuma câmera foi usada.
+**24/11/2026 · Proposta de produto para revisão via PR.** A proposta não está aprovada para merge/execução. O repositório tem PRs abertas #5, #8, #9, #10, #11, #12 e #13; PRs #5/#8 estão em ajustes conforme revisão de Helena. Nenhuma câmera foi usada.
 
 ## Entregas de planejamento desta noite
 
-Seleção para o trabalho desta noite: (1) `scripts/doctor.py`, diagnóstico offline de primeira execução (implementado em PR #10, ainda não integrado); (2) demo estática e interativa sem câmera, Python ou rede, com dados sintéticos (protótipo local sem PR até resolver o gate de testes). Critérios abaixo separam teste técnico de hipótese de valor. A análise de trade-offs está em `oportunidades-features-v2.md`.
+Seleção para o trabalho desta noite: (1) `scripts/doctor.py`, diagnóstico offline de primeira execução (implementado em PR #10, ainda não integrado); (2) demo estática e interativa sem câmera, Python ou rede, com dados sintéticos (implementada como demo e teste Node em PR #13, ainda não integrada). A suíte Python completa passou após sincronizar extras offline; os critérios abaixo separam teste técnico de hipótese de valor. A utilidade ainda não foi validada com pessoas.
 
 ### Sprint 17 — Diagnóstico local de primeira execução
 
@@ -25,13 +25,13 @@ Seleção para o trabalho desta noite: (1) `scripts/doctor.py`, diagnóstico off
 
 **Objetivo:** permitir que alguém explore a experiência principal antes de instalar Python ou conectar câmera.
 
-**Escopo:** protótipo local em `demos/offline/index.html`; PR ainda não aberta. Uma página local independente com fluxos demonstráveis de diagnóstico/enquadramento, gesto detectado, ausência de pose e degradação. Usar fixtures marcadas persistentemente como **SIMULAÇÃO — dados fictícios**; nenhuma API, câmera, dependência Python ou asset remoto. Não imitar confiança/saúde como medição real.
+**Escopo:** PR #13 adiciona `demos/offline/index.html` e testes em `demos/offline/tests/offline-demo.test.js`. Uma página local independente com fluxos demonstráveis de diagnóstico/enquadramento, gesto detectado, ausência de pose e degradação. Usar fixtures marcadas persistentemente como **SIMULAÇÃO — dados fictícios**; nenhuma API, câmera, dependência Python ou asset remoto. Não imitar confiança/saúde como medição real.
 
 **Pronto quando:**
 
 - Abre como arquivo local com rede desligada e funciona sem backend/Python; nenhum recurso externo é requisitado.
 - Cada tela usa payload sintético versionado, todos os estados e lacunas são explícitos; nenhuma feature visual sugere que houve inferência real.
-- Testes determinísticos de navegação/transições ainda não foram adicionados. A execução do pytest no clone local para no baseline por falta do extra opcional `mediapipe`; a demo não tem teste frontend automatizado ainda. Antes de PR, adicionar teste determinístico independente e registrar claramente o gate Python que falha também na `main` limpa.
+- Três testes Node built-in cobrem rótulos sintéticos, ausência de APIs de rede/câmera e presença dos controles acessíveis; não cobrem um navegador real. A suíte Python completa passou no clone de Nico após sincronização offline dos extras (268 passed, 1 warning).
 - Teste de valor futuro (hipótese): com 5 pessoas novas, ao menos 4 explicam o que o produto faz e reconhecem que a demonstração usa dados fictícios.
 
 **Câmera Victor:** não requerida.
@@ -70,8 +70,8 @@ Seleção para o trabalho desta noite: (1) `scripts/doctor.py`, diagnóstico off
 
 - S17 e S18 podem ser prototipados independentemente de hardware. S17 é primeiro para melhorar onboarding; S18 oferece exploração zero-setup.
 - S19 deve consumir sinais do pipeline atual, sem implementar um segundo pipeline no browser. S20 depende de segurança e estabilidade dos gestos e dos resultados dos checkpoints S14/S16.
-- PRs #5 (S15) e #8 (S16) continuam abertas e com conflitos relatados; Helena recomenda #5 antes de #8. Comentários em ambas registram ajustes importantes. PR #10 (doctor) parte de `main` HEAD `ea1b714`; PR #9 (OSS readiness) também parte da `main`, HEAD após correção `4352121`. Não há PR para demo até testes focados existirem e o gate ser esclarecido. Antes de outra feature que dependa de S16, confirmar estado e seguir a sequência de Helena. Branch: S17/S18 independentes podem sair de `main` somente após alinhar HEAD; S19/S20 devem partir de `sprint-16` e manter PR empilhada nessa branch enquanto a base não integrar. Sem mudança no código nesta entrega.
-- **OSS readiness:** escolher e adicionar licença explícita, preparar instruções de contribuição/segurança e garantir setup/checks reproduzíveis antes de chamar a experiência de pronta para contribuições públicas. O root público observado não listava `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md` nem workflow CI; confirmar no HEAD antes de priorizar.
+- PRs #5 (S15) e #8 (S16) continuam abertas e com conflitos relatados; Helena recomenda #5 antes de #8. Comentários em ambas registram ajustes importantes. PR #10 (doctor) parte de `main` HEAD `ea1b714`; PR #9 (OSS readiness) também parte de `main`, head `4352121`; PR #11 contém este roadmap; PR #12 corrige Origin/WebSocket e métrica wave na base Sprint 16; PR #13 implementa a demo na main. Todas permanecem abertas e sem merge no estado consultado. Para #10/#13, suíte Python offline passou após sync dos extras; #13 tem 3 testes Node. PR #9/#10/#13 ainda aguardam/requerem revisão após mudanças. Antes de outra feature que dependa de S16, confirmar estado e seguir a sequência de Helena. Branch: S17/S18 independentes podem sair de `main` somente após alinhar HEAD; S19/S20 devem partir de `sprint-16` e manter PR empilhada nessa branch enquanto a base não integrar. Sem mudança no código nesta entrega.
+- **OSS readiness:** escolher e adicionar licença explícita, preparar instruções de contribuição/segurança e garantir setup/checks reproduzíveis antes de chamar a experiência de pronta para contribuições públicas. PR #9 propõe licença MIT, `CONTRIBUTING.md`, Code of Conduct e templates, mas segue sem merge; até integração a licença efetiva continua ausente. A checagem de CI continua sem status publicado nas PRs.
 
 ## Entrega desta noite vs futuro
 
@@ -83,5 +83,5 @@ Seleção para o trabalho desta noite: (1) `scripts/doctor.py`, diagnóstico off
 
 - Repositório `victorlanzaro-product/motion-lab`: README, `docs/ROADMAP-v2.md`, `docs/sprints/15-dashboard.md` no head da PR #5 e `docs/sprints/16-hardening-avaliacao.md` no head da PR #8.
 - `Shared/FATOS-E-REGRAS.md` e `Shared/produto/CONTEXTO.md`, lidos em 24/11/2026.
-- Estados PR #5 (`cdcbc445`) e #8 (`44f837f`) consultados em 24/11/2026; revalidar antes de implementação/integração.
+- Estados PR #5 (`cdcbc445`), #8 (`44f837f`), #9 (`4352121`), #10 (`79008bb`), #11 (`6cc0233`), #12 (`eb84cef`) e #13 (`f1c7f85`) consultados em 24/11/2026; revalidar antes de integração.
 \n\n---\n\nCo-authored-by: OpenBot <335604065+openbotgit[bot]@users.noreply.github.com>\n
