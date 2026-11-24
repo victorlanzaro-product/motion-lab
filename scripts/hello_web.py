@@ -22,7 +22,7 @@ import uvicorn
 from pathlib import Path
 
 from backend.camera import CameraConfig
-from backend.ml import DEFAULT_MODEL_PATH
+from backend.dataset.writer import DEFAULT_DATASET_PATH, DEFAULT_V2_DATASET_PATH
 from backend.vision import (
     DEFAULT_FACE_MODEL_PATH,
     FaceModelError,
@@ -50,10 +50,26 @@ def main() -> int:
     )
     parser.add_argument("--quality", type=int, default=70, help="JPEG quality, 1-100")
     parser.add_argument(
+        "--model-schema",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="model/data schema (1: per-frame, 2: temporal windows)",
+    )
+    parser.add_argument(
         "--model",
         type=Path,
-        default=DEFAULT_MODEL_PATH,
-        help="trained Sprint 08 model; missing is fine, Live ML just stays off",
+        default=None,
+        help="override the schema-specific model bundle; missing is fine, Live ML stays off",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=None,
+        help=(
+            "override the schema-specific recording dataset "
+            f"(v1: {DEFAULT_DATASET_PATH}; v2: {DEFAULT_V2_DATASET_PATH})"
+        ),
     )
     parser.add_argument(
         "--face",
@@ -69,6 +85,8 @@ def main() -> int:
         preview_width=args.preview_width,
         jpeg_quality=args.quality,
         model_path=args.model,
+        model_schema=args.model_schema,
+        dataset_path=args.dataset,
         face_enabled=args.face,
         face_model_path=args.face_model,
     )
