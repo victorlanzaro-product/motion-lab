@@ -166,7 +166,8 @@ def test_websocket_rejects_external_origin_before_subscribing(tmp_path):
     with client_for(runner) as client:
         with pytest.raises(WebSocketDisconnect) as closed:
             with client.websocket_connect(
-                "/ws", headers={"origin": "https://attacker.example"}
+                "/ws",
+                headers={"origin": "https://attacker.example", "host": "attacker.example"},
             ):
                 pass
 
@@ -177,7 +178,9 @@ def test_websocket_rejects_external_origin_before_subscribing(tmp_path):
 
 def test_websocket_accepts_same_origin(tmp_path, monkeypatch):
     stub_preview_encoding(monkeypatch)
-    runner, _ = build(dataset_path=tmp_path / "dataset.csv")
+    runner, _ = build(
+        dataset_path=tmp_path / "dataset.csv", allowed_origins=("http://testserver",)
+    )
     with client_for(runner) as client, client.websocket_connect(
         "/ws", headers={"origin": "http://testserver"}
     ) as socket:
@@ -1813,14 +1816,35 @@ def test_hello_web_accepts_loopback_or_warns_after_lan_consent(
 ):
     argv = ["hello_web.py", "--host", host]
     if allow_lan:
-        argv.append("--allow-lan")
+        argv.extend(["--allow-lan", "--allowed-origin", "http://192.0.2.20:8000"])
     monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(hello_web, "ensure_model", lambda path: path)
     calls = []
-    monkeypatch.setattr(hello_web.uvicorn, "run", lambda _app, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(
+        hello_web.uvicorn,
+        "run",
+        lambda app, **kwargs: calls.append((app, kwargs)),
+    )
     assert hello_web.main() == 0
-    assert [call["host"] for call in calls] == [bound]
+    assert [call[1]["host"] for call in calls] == [bound]
+    expected_origin = (
+        "http://192.0.2.20:8000"
+        if allow_lan
+        else f"http://[{bound}]:8000" if ":" in bound else f"http://{bound}:8000"
+    )
+    assert calls[0][0].state.runner.config.allowed_origins == (expected_origin,)
     output = capsys.readouterr()
     assert ("sem autenticação" in output.err) is allow_lan
     if host == "::1":
         assert "http://[::1]:8000" in output.out
+
+
+def test_hello_web_requires_explicit_allowed_origin_for_lan(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["hello_web.py", "--host", "0.0.0.0", "--allow-lan"])
+    monkeypatch.setattr(
+        hello_web, "ensure_model", lambda _path: pytest.fail("loaded model")
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        hello_web.main()
+    assert exit_info.value.code == 2
+    assert "exige ao menos um --allowed-origin explícito" in capsys.readouterr().err
