@@ -309,7 +309,7 @@ def summarize_segment(
         or spec.variant.startswith("wave_")
         or any(f.v2_label == "wave" for f in segment_frames)
     ):
-        body["wave"] = _wave_coverage(segment_frames, spec.variant)
+        body["wave"] = _wave_coverage(comparable, spec.variant)
     return body
 
 
