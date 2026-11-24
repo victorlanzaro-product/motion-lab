@@ -172,6 +172,13 @@ class WebConfig:
     #: Schema selected for live inference and recording labels. Appended to
     #: preserve the positional field order of the pre-S14 WebConfig API.
     model_schema: int = 1
+    #: Exact browser origins permitted to open the camera WebSocket. The CLI
+    #: sets this to its printed URL; LAN binding requires explicit origins.
+    allowed_origins: tuple[str, ...] = (
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "http://[::1]:8000",
+    )
 
     def __post_init__(self) -> None:
         if type(self.model_schema) is not int or self.model_schema not in (1, 2):
