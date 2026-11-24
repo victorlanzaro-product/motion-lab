@@ -5,7 +5,7 @@ Thanks for your interest in Motion Lab. Contributions should keep the project lo
 ## Before you start
 
 - Open an issue to discuss a substantial change. For small fixes, a pull request is welcome.
-- Do not include personal, third-party, or employer data, private recordings, credentials, or generated datasets.
+- Do not include personal data, private recordings, credentials, or generated datasets.
 - Explain any privacy, network, storage, or model-download behavior your change introduces.
 
 ## Development

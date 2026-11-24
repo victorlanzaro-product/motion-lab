@@ -7,7 +7,7 @@
 - [ ] Other checks (describe):
 
 ## Privacy and data
-Describe any change to camera access, network traffic, storage, model downloads, or data collection. Confirm that no personal, third-party, or employer data is included.
+Describe any change to camera access, network traffic, storage, model downloads, or data collection. Confirm that no personal data or private recordings are included.
 
 ## Checklist
 - [ ] Documentation updated
