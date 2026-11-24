@@ -28,7 +28,7 @@ from backend.features.face_features import FaceSignals
 from backend.features.face_motion import FaceMotionState
 from backend.features.features import FEATURE_NAMES, FrameFeatures
 from backend.features.velocity import MotionState, Trail
-from backend.dataset.writer import DEFAULT_LABELS
+from backend.dataset.writer import DEFAULT_LABELS, V2_LABELS
 from backend.gestures.engine import GestureEvent
 from backend.vision.face_landmarks import (
     FACE_CHAIN_GROUPS,
@@ -321,6 +321,8 @@ def hello_message(
     still_threshold: float = 0.35,
     preview_width: int = 640,
     jpeg_quality: int = 70,
+    model_schema: int = 1,
+    record_labels: Optional[list[str] | tuple[str, ...]] = None,
     ml_classes: Optional[list[str]] = None,
     face_enabled: bool = False,
     report_available: bool = False,
@@ -330,8 +332,15 @@ def hello_message(
     Sent up front so the frontend keeps no copy of the landmark table, the bone
     topology or the thresholds — change them in Python and the browser follows.
     """
+    if model_schema not in (1, 2):
+        raise ValueError("model_schema must be 1 or 2")
+    labels = record_labels
+    if labels is None:
+        labels = V2_LABELS if model_schema == 2 else DEFAULT_LABELS
+
     return {
         "type": "hello",
+        "model_schema": model_schema,
         "arm_landmarks": [int(lm) for lm in ARM_LANDMARKS],
         "landmark_names": {str(int(lm)): lm.name for lm in ARM_LANDMARKS},
         "chains": [[int(a), int(b)] for a, b in ARM_CHAINS],
@@ -339,7 +348,7 @@ def hello_message(
         "gesture_names": list(GESTURE_NAMES),
         # One source of truth for browser recording controls; keeping the
         # vocabulary here prevents a frontend copy from drifting from the CSV.
-        "record_labels": list(DEFAULT_LABELS),
+        "record_labels": list(labels),
         # Empty when no model is trained yet -- the client's cue to show
         # "sem modelo treinado" instead of waiting for an "ml" field that
         # will never arrive non-null.

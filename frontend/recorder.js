@@ -13,6 +13,49 @@
   const START_REPLAY_WINDOW_MS = 2000;
   const START_FAILED_ERROR = "Gravação não iniciada: conexão caiu";
 
+  const S13_RECORD_LABELS = Object.freeze([
+    "arm_raised",
+    "arms_crossed",
+    "arms_open",
+    "idle",
+  ]);
+
+  function waveRecordingEnabled(modelSchema, recordLabels) {
+    if (modelSchema !== 2) return false;
+    const list = Array.isArray(recordLabels) ? recordLabels : [];
+    return list.includes("wave");
+  }
+
+  /** Labels shown in the Recorder — server order; `wave` only in schema 2. */
+  function recordLabelsForHello(hello) {
+    const list = hello && Array.isArray(hello.record_labels) ? hello.record_labels.slice() : [];
+    const schema = hello && hello.model_schema;
+    if (waveRecordingEnabled(schema, list)) return list;
+    return list.filter((label) => label !== "wave");
+  }
+
+  function shortcutForLabel(label, labels, modelSchema) {
+    if (!Array.isArray(labels) || !labels.includes(label)) return null;
+    if (label === "wave") {
+      return waveRecordingEnabled(modelSchema, labels) ? "5" : null;
+    }
+    const index = labels.indexOf(label);
+    if (index >= 0 && index < 4) return String(index + 1);
+    return null;
+  }
+
+  function labelIndexForDigit(digit, labels, modelSchema) {
+    const n = Number(digit);
+    if (!Number.isFinite(n) || n < 1 || n > 9) return -1;
+    if (!Array.isArray(labels) || labels.length === 0) return -1;
+    if (n === 5 && waveRecordingEnabled(modelSchema, labels)) {
+      const waveIndex = labels.indexOf("wave");
+      return waveIndex >= 0 ? waveIndex : -1;
+    }
+    if (n <= labels.length && n !== 5) return n - 1;
+    return -1;
+  }
+
   function createRecorder(options) {
     const opts = options || {};
     const countdownSeconds = opts.countdownSeconds ?? DEFAULT_COUNTDOWN_SECONDS;
@@ -234,6 +277,11 @@
     DEFAULT_COUNTDOWN_SECONDS,
     START_REPLAY_WINDOW_MS,
     START_FAILED_ERROR,
+    S13_RECORD_LABELS,
+    waveRecordingEnabled,
+    recordLabelsForHello,
+    shortcutForLabel,
+    labelIndexForDigit,
   };
 
   if (typeof module !== "undefined" && module.exports) {

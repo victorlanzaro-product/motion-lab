@@ -23,7 +23,8 @@ pytest.importorskip("httpx", reason="fastapi's TestClient needs httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from backend.camera import CameraConfig, CameraEngine  # noqa: E402
-from backend.dataset import DATASET_COLUMNS, DEFAULT_LABELS, DatasetWriter  # noqa: E402
+from backend.dataset import DATASET_COLUMNS, DEFAULT_LABELS, V2_LABELS, DatasetWriter  # noqa: E402
+from backend.dataset.stats import dataset_stats  # noqa: E402
 from backend.features import (  # noqa: E402
     FEATURE_NAMES,
     ArmMotion,
@@ -43,6 +44,7 @@ from backend.vision import (  # noqa: E402
     PoseLandmark,
 )
 from backend.web import WebConfig, create_app  # noqa: E402
+from backend.web.app import _write_frames  # noqa: E402
 from backend.web.pipeline import PipelineRunner, Subscriber  # noqa: E402
 
 LEFT_WRIST_X = 0.2  # off-centre on purpose: a mirrored copy would read 0.8
@@ -260,6 +262,7 @@ def test_hello_arrives_before_any_frame(tmp_path):
     assert hello["feature_names"] == list(FEATURE_NAMES)
     assert hello["arm_landmarks"] == [int(lm) for lm in ARM_LANDMARKS]
     assert "arm_raised" in hello["gesture_names"]
+    assert hello["model_schema"] == 1
     assert hello["record_labels"] == list(DEFAULT_LABELS)
     assert hello["report_available"] is False
     assert record_status == {
@@ -272,6 +275,24 @@ def test_hello_arrives_before_any_frame(tmp_path):
         "owner": False,
         "error": None,
     }
+
+
+def test_v2_hello_advertises_wave_without_a_trained_bundle(tmp_path):
+    runner, _ = build(
+        model_schema=2,
+        model_path=tmp_path / "missing-v2.joblib",
+        dataset_path=tmp_path / "dataset_v2.csv",
+    )
+    with client_for(runner) as client, client.websocket_connect("/ws") as socket:
+        hello = socket.receive_json()
+        receive_initial_record_status(socket)
+        frame = receive_frame(socket)
+    runner.stop()
+
+    assert hello["model_schema"] == 2
+    assert hello["record_labels"] == list(V2_LABELS)
+    assert hello["ml_classes"] == []
+    assert frame["ml"] is None
 
 
 def test_hello_carries_the_face_overlay_topology_regardless_of_face_enabled():
@@ -292,6 +313,78 @@ def test_hello_carries_the_face_overlay_topology_regardless_of_face_enabled():
     for name, pairs in hello["face_chains"].items():
         assert pairs == [[a, b] for a, b in FACE_CHAIN_GROUPS[name]]
     assert isinstance(hello["face_mesh_version"], int) and hello["face_mesh_version"] >= 1
+
+
+def test_failed_initial_record_status_send_unsubscribes_client():
+    """A failed snapshot send must not leave a camera-owning subscriber."""
+    runner, _ = build()
+    app = create_app(runner=runner)
+    websocket_route = next(route for route in app.routes if getattr(route, "path", None) == "/ws")
+
+    class FailingSocket:
+        async def accept(self):
+            pass
+
+        async def send_json(self, message):
+            if message.get("type") == "record_status":
+                raise RuntimeError("initial record status send failed")
+
+    try:
+        with pytest.raises(RuntimeError, match="initial record status send failed"):
+            asyncio.run(websocket_route.endpoint(FailingSocket()))
+
+        assert runner.client_count == 0
+    finally:
+        runner.stop()
+
+
+def test_second_cancellation_during_child_cleanup_still_unsubscribes(monkeypatch):
+    """Cancellation of gather in finally must not skip subscription cleanup."""
+
+    async def scenario():
+        runner, _ = build()
+        app = create_app(runner=runner)
+        websocket_route = next(
+            route for route in app.routes if getattr(route, "path", None) == "/ws"
+        )
+        children_started = asyncio.Event()
+        child_cleanup_started = asyncio.Event()
+        started_count = 0
+
+        async def stalled_child(*_args):
+            nonlocal started_count
+            started_count += 1
+            if started_count == 2:
+                children_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                child_cleanup_started.set()
+                await asyncio.Future()
+
+        monkeypatch.setattr("backend.web.app._write_frames", stalled_child)
+        monkeypatch.setattr("backend.web.app._read_client_messages", stalled_child)
+
+        class Socket:
+            async def accept(self):
+                pass
+
+            async def send_json(self, _message):
+                pass
+
+        task = asyncio.create_task(websocket_route.endpoint(Socket()))
+        try:
+            await asyncio.wait_for(children_started.wait(), timeout=2.0)
+            task.cancel()
+            await asyncio.wait_for(child_cleanup_started.wait(), timeout=2.0)
+            task.cancel()  # interrupts the gather inside stream()'s finally
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert runner.client_count == 0
+        finally:
+            runner.stop()
+
+    asyncio.run(scenario())
 
 
 # --- browser recorder ---------------------------------------------------
@@ -381,6 +474,52 @@ def test_websocket_rejects_removed_and_unknown_labels_before_creating_dataset(tm
     runner.stop()
 
     assert not dataset_path.exists()
+
+
+def test_v2_can_record_wave_before_any_model_is_trained(tmp_path, monkeypatch):
+    stub_preview_encoding(monkeypatch)
+    dataset_path = tmp_path / "dataset_v2.csv"
+    runner, _ = build(
+        model_schema=2,
+        model_path=tmp_path / "missing-v2.joblib",
+        dataset_path=dataset_path,
+        preview_width=320,
+    )
+    with client_for(runner) as client, client.websocket_connect("/ws") as socket:
+        hello = socket.receive_json()
+        receive_initial_record_status(socket)
+        receive_frame(socket)
+
+        socket.send_json({"type": "record_start", "label": "wave"})
+        started = receive_until(
+            socket,
+            lambda item: item.get("type") == "record_status" and item["recording"],
+        )
+        assert started["label"] == "wave"
+        assert started["owner"] is True
+        written = receive_until(
+            socket,
+            lambda item: item.get("type") == "record_status"
+            and item["recording"]
+            and item["written"] >= 2,
+        )
+        socket.send_json({"type": "record_stop"})
+        stopped = receive_until(
+            socket,
+            lambda item: item.get("type") == "record_status"
+            and not item["recording"]
+            and item["session_id"] == started["session_id"],
+        )
+    runner.stop()
+
+    assert hello["model_schema"] == 2
+    assert hello["ml_classes"] == []
+    assert stopped["written"] >= written["written"]
+    with dataset_path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows and tuple(rows[0]) == DATASET_COLUMNS
+    assert {row["label"] for row in rows} == {"wave"}
+    assert {row["session_id"] for row in rows} == {started["session_id"]}
 
 
 def test_second_tab_conflict_error_is_private_and_active_owner_keeps_recording(tmp_path, monkeypatch):
@@ -800,6 +939,54 @@ def test_camera_stays_closed_until_a_client_connects():
     runner.stop()
 
 
+
+
+def test_dataset_stats_route_never_500_on_corrupt_csv(tmp_path):
+    dataset_path = tmp_path / "dataset.csv"
+    dataset_path.write_text("session_id,label\ns0,idle\n", encoding="utf-8")
+
+    with TestClient(create_app(WebConfig(dataset_path=dataset_path))) as client:
+        response = client.get("/dataset/stats")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == dataset_stats(dataset_path)
+    assert body["exists"] is True
+    assert body["ready"] is False
+    assert body["problems"]
+def test_dataset_stats_route_returns_the_shared_stats_for_its_configured_path(tmp_path):
+    """The endpoint exposes the same on-disk snapshot as the CLI/report code."""
+    dataset_path = tmp_path / "missing.csv"
+
+    with TestClient(create_app(WebConfig(dataset_path=dataset_path))) as client:
+        response = client.get("/dataset/stats")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == dataset_stats(dataset_path)
+    assert response.json()["exists"] is False
+
+
+def test_v2_dataset_stats_uses_v2_path_and_includes_wave_coverage(tmp_path):
+    dataset_path = tmp_path / "missing-v2.csv"
+    config = WebConfig(
+        model_schema=2,
+        model_path=tmp_path / "missing-v2.joblib",
+        dataset_path=dataset_path,
+    )
+
+    with TestClient(create_app(config)) as client:
+        response = client.get("/dataset/stats")
+
+    assert response.status_code == 200
+    assert response.json() == dataset_stats(dataset_path, V2_LABELS)
+    assert response.json()["labels"]["wave"] == {
+        "rows": 0,
+        "sessions": 0,
+        "seconds": 0.0,
+    }
+
+
 def test_camera_is_released_after_the_last_client_leaves():
     runner, captures = build()
     with client_for(runner) as client:
@@ -1061,6 +1248,154 @@ def test_a_slow_client_gets_the_newest_frame_not_a_backlog():
     message, dropped = asyncio.run(scenario())
     assert message["frame_index"] == 3
     assert dropped == 2
+
+
+def test_control_flood_is_bounded_and_keeps_recording_transitions(monkeypatch):
+    """A rejected-command flood cannot hide the start or final stop status."""
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        subscriber = Subscriber(loop)
+        schedule = loop.call_soon_threadsafe
+        notifications = []
+
+        def track_notification(callback, *args):
+            notifications.append((callback, args))
+            return schedule(callback, *args)
+
+        monkeypatch.setattr(loop, "call_soon_threadsafe", track_notification)
+        started = {
+            "type": "record_status",
+            "recording": True,
+            "label": "idle",
+            "session_id": "session-1",
+            "written": 0,
+            "skipped": 0,
+            "owner": True,
+            "error": None,
+        }
+        subscriber.offer(started)
+
+        for index in range(Subscriber.MAX_CONTROL_MESSAGES * 4):
+            subscriber.offer(
+                {
+                    **started,
+                    "owner": False,
+                    "error": f"request {index} rejected while recording",
+                }
+            )
+
+        repeated_rejection = {
+            **started,
+            "owner": False,
+            "error": "another recording is already active",
+        }
+        for _ in range(1000):
+            subscriber.offer(repeated_rejection)
+
+        stopped = {
+            "type": "record_status",
+            "recording": False,
+            "label": "idle",
+            "session_id": "session-1",
+            "written": 125,
+            "skipped": 2,
+            "owner": False,
+            "error": "camera disconnected during active recording",
+        }
+        subscriber.offer(stopped)
+        queued = len(subscriber._control)
+        # The loop has not run a wakeup yet. The messages must already be in
+        # the bounded buffer, with only one callback and no payload in it.
+        assert subscriber._control.maxlen == Subscriber.MAX_CONTROL_MESSAGES
+        assert notifications == [(subscriber._wake_reader, ())]
+        messages = [await subscriber.get() for _ in range(queued)]
+        return queued, messages, started, stopped, repeated_rejection
+
+    queued, messages, started, stopped, repeated_rejection = asyncio.run(scenario())
+
+    assert queued <= Subscriber.MAX_CONTROL_MESSAGES
+    assert messages[0] == started
+    assert messages[-1] == stopped
+    assert messages.count(repeated_rejection) == 1
+
+
+@pytest.mark.parametrize(
+    "overflow_message",
+    [
+        pytest.param(
+            {"type": "error", "message": "camera permanently denied", "fatal": True},
+            id="fatal-error",
+        ),
+        pytest.param(
+            {
+                "type": "record_status",
+                "recording": True,
+                "label": "idle",
+                "session_id": "current-session",
+                "written": 1,
+                "skipped": 0,
+                "owner": True,
+                "error": None,
+            },
+            id="current-recording-state",
+        ),
+    ],
+)
+def test_final_only_control_overflow_closes_socket_for_fresh_snapshot(overflow_message):
+    """A saturated final-only queue cannot leave a client on stale state."""
+
+    async def scenario():
+        subscriber = Subscriber(asyncio.get_running_loop())
+        for index in range(Subscriber.MAX_CONTROL_MESSAGES):
+            subscriber.offer(
+                {
+                    "type": "record_status",
+                    "recording": False,
+                    "label": "idle",
+                    "session_id": f"session-{index}",
+                    "written": index,
+                    "skipped": 0,
+                    "owner": False,
+                    "error": None,
+                }
+            )
+        assert len(subscriber._control) == Subscriber.MAX_CONTROL_MESSAGES
+        assert all(subscriber._is_final_record_status(item) for item in subscriber._control)
+
+        pending = list(subscriber._control)
+        subscriber.offer(
+            {
+                "type": "record_status",
+                "recording": False,
+                "session_id": None,
+                "error": "No recording is active.",
+            }
+        )
+        assert list(subscriber._control) == pending
+
+        subscriber.offer(overflow_message)
+
+        class Socket:
+            def __init__(self):
+                self.sent = []
+                self.close_args = None
+
+            async def send_json(self, message):
+                self.sent.append(message)
+
+            async def close(self, *, code, reason):
+                self.close_args = (code, reason)
+
+        socket = Socket()
+        await _write_frames(socket, subscriber)
+        return socket
+
+    socket = asyncio.run(scenario())
+    assert socket.sent == []
+    assert socket.close_args is not None
+    assert socket.close_args[0] == 1013
+    assert "fresh state snapshot" in socket.close_args[1]
 
 
 # --- static ------------------------------------------------------------
