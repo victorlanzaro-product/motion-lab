@@ -12,7 +12,7 @@ from backend.dataset.windows import WINDOW_TRAINING_COLUMNS
 from backend.features import FEATURE_NAMES, FrameFeatures
 from backend.features.velocity import Direction, MotionConfig, MotionTracker
 from backend.features.window import WindowFeatures
-from backend.gestures import GestureConfig, GestureEngine
+from backend.gestures import GestureConfig, GestureEngine, GestureEvent
 from backend.ml.live_eval import (
     COMMON_V1_LABELS,
     LiveEvaluationSession,
@@ -131,6 +131,31 @@ def test_warmup_and_transition_excluded_from_agreement():
     summary = summarize_segment(evaluated, spec)
     assert summary["excluded"] == {"warmup": 1, "transition": 1}
     assert summary["agreement"]["v1_v2"]["comparable"] <= 4
+
+
+def test_wave_coverage_uses_only_eligible_frames():
+    session = LiveEvaluationSession(_v1_bundle("idle"), _v2_bundle("wave"))
+    evaluated = session.run_frames(
+        [(_complete_frame(i, i / 10.0), True) for i in range(5)]
+    )
+    for frame in evaluated:
+        frame.v2_label = "wave"
+        frame.gesture_events = [
+            GestureEvent("wave", "left", frame.frame_index, frame.timestamp)
+        ]
+
+    summary = summarize_segment(
+        evaluated,
+        SegmentSpec(
+            label="wave", start_index=0, end_index=4,
+            warmup=1, transition=1, variant="wave_left",
+        ),
+    )
+
+    assert summary["excluded"] == {"warmup": 1, "transition": 1}
+    assert summary["wave"]["v2_labeled_frames"] == 3
+    assert summary["wave"]["rule_events"] == 3
+    assert [event["frame_index"] for event in summary["wave"]["rule_event_frames"]] == [1, 2, 3]
 
 
 def test_agreement_null_when_no_overlap():

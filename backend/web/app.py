@@ -23,6 +23,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
@@ -121,6 +122,13 @@ def create_app(
 
     @app.websocket("/ws")
     async def stream(websocket: WebSocket) -> None:
+        headers = getattr(websocket, "headers", {})
+        origin = headers.get("origin")
+        if origin is not None and not _origin_matches_host(
+            origin, headers.get("host", ""), websocket.url.scheme
+        ):
+            await websocket.close(code=1008, reason="Origin not allowed")
+            return
         await websocket.accept()
         report_available = await asyncio.to_thread(pipeline.report_available)
         await websocket.send_json(
@@ -190,6 +198,34 @@ def create_app(
                 pipeline.unsubscribe(subscriber)
 
     return app
+
+
+def _origin_matches_host(origin: str, host: str, websocket_scheme: str) -> bool:
+    """Allow browser WebSocket handshakes only from this server's own origin."""
+    try:
+        parsed_origin = urlsplit(origin)
+        parsed_host = urlsplit(f"//{host}")
+        if (
+            parsed_origin.scheme not in {"http", "https"}
+            or not parsed_origin.hostname
+            or parsed_origin.username is not None
+            or parsed_origin.password is not None
+            or parsed_origin.path not in {"", "/"}
+            or parsed_origin.query
+            or parsed_origin.fragment
+            or not parsed_host.hostname
+        ):
+            return False
+        expected_scheme = "https" if websocket_scheme == "wss" else "http"
+        origin_port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
+        host_port = parsed_host.port or (443 if expected_scheme == "https" else 80)
+        return (
+            parsed_origin.scheme == expected_scheme
+            and parsed_origin.hostname.casefold() == parsed_host.hostname.casefold()
+            and origin_port == host_port
+        )
+    except ValueError:
+        return False
 
 
 def _read_saved_report(pipeline: PipelineRunner) -> str:
