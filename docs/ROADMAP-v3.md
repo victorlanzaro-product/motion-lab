@@ -10,12 +10,12 @@ Seleção para o trabalho desta noite: (1) `scripts/doctor.py`, diagnóstico off
 
 **Objetivo:** ajudar quem clona o projeto a identificar requisitos ausentes e o próximo passo sem inicializar câmera ou transmitir dados.
 
-**Escopo:** PR #10 adiciona `scripts/doctor.py`, que verifica versão Python suportada, presença de dependências por extras, modelo de pose local, diretórios/permissões e indica que câmera/permissões serão necessárias apenas ao iniciar app ao vivo. Não instala pacotes, não baixa modelos, não acessa webcam/rede e não altera configuração.
+**Escopo:** PR #10 adiciona `scripts/doctor.py`, que verifica versão Python suportada, presença de dependências por extras, arquivo do modelo de pose local; o diagnóstico não verifica diretórios/permissões e avisa que câmera só será usada quando o usuário iniciar o app ao vivo. Não instala pacotes, não baixa modelos, não acessa webcam/rede e não altera configuração.
 
 **Pronto quando:**
 
 - Casos saudáveis e ausentes geram instruções claras e status/exit code estáveis.
-- Testes unitários cobrem versões incompatíveis, extras ausentes, modelo/diretório ausente e estado completo sem depender de câmera, rede ou modelo real.
+- Testes unitários cobrem versões incompatíveis, extras ausentes, modelo ausente e estado completo sem depender de câmera, rede ou modelo real.
 - README tem uma seção de primeira execução; mensagens distinguem “dependência faltando” de “câmera ainda não testada”.
 - Teste de valor futuro (hipótese): com 5 pessoas novas, ao menos 4 encontram o requisito faltando e entendem o próximo passo sem ajuda. A Íris não entrevistou ninguém; isso não está validado.
 
@@ -70,7 +70,7 @@ Seleção para o trabalho desta noite: (1) `scripts/doctor.py`, diagnóstico off
 
 - S17 e S18 podem ser prototipados independentemente de hardware. S17 é primeiro para melhorar onboarding; S18 oferece exploração zero-setup.
 - S19 deve consumir sinais do pipeline atual, sem implementar um segundo pipeline no browser. S20 depende de segurança e estabilidade dos gestos e dos resultados dos checkpoints S14/S16.
-- PRs #5 (S15) e #8 (S16) continuam abertas e com conflitos relatados; Helena recomenda #5 antes de #8. Comentários em ambas registram ajustes importantes. PR #10 (doctor) parte de `main` HEAD `ea1b714`; PR #9 (OSS readiness) também parte de `main`, head `4352121`; PR #11 contém este roadmap; PR #12 corrige Origin/WebSocket e métrica wave na base Sprint 16; PR #13 implementa a demo na main. Todas permanecem abertas e sem merge no estado consultado. Para #10/#13, suíte Python offline passou após sync dos extras; #13 tem 3 testes Node. PR #9/#10/#13 ainda aguardam/requerem revisão após mudanças. Antes de outra feature que dependa de S16, confirmar estado e seguir a sequência de Helena. Branch: S17/S18 independentes podem sair de `main` somente após alinhar HEAD; S19/S20 devem partir de `sprint-16` e manter PR empilhada nessa branch enquanto a base não integrar. Sem mudança no código nesta entrega.
+- PRs #5 (S15) e #8 (S16) continuam abertas e com conflitos relatados; Helena recomenda #5 antes de #8. Comentários em ambas registram ajustes importantes. PR #10 (doctor) parte de `main` HEAD `ea1b714`; PR #9 (OSS readiness) também parte de `main`, head `85fcf297`; PR #11 contém este roadmap; PR #12 corrige Origin/WebSocket e métrica wave na base Sprint 16; PR #13 implementa a demo na main. Todas permanecem abertas e sem merge no estado consultado. Para #10/#13, suíte Python offline passou após sync dos extras; #13 tem 3 testes Node. PR #9/#10/#13 ainda aguardam/requerem revisão após mudanças. Antes de outra feature que dependa de S16, confirmar estado e seguir a sequência de Helena. Branch: S17/S18 independentes podem sair de `main` somente após alinhar HEAD; S19/S20 devem partir de `sprint-16` e manter PR empilhada nessa branch enquanto a base não integrar. Sem mudança no código nesta entrega.
 - **OSS readiness:** escolher e adicionar licença explícita, preparar instruções de contribuição/segurança e garantir setup/checks reproduzíveis antes de chamar a experiência de pronta para contribuições públicas. PR #9 propõe licença MIT, `CONTRIBUTING.md`, Code of Conduct e templates, mas segue sem merge; até integração a licença efetiva continua ausente. A checagem de CI continua sem status publicado nas PRs.
 
 ## Entrega desta noite vs futuro
@@ -84,4 +84,4 @@ Seleção para o trabalho desta noite: (1) `scripts/doctor.py`, diagnóstico off
 - Repositório `victorlanzaro-product/motion-lab`: README, `docs/ROADMAP-v2.md`, `docs/sprints/15-dashboard.md` no head da PR #5 e `docs/sprints/16-hardening-avaliacao.md` no head da PR #8.
 - `Shared/FATOS-E-REGRAS.md` e `Shared/produto/CONTEXTO.md`, lidos em 24/11/2026.
 - Estados e heads das PRs #5, #8–#13 consultados em 24/11/2026; revalidar antes de implementação ou integração.
-\n\n---\n\nCo-authored-by: OpenBot <335604065+openbotgit[bot]@users.noreply.github.com>\n
+
