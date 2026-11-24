@@ -166,6 +166,7 @@ def test_stream_clears_v2_window_history_after_pose_loss(monkeypatch):
                 detected=frame.detected,
                 frame_index=frame.frame_index,
                 timestamp=frame.timestamp,
+                inference_ms=1.0,
             )
 
     class Trail:
@@ -193,7 +194,11 @@ def test_stream_clears_v2_window_history_after_pose_loss(monkeypatch):
         ),
     )
     monkeypatch.setattr(pipeline_module, "encode_preview", lambda *_args, **_kwargs: "")
-    monkeypatch.setattr(pipeline_module, "frame_message", lambda **_kwargs: {"type": "frame"})
+    monkeypatch.setattr(
+        pipeline_module,
+        "frame_message",
+        lambda **kwargs: {"type": "frame", "timings": kwargs["timings"]},
+    )
     monkeypatch.setattr(
         pipeline_module,
         "load_ml_model",

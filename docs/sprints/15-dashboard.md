@@ -45,7 +45,16 @@ descartados) e o relatório do Sprint 10 servido pelo próprio servidor.
 3. `health.fps` repete `fps` de propósito: o bloco `health` é autocontido.
 4. Primeiro frame de um cliente: `dropped_frames=0`, `dropped_rate=0.0` (nunca `null`).
 5. `report_available` é snapshot só no `hello`; o link sempre tenta `/report` e
-   o 404 mostra a mensagem — não há push de mudança.
+   o 404 mostra a mensagem — não há push de mudança. O estado ausente aparece
+   como dica/estilo pendente, sem desabilitar a navegação, para manter o endpoint
+   acessível e permitir que o servidor explique como gerar o relatório.
+
+### Resolução do contrato do link
+
+Quando o arquivo ainda não existe, `report_available=false` só apresenta a dica
+e o estilo pendente. O link permanece ativo; `GET /report` responde 404 com a
+instrução para gerar o HTML. Assim, a interface não esconde a explicação que o
+próprio endpoint fornece.
 
 ### `hello` ganha `"report_available": true|false`
 
@@ -84,8 +93,9 @@ Não tocar: `backend/`, `tests/`, `README.md`, `docs/`, `studio-controls.js`.
   Lacunas visíveis. Taxa de concordância numérica ao lado.
 - Painel de saúde (`health-panel.js` puro): FPS, barras por estágio de
   `timings` (`null` = "—", nunca 0), `dropped_rate` com alerta acima de 0.10.
-- Link "Relatório" que abre `/report` em nova aba; desabilitado com dica quando
-  `hello.report_available=false`.
+- Link "Relatório" que sempre abre `/report` em nova aba; quando
+  `hello.report_available=false`, mostra dica e estilo pendente, sem desabilitar
+  a navegação. O servidor responde 404 com instrução para gerar o relatório.
 - `app.js` nunca calcula feature; só exibe números do servidor.
 
 ## Aceite (gates)
