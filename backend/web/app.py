@@ -31,6 +31,7 @@ from starlette.concurrency import run_in_threadpool
 
 from backend.dataset.stats import dataset_stats
 from backend.web.payload import hello_message
+from backend.web.origin import origin_is_allowed
 from backend.web.pipeline import PipelineRunner, Subscriber, WebConfig
 
 #: backend/web/app.py -> backend/web -> backend -> project root
@@ -107,6 +108,16 @@ def create_app(
 
     @app.websocket("/ws")
     async def stream(websocket: WebSocket) -> None:
+        # Validate before accept, hello, or subscribe. Host is intentionally
+        # ignored: browsers control Origin, while Host can be forged by a raw
+        # client and must never become an allowlist source. This is not client
+        # authentication; it is a browser-origin defense for the local stream.
+        origins = websocket.headers.getlist("origin")
+        if len(origins) != 1 or not origin_is_allowed(
+            origins[0], pipeline.config.allowed_origins
+        ):
+            await websocket.close(code=1008, reason="Origin not allowed")
+            return
         await websocket.accept()
         report_available = await asyncio.to_thread(pipeline.report_available)
         await websocket.send_json(

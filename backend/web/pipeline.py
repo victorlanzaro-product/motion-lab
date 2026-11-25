@@ -100,6 +100,7 @@ from backend.web.payload import (
     record_status_message,
     status_message,
 )
+from backend.web.origin import normalize_origin
 from backend.web.recorder import Recorder
 
 #: Wire names for the two arms, in the order the payload uses them.
@@ -164,10 +165,30 @@ class WebConfig:
     #: Schema selected for live inference and recording labels. Appended to
     #: preserve the positional field order of the pre-S14 WebConfig API.
     model_schema: int = 1
+    #: Browser Origins allowed to open the live stream. This does not
+    #: authenticate clients; it blocks untrusted web pages from using a
+    #: browser to connect to the local camera endpoint.
+    allowed_origins: tuple[str, ...] = (
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "http://[::1]:8000",
+    )
 
     def __post_init__(self) -> None:
         if type(self.model_schema) is not int or self.model_schema not in (1, 2):
             raise ValueError("model_schema must be 1 or 2")
+        if isinstance(self.allowed_origins, str):
+            raise ValueError("allowed_origins must be a sequence of Origins, not a string")
+        try:
+            allowed_origins = tuple(self.allowed_origins)
+        except TypeError as exc:
+            raise ValueError("allowed_origins must be a sequence of Origins") from exc
+        if not allowed_origins or any(
+            not isinstance(origin, str) or normalize_origin(origin) is None
+            for origin in allowed_origins
+        ):
+            raise ValueError("allowed_origins must contain at least one non-empty Origin")
+        object.__setattr__(self, "allowed_origins", allowed_origins)
         model_default = DEFAULT_MODEL_PATH if self.model_schema == 1 else DEFAULT_V2_MODEL_PATH
         dataset_default = (
             DEFAULT_DATASET_PATH if self.model_schema == 1 else DEFAULT_V2_DATASET_PATH
