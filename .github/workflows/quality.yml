@@ -55,7 +55,7 @@ jobs:
             echo "python=$(uv run --no-sync python --version 2>&1)"
             echo "uv=$(uv --version)"
             echo "node=$(node --version)"
-            echo "python_command=uv run --no-sync pytest -p pytest_offline -q --junitxml=artifacts/pytest.xml"
+            echo "python_command=uv run --no-sync pytest -p pytest_offline -x -vv -o faulthandler_timeout=60 --junitxml=artifacts/pytest.xml"
             echo "frontend_command=node --import=./scripts/no_external_network.mjs --test frontend/*.test.js"
             echo "diff_command=git diff --check <base>...HEAD for pull requests; HEAD^...HEAD for main pushes"
           } | tee -a artifacts/manifest.txt
@@ -66,14 +66,26 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Python and frontend tests (loopback only)
+        timeout-minutes: 8
         shell: bash
         run: |
           sudo --non-interactive unshare --net -- bash -euc '
             ip link set lo up
             exec setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --init-groups -- "$@"
           ' bash env "PATH=$PATH" "HOME=$HOME" UV_OFFLINE=1 bash -euo pipefail -c '
-            uv run --no-sync pytest -p pytest_offline -q --junitxml=artifacts/pytest.xml
-            node --import=./scripts/no_external_network.mjs --test frontend/*.test.js 2>&1 | tee artifacts/frontend-test.log
+            timeout --kill-after=5s 30s uv run --no-sync python -u -c "
+          import faulthandler
+          faulthandler.dump_traceback_later(15)
+          import mediapipe as mp
+          import numpy as np
+          image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.zeros((2, 2, 3), dtype=np.uint8))
+          print(f\"MediaPipe {mp.__version__}: {image.width}x{image.height} synthetic image\")
+          faulthandler.cancel_dump_traceback_later()
+          " 2>&1 | tee artifacts/mediapipe.log
+            timeout --kill-after=15s 4m uv run --no-sync pytest -p pytest_offline -x -vv \
+              -o faulthandler_timeout=60 --junitxml=artifacts/pytest.xml 2>&1 | tee artifacts/pytest.log
+            timeout --kill-after=15s 2m node --import=./scripts/no_external_network.mjs \
+              --test frontend/*.test.js 2>&1 | tee artifacts/frontend-test.log
           '
 
       - name: Check whitespace errors against main
