@@ -52,13 +52,13 @@ jobs:
           uv run --no-sync python scripts/verify_quality_sha.py \
             --expected "$TESTED_SHA" --actual "$actual_sha" --manifest artifacts/manifest.txt
           {
-            echo "python=$(python --version 2>&1)"
+            echo "python=$(uv run --no-sync python --version 2>&1)"
             echo "uv=$(uv --version)"
             echo "node=$(node --version)"
             echo "python_command=uv run --no-sync pytest -p pytest_offline -q --junitxml=artifacts/pytest.xml"
             echo "frontend_command=node --import=./scripts/no_external_network.mjs --test frontend/*.test.js"
             echo "diff_command=git diff --check <base>...HEAD for pull requests; HEAD^...HEAD for main pushes"
-          } | tee artifacts/manifest.txt
+          } | tee -a artifacts/manifest.txt
           {
             echo "### Quality job tested SHA"
             echo
