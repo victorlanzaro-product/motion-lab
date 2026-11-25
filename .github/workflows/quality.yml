@@ -65,16 +65,16 @@ jobs:
             echo "\`$TESTED_SHA\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Python tests (loopback only; external network blocked)
-        run: uv run --no-sync pytest -p pytest_offline -q --junitxml=artifacts/pytest.xml
-        env:
-          UV_OFFLINE: "1"
-
-      - name: Frontend tests
-        run: |
-          set -o pipefail
-          node --import=./scripts/no_external_network.mjs --test frontend/*.test.js 2>&1 | tee artifacts/frontend-test.log
+      - name: Python and frontend tests (loopback only)
         shell: bash
+        run: |
+          sudo --non-interactive unshare --net -- bash -euc '
+            ip link set lo up
+            exec setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --init-groups -- "$@"
+          ' bash env "PATH=$PATH" "HOME=$HOME" UV_OFFLINE=1 bash -euo pipefail -c '
+            uv run --no-sync pytest -p pytest_offline -q --junitxml=artifacts/pytest.xml
+            node --import=./scripts/no_external_network.mjs --test frontend/*.test.js 2>&1 | tee artifacts/frontend-test.log
+          '
 
       - name: Check whitespace errors against main
         run: |

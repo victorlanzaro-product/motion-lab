@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import pytest
-import socket
 
-from pytest_offline import _is_local_host
+from pytest_offline import _guarded_getaddrinfo, _guarded_resolver, _is_local_host
 
 
 @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "::1", "127.0.0.2"])
@@ -18,8 +17,13 @@ def test_offline_guard_rejects_non_loopback_hosts(host):
     assert not _is_local_host(host)
 
 
-def test_offline_guard_blocks_external_dns_resolution():
+@pytest.mark.parametrize(
+    ("guard", "args"),
+    [(_guarded_getaddrinfo, (80,)), (_guarded_resolver, ())],
+)
+def test_offline_guard_blocks_external_dns_resolution(guard, args):
+    def resolver(*_args, **_kwargs):
+        pytest.fail("external hostname reached the resolver")
+
     with pytest.raises(OSError, match="external network disabled in tests"):
-        socket.getaddrinfo("example.invalid", 80)
-    with pytest.raises(OSError, match="external network disabled in tests"):
-        socket.gethostbyname("example.invalid")
+        guard(resolver)("example.invalid", *args)
