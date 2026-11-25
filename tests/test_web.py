@@ -20,7 +20,8 @@ import pytest
 pytest.importorskip("fastapi", reason="install the 'web' extra: uv sync --extra web")
 pytest.importorskip("httpx", reason="fastapi's TestClient needs httpx")
 
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient as FastAPITestClient  # noqa: E402
+from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 from backend.camera import CameraConfig, CameraEngine  # noqa: E402
 from backend.dataset import DATASET_COLUMNS, DEFAULT_LABELS, V2_LABELS, DatasetWriter  # noqa: E402
@@ -48,6 +49,18 @@ from backend.web.app import _write_frames  # noqa: E402
 from backend.web.pipeline import PipelineRunner, Subscriber  # noqa: E402
 
 LEFT_WRIST_X = 0.2  # off-centre on purpose: a mirrored copy would read 0.8
+LOCAL_TEST_ORIGIN = "http://127.0.0.1:8000"
+
+
+class TestClient(FastAPITestClient):
+    """Supply the normal local browser Origin for existing handshake tests."""
+
+    def websocket_connect(self, url, subprotocols=None, headers=None, cookies=None):
+        request_headers = dict(headers or {})
+        request_headers.setdefault("origin", LOCAL_TEST_ORIGIN)
+        return super().websocket_connect(
+            url, subprotocols=subprotocols, headers=request_headers, cookies=cookies
+        )
 
 
 class FakeCapture:
@@ -277,6 +290,51 @@ def test_hello_arrives_before_any_frame(tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    ("origin", "host"),
+    [
+        ("https://evil.example", "127.0.0.1:8000"),
+        ("https://evil.example", "evil.example"),
+        (None, "127.0.0.1:8000"),
+        ("http://localhost:8000/path", "localhost:8000"),
+    ],
+)
+def test_websocket_rejects_untrusted_missing_or_malformed_origin_before_accept_or_subscribe(
+    origin, host
+):
+    runner, captures = build()
+    client = FastAPITestClient(create_app(runner=runner))
+    headers = {"host": host}
+    if origin is not None:
+        headers["origin"] = origin
+
+    try:
+        with pytest.raises(WebSocketDisconnect) as rejected:
+            with client.websocket_connect("/ws", headers=headers):
+                pytest.fail("untrusted Origin must not complete the handshake")
+        assert rejected.value.code == 1008
+        assert runner.client_count == 0
+        assert runner.state == "idle"
+        assert captures == []
+    finally:
+        runner.stop()
+
+
+def test_websocket_allowed_origin_ignores_forged_external_host():
+    runner, _ = build()
+    client = FastAPITestClient(create_app(runner=runner))
+    try:
+        with client.websocket_connect(
+            "/ws",
+            headers={"origin": LOCAL_TEST_ORIGIN, "host": "forged.example"},
+        ) as socket:
+            assert socket.receive_json()["type"] == "hello"
+            assert receive_initial_record_status(socket)["type"] == "record_status"
+        assert runner.client_count == 0
+    finally:
+        runner.stop()
+
+
 def test_v2_hello_advertises_wave_without_a_trained_bundle(tmp_path):
     runner, _ = build(
         model_schema=2,
@@ -322,6 +380,8 @@ def test_failed_initial_record_status_send_unsubscribes_client():
     websocket_route = next(route for route in app.routes if getattr(route, "path", None) == "/ws")
 
     class FailingSocket:
+        headers = SimpleNamespace(getlist=lambda _name: [LOCAL_TEST_ORIGIN])
+
         async def accept(self):
             pass
 
@@ -366,6 +426,8 @@ def test_second_cancellation_during_child_cleanup_still_unsubscribes(monkeypatch
         monkeypatch.setattr("backend.web.app._read_client_messages", stalled_child)
 
         class Socket:
+            headers = SimpleNamespace(getlist=lambda _name: [LOCAL_TEST_ORIGIN])
+
             async def accept(self):
                 pass
 

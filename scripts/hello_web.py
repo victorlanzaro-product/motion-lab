@@ -14,6 +14,7 @@ only turns on once a page is actually connected.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import sys
 import webbrowser
 
@@ -39,6 +40,17 @@ def main() -> int:
     # with no authentication. Binding 0.0.0.0 puts your living room on the LAN.
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--allow-lan",
+        action="store_true",
+        help="allow binding beyond loopback; requires at least one explicit --allowed-origin",
+    )
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        help="exact browser Origin allowed to connect; repeat for multiple Origins",
+    )
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
@@ -80,6 +92,23 @@ def main() -> int:
     parser.add_argument("--open", action="store_true", help="open the browser on startup")
     args = parser.parse_args()
 
+    try:
+        host_is_loopback = ipaddress.ip_address(args.host).is_loopback
+    except ValueError:
+        host_is_loopback = args.host.lower() == "localhost"
+    if not host_is_loopback and not args.allow_lan:
+        parser.error("non-loopback --host requires --allow-lan")
+    if not host_is_loopback and not args.allowed_origin:
+        parser.error("--allow-lan requires at least one explicit --allowed-origin")
+    origin_host = f"[{args.host}]" if ":" in args.host else args.host
+    bound_origin = f"http://{origin_host}:{args.port}"
+    allowed_origins = tuple(args.allowed_origin) or (
+        bound_origin,
+        f"http://127.0.0.1:{args.port}",
+        f"http://localhost:{args.port}",
+        f"http://[::1]:{args.port}",
+    )
+
     config = WebConfig(
         camera=CameraConfig(args.camera, args.width, args.height),
         preview_width=args.preview_width,
@@ -89,6 +118,7 @@ def main() -> int:
         dataset_path=args.dataset,
         face_enabled=args.face,
         face_model_path=args.face_model,
+        allowed_origins=allowed_origins,
     )
 
     try:
@@ -108,7 +138,8 @@ def main() -> int:
             # going with pose/gestures/ML/web fully working.
             print(f"WARN: face model unavailable, Sprint 11 signals stay off: {exc}")
 
-    url = f"http://{args.host}:{args.port}"
+    display_host = f"[{args.host}]" if ":" in args.host else args.host
+    url = f"http://{display_host}:{args.port}"
     print(f"Motion Lab web app on {url} — the camera starts when a page connects.")
     print("Ctrl+C to stop. No video is written to disk.")
     if args.open:
