@@ -15,6 +15,7 @@ from backend.web.pipeline import WebConfig
         ("HTTP://LOCALHOST:8000", "http://localhost:8000"),
         ("http://localhost:80", "http://localhost"),
         ("https://example.test:443", "https://example.test"),
+        ("https://example.test.:443", "https://example.test."),
         ("http://[::1]:8000", "http://[::1]:8000"),
         ("null", None),
         ("https://example.test/path", None),
@@ -32,6 +33,15 @@ def test_origin_allowlist_requires_an_exact_browser_origin():
     assert origin_is_allowed("HTTP://LOCALHOST:8000", allowed)
     assert not origin_is_allowed("http://localhost.evil:8000", allowed)
     assert not origin_is_allowed("https://localhost:8000", allowed)
+
+
+def test_origin_allowlist_preserves_trailing_dot_distinction():
+    undotted = "https://example.test"
+    dotted = "https://example.test."
+
+    assert origin_is_allowed(dotted, (dotted,))
+    assert not origin_is_allowed(dotted, (undotted,))
+    assert not origin_is_allowed(undotted, (dotted,))
 
 
 @pytest.mark.parametrize("origins", [(), ("",), ("https://bad.test/path",), "https://bad.test"])

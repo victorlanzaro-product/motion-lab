@@ -25,7 +25,7 @@ def normalize_origin(value: str) -> str | None:
             or parsed.fragment
         ):
             return None
-        hostname = parsed.hostname.rstrip(".").lower()
+        hostname = parsed.hostname.lower()
         port = parsed.port
     except (ValueError, AttributeError):
         return None
