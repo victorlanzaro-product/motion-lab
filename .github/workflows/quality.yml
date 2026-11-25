@@ -42,6 +42,11 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install native MediaPipe dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libegl1 libgles2
+
       - name: Install project and test dependencies
         run: uv sync --locked --all-extras --group dev
 
