@@ -1,0 +1,95 @@
+name: quality
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TESTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out the exact tested commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install project and test dependencies
+        run: uv sync --locked --all-extras --group dev
+
+      - name: Record tested SHA and tool versions
+        run: |
+          mkdir -p artifacts
+          actual_sha="$(git rev-parse HEAD)"
+          uv run --no-sync python scripts/verify_quality_sha.py \
+            --expected "$TESTED_SHA" --actual "$actual_sha" --manifest artifacts/manifest.txt
+          {
+            echo "python=$(python --version 2>&1)"
+            echo "uv=$(uv --version)"
+            echo "node=$(node --version)"
+            echo "python_command=uv run --no-sync pytest -p pytest_offline -q --junitxml=artifacts/pytest.xml"
+            echo "frontend_command=node --import=./scripts/no_external_network.mjs --test frontend/*.test.js"
+            echo "diff_command=git diff --check <base>...HEAD for pull requests; HEAD^...HEAD for main pushes"
+          } | tee artifacts/manifest.txt
+          {
+            echo "### Quality job tested SHA"
+            echo
+            echo "\`$TESTED_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Python tests (loopback only; external network blocked)
+        run: uv run --no-sync pytest -p pytest_offline -q --junitxml=artifacts/pytest.xml
+        env:
+          UV_OFFLINE: "1"
+
+      - name: Frontend tests
+        run: |
+          set -o pipefail
+          node --import=./scripts/no_external_network.mjs --test frontend/*.test.js 2>&1 | tee artifacts/frontend-test.log
+        shell: bash
+
+      - name: Check whitespace errors against main
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base_ref="origin/$GITHUB_BASE_REF"
+          else
+            base_ref="HEAD^"
+          fi
+          git diff --check "$base_ref...HEAD"
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-${{ env.TESTED_SHA }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
