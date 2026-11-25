@@ -62,6 +62,45 @@ def test_missing_dataset_returns_the_contract_empty_shape(tmp_path):
     }
 
 
+def test_header_only_dataset_is_present_but_not_ready(tmp_path):
+    path = tmp_path / "empty.csv"
+    _write(path, [])
+
+    stats = dataset_stats(path)
+
+    assert stats["exists"] is True
+    assert stats["total_rows"] == stats["usable_rows"] == 0
+    assert stats["labels"] == {
+        label: {"rows": 0, "sessions": 0, "seconds": 0.0}
+        for label in DEFAULT_LABELS
+    }
+    assert stats["ready"] is False
+    assert stats["problems"] != ["dataset ausente"]
+    assert all(f"mínimo {MIN_SESSIONS_PER_LABEL}" in problem for problem in stats["problems"])
+
+
+def test_two_single_sample_sessions_with_zero_duration_are_observed_and_ready(tmp_path):
+    path = tmp_path / "zero-duration.csv"
+    rows = [
+        _row(label, f"{label}-session-{session}", session, 0.0)
+        for label in DEFAULT_LABELS
+        for session in range(MIN_SESSIONS_PER_LABEL)
+    ]
+    _write(path, rows)
+
+    stats = dataset_stats(path)
+
+    assert stats["exists"] is True
+    assert stats["total_rows"] == stats["usable_rows"] == len(rows)
+    assert stats["ready"] is True
+    assert stats["problems"] == []
+    assert all(
+        stats["labels"][label] == {"rows": 2, "sessions": 2, "seconds": 0.0}
+        for label in DEFAULT_LABELS
+    )
+    assert all(session["seconds"] == 0.0 for session in stats["sessions"])
+
+
 def test_missing_v2_dataset_includes_an_empty_wave_coverage_entry(tmp_path):
     path = tmp_path / "dataset_v2.csv"
 

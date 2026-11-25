@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from backend.ml import compute_agreement, render_report, rule_label
 
 TRAINING = {
@@ -102,6 +104,79 @@ def test_compute_agreement_excludes_wave_instead_of_counting_it_as_a_mismatch():
     frames = [{"features": {}, "ml": {"label": "wave"}}]
     result = compute_agreement(frames, open_threshold=2.4)
     assert result == {"compared": 0, "matches": 0, "excluded_wave": 1, "rate": None}
+
+
+def test_compute_agreement_denominator_contains_only_frames_with_both_labels():
+    quiet = {
+        "wrists_crossed": False,
+        "wrist_distance": 1.0,
+        "left_wrist_above_shoulder": False,
+        "right_wrist_above_shoulder": False,
+    }
+    frames = [
+        {"features": {**quiet, "wrists_crossed": True}, "ml": {"label": "arms_crossed"}},
+        {"features": {**quiet, "wrist_distance": 3.0}, "ml": {"label": "idle"}},
+        {"features": quiet, "ml": None},
+        {"features": {}, "ml": {"label": "wave"}},
+        {
+            "features": {**quiet, "right_wrist_above_shoulder": None},
+            "ml": {"label": "idle"},
+        },
+    ]
+
+    assert compute_agreement(frames, open_threshold=2.4) == {
+        "compared": 2,
+        "matches": 1,
+        "excluded_wave": 1,
+        "rate": 0.5,
+    }
+
+
+def test_compute_agreement_keeps_zero_rate_distinct_from_no_comparisons():
+    quiet = {
+        "wrists_crossed": False,
+        "wrist_distance": 1.0,
+        "left_wrist_above_shoulder": False,
+        "right_wrist_above_shoulder": False,
+    }
+    zero_matches = compute_agreement(
+        [
+            {"features": quiet, "ml": {"label": "arms_open"}},
+            {"features": quiet, "ml": {"label": "arm_raised"}},
+        ],
+        open_threshold=2.4,
+    )
+    no_comparisons = compute_agreement(
+        [
+            {"features": quiet, "ml": None},
+            {"features": quiet, "ml": {"label": "wave"}},
+        ],
+        open_threshold=2.4,
+    )
+
+    assert zero_matches["compared"] == 2
+    assert zero_matches["matches"] == 0
+    assert zero_matches["rate"] == 0.0
+    assert no_comparisons["compared"] == 0
+    assert no_comparisons["rate"] is None
+    assert "rate" in no_comparisons
+    decoded = json.loads(json.dumps({"zero": zero_matches["rate"], "none": no_comparisons["rate"]}))
+    assert decoded == {"zero": 0.0, "none": None}
+
+
+def test_rule_label_distinguishes_observed_zero_from_missing_feature():
+    observed = {
+        "wrists_crossed": False,
+        "wrist_distance": 0.0,
+        "left_wrist_above_shoulder": False,
+        "right_wrist_above_shoulder": False,
+    }
+    missing = {**observed, "wrist_distance": None}
+    absent = {key: value for key, value in observed.items() if key != "right_wrist_above_shoulder"}
+
+    assert rule_label(observed, open_threshold=2.4) == "idle"
+    assert rule_label(missing, open_threshold=2.4) is None
+    assert rule_label(absent, open_threshold=2.4) is None
 
 
 # --- render_report -----------------------------------------------------
