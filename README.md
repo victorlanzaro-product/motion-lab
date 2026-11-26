@@ -40,6 +40,17 @@ primeira execução, via `ensure_model()`. Fora do git.
 O modelo facial (`models/face_landmarker.task`, ~3.6 MB, Sprint 11) só é baixado se
 `--face` for passado — opt-in, nunca automático.
 
+### Diagnóstico local da primeira execução
+
+```bash
+uv run python scripts/doctor.py
+```
+
+O diagnóstico verifica a faixa do Python, dependências requeridas e opcionais e
+arquivos de modelo locais. Ele não abre a câmera, importa bibliotecas nativas nem
+baixa arquivos; modelos e extras opcionais ausentes são informados com comandos
+de correção, sem serem tratados como erro.
+
 ## Rodar
 
 ```bash
