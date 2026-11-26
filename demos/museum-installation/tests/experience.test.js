@@ -31,3 +31,20 @@ test('pause blocks events and resume permits a new event', () => {
 test('invalid synthetic scores are rejected', () => {
   assert.throws(() => simulateGesture(createInitialState(), 1.2), RangeError);
 });
+
+test('pause and resume after an accepted event preserve count and allow the next event', () => {
+  const accepted = simulateGesture(createInitialState(), 0.91);
+  const paused = pause(accepted);
+  assert.equal(simulateGesture(paused, 0.91).count, 1);
+  const resumed = resume(paused);
+  const next = simulateGesture(resumed, 0.91);
+  assert.equal(next.count, 2);
+  assert.equal(next.lastEvent.accepted, true);
+});
+
+test('restart returns the installation to its initial state', () => {
+  const triggered = simulateGesture(createInitialState(), 0.91);
+  const restarted = createInitialState();
+  assert.deepEqual(restarted, { paused: false, count: 0, lastEvent: null, status: 'ready' });
+  assert.notDeepEqual(restarted, triggered);
+});

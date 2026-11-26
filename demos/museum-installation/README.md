@@ -20,4 +20,8 @@ Acesse `http://127.0.0.1:8000/demos/museum-installation/`. Esse servidor é opci
 node --test demos/museum-installation/tests/experience.test.js
 ```
 
-Os testes verificam gesto claro, gesto abaixo do limiar, pausa/retomada e rejeição de pontuação inválida. Eles exercitam a lógica pura, sem browser, câmera ou rede.
+Os testes verificam gesto claro, gesto abaixo do limiar, pausa/retomada antes e depois de um evento aceito, reinício e rejeição de pontuação inválida.
+
+## Evidência visual
+
+`evidence/simulated-light-trigger.png` é uma captura do navegador com o estado de gesto sintético aceito. O navegador abriu a página servida em `127.0.0.1`; a captura não contém webcam ou dados de visitante. Eles exercitam a lógica pura, sem browser, câmera ou rede.
