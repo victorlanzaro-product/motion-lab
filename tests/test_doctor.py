@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import scripts.doctor as doctor
 from scripts.doctor import collect_checks, supported_python
 
 
@@ -54,3 +55,28 @@ def test_empty_model_is_warning_and_valid_local_model_is_detected(tmp_path: Path
     pose.write_bytes(b"synthetic test fixture")
     checks = collect_checks(tmp_path, (3, 12), _installed)
     assert next(check for check in checks if check.name == "Pose model").status == "OK"
+
+
+def test_main_returns_one_and_prints_action_for_required_failure(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        doctor,
+        "collect_checks",
+        lambda: [doctor.Check("numpy", "FAIL", "Required package is not installed.", "uv sync")],
+    )
+
+    assert doctor.main() == 1
+    output = capsys.readouterr().out
+    assert "FAIL numpy" in output
+    assert "Next: uv sync" in output
+
+
+def test_main_returns_zero_when_only_optional_items_are_absent(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        doctor,
+        "collect_checks",
+        lambda: [doctor.Check("Pose model", "INFO", "Not present; no download attempted.")],
+    )
+
+    assert doctor.main() == 0
+    output = capsys.readouterr().out
+    assert "Required local checks passed" in output
