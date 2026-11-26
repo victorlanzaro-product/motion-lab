@@ -1,6 +1,6 @@
 """Check local Motion Lab prerequisites without opening hardware or network.
 
-    uv run python scripts/doctor.py
+    python3 scripts/doctor.py
 
 The diagnostic only checks Python support, whether dependency modules can be
 found, and whether optional model files exist. It never imports those modules,

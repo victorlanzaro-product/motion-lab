@@ -43,13 +43,14 @@ O modelo facial (`models/face_landmarker.task`, ~3.6 MB, Sprint 11) só é baixa
 ### Diagnóstico local da primeira execução
 
 ```bash
-uv run python scripts/doctor.py
+python3 scripts/doctor.py
 ```
 
 O diagnóstico verifica a faixa do Python, dependências requeridas e opcionais e
 arquivos de modelo locais. Ele não abre a câmera, importa bibliotecas nativas nem
 baixa arquivos; modelos e extras opcionais ausentes são informados com comandos
-de correção, sem serem tratados como erro.
+de correção, sem serem tratados como erro. Use `python3` diretamente para
+executá-lo antes de `uv sync`.
 
 ## Rodar
 
