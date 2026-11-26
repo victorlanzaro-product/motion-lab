@@ -25,6 +25,12 @@ models/*.task
 *.avi
 *.png
 *.jpg
+# Exact synthetic UI proof only; keep all other media ignored.
+!demos/museum-installation/evidence/01-evento-aceito.png
+!demos/museum-installation/evidence/02-abaixo-do-limiar.png
+!demos/museum-installation/evidence/03-pausada-apos-evento.png
+!demos/museum-installation/evidence/04-retomada.png
+!demos/museum-installation/evidence/05-reiniciada.png
 
 # macOS
 .DS_Store

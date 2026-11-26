@@ -14,31 +14,5 @@
 <aside class="card" aria-labelledby="explanation-title"><h2 id="explanation-title">Evento explicável</h2><div class="rows"><div class="row"><b>Gesto simulado</b><span>Levantar a mão voluntariamente</span></div><div class="row"><b>Limiar de ativação</b><span id="threshold">0,72 · exemplo</span></div><div class="row"><b>Eventos aceitos</b><span id="count">0</span></div></div><div class="event" id="event" role="status" aria-live="polite"><strong>Pronta para começar.</strong><p>Escolha uma ação para ver como a regra funciona.</p></div><p class="small">Causa, limiar e contagem são simulados localmente. Atualize a página para reiniciar.</p></aside></div>
 <footer>Abra este arquivo diretamente no navegador. Nenhum servidor, rede, câmera ou armazenamento é utilizado.</footer>
 </main>
-<script type="module">
-import { createInitialState, simulateGesture, pause, resume, THRESHOLD } from './experience.js';
-let state = createInitialState();
-const byId = (id) => document.getElementById(id);
-function render() {
-  byId('count').textContent = String(state.count);
-  byId('pause').disabled = state.paused;
-  byId('pause').setAttribute('aria-pressed', String(state.paused));
-  byId('resume').disabled = !state.paused;
-  byId('clear-gesture').disabled = state.paused;
-  byId('ambiguous-gesture').disabled = state.paused;
-  byId('scene-status').textContent = state.paused ? 'INSTALAÇÃO PAUSADA' : state.status === 'triggered' ? 'LUZ ATIVADA' : state.status === 'uncertain' ? 'GESTO INSUFICIENTE' : 'AGUARDANDO GESTO';
-  byId('orb').classList.toggle('active', state.lastEvent?.accepted === true && !state.paused);
-  byId('beam').classList.toggle('active', state.lastEvent?.accepted === true && !state.paused);
-  const event = byId('event');
-  event.className = `event${state.paused ? ' paused' : state.lastEvent?.accepted === false ? ' uncertain' : ''}`;
-  if (state.paused) event.innerHTML = '<strong>Instalação pausada.</strong><p>Retome para simular novos gestos. A pausa não cria eventos.</p>';
-  else if (state.lastEvent) event.innerHTML = `<strong>${state.lastEvent.accepted ? 'Evento: luz ativada' : 'Nenhum evento disparado'}</strong><p>${state.lastEvent.cause} Pontuação sintética: ${state.lastEvent.score.toFixed(2)}. Limiar: ${THRESHOLD.toFixed(2)}.</p>`;
-  else event.innerHTML = '<strong>Pronta para começar.</strong><p>Escolha uma ação para ver como a regra funciona.</p>';
-}
-byId('clear-gesture').addEventListener('click', () => { state = simulateGesture(state, 0.91); render(); });
-byId('ambiguous-gesture').addEventListener('click', () => { state = simulateGesture(state, 0.48); render(); });
-byId('pause').addEventListener('click', () => { state = pause(state); render(); });
-byId('resume').addEventListener('click', () => { state = resume(state); render(); });
-byId('restart').addEventListener('click', () => { state = createInitialState(); render(); });
-render();
-</script>
+<script type="module" src="./demo.js"></script>
 </body></html>
