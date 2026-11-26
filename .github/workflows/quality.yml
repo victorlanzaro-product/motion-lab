@@ -61,7 +61,7 @@ jobs:
             echo "uv=$(uv --version)"
             echo "node=$(node --version)"
             echo "python_command=uv run --no-sync pytest -p pytest_offline -x -vv -o faulthandler_timeout=60 --junitxml=artifacts/pytest.xml"
-            echo "frontend_command=node --import=./scripts/no_external_network.mjs --test frontend/*.test.js"
+            echo "frontend_command=node --import=./scripts/no_external_network.mjs --test frontend/*.test.js demos/onboarding/tests/*.test.js"
             echo "diff_command=git diff --check <base>...HEAD for pull requests; HEAD^...HEAD for main pushes"
           } | tee -a artifacts/manifest.txt
           {
@@ -90,7 +90,7 @@ jobs:
             timeout --kill-after=15s 4m uv run --no-sync pytest -p pytest_offline -x -vv \
               -o faulthandler_timeout=60 --junitxml=artifacts/pytest.xml 2>&1 | tee artifacts/pytest.log
             timeout --kill-after=15s 2m node --import=./scripts/no_external_network.mjs \
-              --test frontend/*.test.js 2>&1 | tee artifacts/frontend-test.log
+              --test frontend/*.test.js demos/onboarding/tests/*.test.js 2>&1 | tee artifacts/frontend-test.log
           '
 
       - name: Check whitespace errors against main
